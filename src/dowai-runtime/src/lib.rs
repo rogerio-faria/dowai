@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+mod executor;
 mod python_runtime;
 
 const SESSION_TTL: Duration = Duration::from_secs(86_400);
@@ -37,6 +38,21 @@ pub struct RunNodeResult {
     pub status: String,
 }
 
+/// One recorded invocation (static node, dependency, or imperative `env.run`).
+/// Never contains variable values.
+#[derive(Clone, Debug, Serialize)]
+pub struct InvocationRecord {
+    pub invocation_id: String,
+    pub parent_invocation_id: String,
+    pub call_type: String,
+    pub target: String,
+    pub mode: String,
+    pub status: String,
+    pub duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct RunResult {
     pub schema_version: u32,
@@ -48,6 +64,7 @@ pub struct RunResult {
     pub duration_ms: u64,
     pub profile: String,
     pub nodes: Vec<RunNodeResult>,
+    pub invocations: Vec<InvocationRecord>,
     pub warnings: Vec<String>,
 }
 
@@ -156,18 +173,19 @@ pub fn run_postgres(project_dir: &Path, request: RunRequest) -> Result<RunResult
             ));
         }
         let interpreter = &python.interpreter;
+        let models_dir = root.join(&project.models_dir);
+        let run_invocation_id = Uuid::new_v4().to_string();
+        let mut executor = executor::Executor::new(
+            &root,
+            &models_dir,
+            interpreter,
+            Duration::from_secs(python.timeout_seconds),
+            &configuration,
+            &store,
+        )?;
         let mut completed_nodes = Vec::with_capacity(execution_plan.nodes.len());
         for node in &execution_plan.nodes {
-            let model_path = resolve_python_model_path(&root, &project.models_dir, &node.path)?;
-            variables = python_runtime::execute_model(
-                &root,
-                interpreter,
-                Duration::from_secs(python.timeout_seconds),
-                &model_path,
-                &node.depends_on,
-                &variables,
-            )?;
-            store.validate_variables(&variables)?;
+            variables = executor.run_static(node, mode, variables, &run_invocation_id)?;
             completed_nodes.push(RunNodeResult {
                 id: node.id.clone(),
                 relation: node.id.clone(),
@@ -175,6 +193,7 @@ pub fn run_postgres(project_dir: &Path, request: RunRequest) -> Result<RunResult
                 status: "SUCCEEDED".to_owned(),
             });
         }
+        let invocations = executor.invocations;
         let session = match prior_session {
             Some(session) => session,
             None => store.create(&root, SESSION_TTL)?,
@@ -184,12 +203,13 @@ pub fn run_postgres(project_dir: &Path, request: RunRequest) -> Result<RunResult
             schema_version: 2,
             session_id: session.session_id,
             run_id: Uuid::new_v4().to_string(),
-            invocation_id: Uuid::new_v4().to_string(),
+            invocation_id: run_invocation_id,
             status: "SUCCEEDED".to_owned(),
             execution_mode: execution_plan.execution_mode,
             duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             profile: "python".to_owned(),
             nodes: completed_nodes,
+            invocations,
             warnings: execution_plan.warnings,
         });
     }
@@ -249,6 +269,7 @@ pub fn run_postgres(project_dir: &Path, request: RunRequest) -> Result<RunResult
         duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         profile: profile_name.to_owned(),
         nodes: completed_nodes,
+        invocations: Vec::new(),
         warnings: execution_plan.warnings,
     })
 }

@@ -144,9 +144,13 @@ need a PostgreSQL profile, but effective `security.allow_external_writes` must
 be enabled because model code is arbitrary trusted project code.
 
 The current worker supports only `def model(env)`, `env.setVar()`,
-`env.getVar()`, `env.unsetVar()`, static `env.depends_on()` declarations, and a
-`None` return. Variables commit to the session only after every selected model
-succeeds. The worker runs in a supervised subprocess with a configured timeout
+`env.getVar()`, `env.unsetVar()`, static `env.depends_on()` declarations, a
+`None` return, and `env.run("other.py")` for Python models (with
+`env.manual()` and `mode="manual"`). Nested calls inherit pending variables,
+merge them back only on success, and are limited by
+`execution.max_call_depth` and `execution.max_invocations_per_run`; `env.run()`
+of `.sql` files is not implemented yet. Variables commit to the session only
+after every selected model succeeds. The worker runs in a supervised subprocess with a configured timeout
 and bounded JSON IPC; Windows Job Objects and Unix process groups are
 terminated on timeout. The worker receives a minimal environment allowlist,
 not arbitrary host variables. This is **not a security sandbox**. Python code

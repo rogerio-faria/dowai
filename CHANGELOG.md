@@ -11,3 +11,11 @@
   session-variable defaults; SQL value interpolation remains prohibited.
 - Add the preliminary typed Python SDK package; runtime integration is not
   included.
+- Add imperative `env.run()` for Python models in the supervised runtime:
+  nested invocations inherit pending session variables, merge them back only on
+  success, record an invocation tree, enforce cycle, depth, and invocation-count
+  limits, and raise `DowaiExecutionError` with stable codes. The worker IPC is now
+  bidirectional NDJSON (`protocol_version` 1, additive); `env.run()` of `.sql`
+  returns `DOWAI_NOT_IMPLEMENTED`.
+- Add the GitHub Actions workflow (`.github/workflows/ci.yml`) referenced by the
+  status document.
