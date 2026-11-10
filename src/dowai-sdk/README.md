@@ -1,9 +1,33 @@
 # DOWAI Python SDK
 
-This package currently provides dependency-free Python API types and a
-testable `Env` facade. The DOWAI engine is planned as a Rust application; this
-package does **not** launch it, implement IPC, execute models, or connect to a
-session automatically.
+This package provides dependency-free Python API types, a testable `Env`
+facade, and `DowaiClient`, which drives the `dowai` engine binary (AC034).
+`Env` does not launch the engine; only `DowaiClient` does, and only on request.
+
+## Engine client (AC034)
+
+`DowaiClient` runs `dowai ... --json` and returns what the engine printed, so
+the CLI and Python share one code path. The parity tests compare both paths on
+the same project and journal.
+
+```python
+from dowai import DowaiClient
+
+client = DowaiClient("/path/to/project", binary="/path/to/dowai")  # or DOWAI_BIN / PATH
+plan = client.plan(["consumer.py"])
+result = client.run(["consumer.py"], variables={"batch": 7})
+if result.failed:
+    print(result.error_code)  # stable DOWAI_* code, never a free-text message
+    again = client.retry(result.run_id or client.runs(1)["runs"][0]["run_id"])
+```
+
+Methods: `plan`, `run`, `retry(run_id, failed_only=False, variables=...)`,
+`runs(limit)`, `run_detail(run_id)`, `logs(run_id, node=, level=)`. Engine
+refusals in `run`/`retry` come back as a failed `RunResult`; the others raise
+`DowaiExecutionError` with the engine's code.
+
+The parity test needs a built binary (`DOWAI_BIN` or `target/debug/dowai`) and
+skips otherwise.
 
 ```python
 from dowai import DowaiExecutionError, Env, RunResult
@@ -27,7 +51,7 @@ adapters; they do not imply that the Rust runtime or its policies are present.
 The `Dataset` protocol is intentionally opaque so this package does not promise
 materialization or transport behavior before the engine contract exists.
 
-Run the dependency-free test suite from this directory:
+Run the test suite from this directory (parity tests need the engine binary):
 
 ```powershell
 python -m unittest discover -s tests -v
