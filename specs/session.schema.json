@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dowai.dev/schemas/session.schema.json",
+  "title": "DOWAI session command result",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "status",
+        "session_id",
+        "project_root",
+        "created_at_ms",
+        "expires_at_ms",
+        "variable_names"
+      ],
+      "properties": {
+        "schema_version": { "const": 2 },
+        "status": { "const": "ACTIVE" },
+        "session_id": { "type": "string", "format": "uuid" },
+        "project_root": { "type": "string" },
+        "created_at_ms": { "type": "integer", "minimum": 0 },
+        "expires_at_ms": { "type": "integer", "minimum": 0 },
+        "variable_names": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "status", "session_id"],
+      "properties": {
+        "schema_version": { "const": 2 },
+        "status": { "const": "ENDED" },
+        "session_id": { "type": "string", "format": "uuid" }
+      }
+    }
+  ]
+}

@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dowai.dev/schemas/project.schema.json",
+  "title": "DOWAI project configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "name"],
+  "properties": {
+    "schema_version": {
+      "const": 2
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "models_dir": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Relative path under the project root."
+    },
+    "config": {
+      "type": "object",
+      "description": "Project-level overrides using the DOWAI configuration sections."
+    },
+    "sources": {
+      "type": "object",
+      "description": "Declared PostgreSQL source relations available to source() macros.",
+      "propertyNames": { "pattern": "^[^\\u0000-\\u001f]{1,63}$" },
+      "additionalProperties": { "$ref": "#/$defs/source" }
+    },
+    "python": {
+      "$ref": "#/$defs/python"
+    }
+  },
+  "$defs": {
+    "python": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["interpreter"],
+      "properties": {
+        "interpreter": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Absolute path to the Python interpreter in this project's virtual environment."
+        },
+        "timeout_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400,
+          "default": 300
+        },
+        "dependencies": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "default": []
+        },
+        "package_policy": {
+          "type": "string",
+          "enum": ["declared_and_authorized", "declared_only", "admin_allowlist"],
+          "default": "declared_and_authorized"
+        },
+        "allow_unlisted_packages": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "tables"],
+      "properties": {
+        "schema": { "type": "string", "minLength": 1, "maxLength": 63 },
+        "tables": {
+          "type": "object",
+          "propertyNames": { "pattern": "^[^\\u0000-\\u001f]{1,63}$" },
+          "additionalProperties": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 63
+          }
+        }
+      }
+    }
+  }
+}

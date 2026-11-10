@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dowai.dev/schemas/workspace.schema.json",
+  "title": "DOWAI workspace configuration (implemented profile subset)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version"],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "workspace_name": { "type": "string", "minLength": 1 },
+    "profiles": {
+      "type": "object",
+      "propertyNames": { "pattern": "^[^/\\\\\\u0000-\\u001f]+$" },
+      "additionalProperties": { "$ref": "#/$defs/postgres_profile" }
+    },
+    "defaults": {
+      "type": "object",
+      "description": "Configuration defaults; validated against the effective configuration contract by DOWAI."
+    }
+  },
+  "$defs": {
+    "postgres_profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "host", "port", "user", "database", "password_env"],
+      "properties": {
+        "type": { "const": "postgres" },
+        "host": { "type": "string", "minLength": 1 },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "user": { "type": "string", "minLength": 1 },
+        "database": { "type": "string", "minLength": 1 },
+        "password_env": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+        },
+        "tls": { "enum": ["required", "disabled"], "default": "required" }
+      }
+    }
+  }
+}

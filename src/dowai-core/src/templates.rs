@@ -1,0 +1,834 @@
+use crate::{DowaiError, Result};
+use serde_json::Value;
+use std::collections::BTreeMap;
+
+/// Rendering limits and behavior for the safe SQL template subset.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TemplateOptions {
+    /// Maximum number of nested conditional blocks allowed.
+    pub max_nesting: usize,
+    /// Whether a missing variable without a default is an error.
+    pub strict_undefined: bool,
+}
+
+impl Default for TemplateOptions {
+    fn default() -> Self {
+        Self {
+            max_nesting: 32,
+            strict_undefined: true,
+        }
+    }
+}
+
+/// Rendered SQL and the final values visible to template conditions.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TemplateRender {
+    /// SQL with conditional sections selected; variable values are not interpolated.
+    pub sql: String,
+    /// Initial and defined variables after rendering.
+    pub variables: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Materialization {
+    Table,
+    View,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RenderedSqlModel {
+    pub sql: String,
+    pub variables: BTreeMap<String, Value>,
+    pub materialization: Materialization,
+}
+
+/// Render the supported conditional SQL template subset without evaluating SQL values.
+///
+/// Conditions can read JSON values with `var('name')`, optionally supplying a default,
+/// and may compare the result with a JSON scalar. Bare values use JSON-style truthiness:
+/// null, false, zero, and empty strings, arrays, or objects are false. `def_var` sets a
+/// value only when it is absent. Other SQL text, including `{{ ref(...) }}`, is copied
+/// verbatim.
+pub fn render_template(
+    source: &str,
+    variables: &BTreeMap<String, Value>,
+    options: &TemplateOptions,
+) -> Result<TemplateRender> {
+    let tokens = tokenize(source)?;
+    let mut parser = Parser {
+        tokens,
+        position: 0,
+        max_nesting: options.max_nesting,
+    };
+    let (nodes, stop) = parser.parse_sequence(0)?;
+    if stop.is_some() {
+        return Err(template_error("unexpected conditional closing tag"));
+    }
+
+    let mut context = variables.clone();
+    let mut sql = String::new();
+    render_nodes(&nodes, &mut context, &mut sql, options.strict_undefined)?;
+    Ok(TemplateRender {
+        sql,
+        variables: context,
+    })
+}
+
+#[derive(Debug)]
+enum Node {
+    Text(String),
+    Define {
+        name: String,
+        value: Value,
+    },
+    Conditional {
+        branches: Vec<(Condition, Vec<Node>)>,
+        otherwise: Vec<Node>,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct Condition {
+    name: String,
+    default: Option<Value>,
+    comparison: Option<(Comparison, Value)>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Comparison {
+    Equal,
+    NotEqual,
+}
+
+#[derive(Clone, Debug)]
+enum Token {
+    Text(String),
+    Define { name: String, value: Value },
+    If(Condition),
+    Elif(Condition),
+    Else,
+    EndIf,
+}
+
+fn template_error(message: impl Into<String>) -> DowaiError {
+    DowaiError::Template(message.into())
+}
+
+fn tokenize(source: &str) -> Result<Vec<Token>> {
+    let mut tokens = Vec::new();
+    let mut position = 0;
+    while position < source.len() {
+        let next = ["{%", "{{", "{#"]
+            .iter()
+            .filter_map(|opening| {
+                source[position..]
+                    .find(opening)
+                    .map(|offset| position + offset)
+            })
+            .min();
+        let next = match next {
+            Some(index) => index,
+            None => {
+                push_text(&mut tokens, &source[position..]);
+                break;
+            }
+        };
+        push_text(&mut tokens, &source[position..next]);
+        if source[next..].starts_with("{#") {
+            let content_start = next + 2;
+            let Some(close_offset) = source[content_start..].find("#}") else {
+                return Err(template_error("template comment is missing '#}'"));
+            };
+            position = content_start + close_offset + 2;
+            continue;
+        }
+        let is_alias = source[next..].starts_with("{{");
+        let opening_len = 2;
+        let close = if is_alias { "}}" } else { "%}" };
+        let content_start = next + opening_len;
+        let Some(close_offset) = source[content_start..].find(close) else {
+            return Err(template_error(format!(
+                "template expression is missing '{close}'"
+            )));
+        };
+        let close_start = content_start + close_offset;
+        let content = source[content_start..close_start].trim();
+        let full_end = close_start + close.len();
+        match parse_directive(content)? {
+            Some(token) => tokens.push(token),
+            None if is_alias && is_static_macro_call(content) => {
+                push_text(&mut tokens, &source[next..full_end])
+            }
+            None => return Err(template_error("unsupported or unsafe template expression")),
+        }
+        position = full_end;
+    }
+    Ok(tokens)
+}
+
+fn push_text(tokens: &mut Vec<Token>, text: &str) {
+    if !text.is_empty() {
+        if let Some(Token::Text(previous)) = tokens.last_mut() {
+            previous.push_str(text);
+        } else {
+            tokens.push(Token::Text(text.to_owned()));
+        }
+    }
+}
+
+fn is_static_macro_call(expression: &str) -> bool {
+    parse_static_macro(expression).is_ok()
+}
+
+enum StaticMacro {
+    Ref(String),
+    Source(String, String),
+    Config(BTreeMap<String, Value>),
+}
+
+fn parse_static_macro(expression: &str) -> Result<StaticMacro> {
+    let mut cursor = Cursor::new(expression);
+    let name = cursor.parse_name()?;
+    if !matches!(name.as_str(), "ref" | "source" | "config") {
+        return Err(template_error("unsupported static SQL macro"));
+    }
+    cursor.expect_char('(')?;
+    let mut positional = Vec::new();
+    let mut named = BTreeMap::new();
+    loop {
+        cursor.skip_whitespace();
+        if cursor.consume_char(')') {
+            break;
+        }
+        let key = if cursor
+            .peek_char()
+            .is_some_and(|character| character.is_ascii_alphabetic() || character == '_')
+        {
+            let start = cursor.position;
+            let key = cursor.parse_name()?;
+            cursor.skip_whitespace();
+            if cursor.consume_char('=') {
+                Some(key)
+            } else {
+                cursor.position = start;
+                None
+            }
+        } else {
+            None
+        };
+        let value = cursor.parse_scalar()?;
+        if let Some(key) = key {
+            if named.insert(key, value).is_some() {
+                return Err(template_error("duplicate named SQL macro argument"));
+            }
+        } else {
+            positional.push(value);
+        }
+        cursor.skip_whitespace();
+        if cursor.consume_char(')') {
+            break;
+        }
+        cursor.expect_char(',')?;
+        cursor.skip_whitespace();
+        if cursor.peek_char() == Some(')') {
+            return Err(template_error(
+                "SQL macro arguments cannot end with a comma",
+            ));
+        }
+    }
+    cursor.expect_end()?;
+    match name.as_str() {
+        "ref" if positional.len() == 1 && named.is_empty() => positional[0]
+            .as_str()
+            .map(|reference| StaticMacro::Ref(reference.to_owned()))
+            .ok_or_else(|| template_error("ref() requires one string literal")),
+        "source" if positional.len() == 2 && named.is_empty() => {
+            let source = positional[0]
+                .as_str()
+                .ok_or_else(|| template_error("source() requires two string literals"))?;
+            let table = positional[1]
+                .as_str()
+                .ok_or_else(|| template_error("source() requires two string literals"))?;
+            Ok(StaticMacro::Source(source.to_owned(), table.to_owned()))
+        }
+        "config" if positional.is_empty() && !named.is_empty() => Ok(StaticMacro::Config(named)),
+        "ref" => Err(template_error("ref() requires exactly one string literal")),
+        "source" => Err(template_error(
+            "source() requires exactly two string literals",
+        )),
+        "config" => Err(template_error("config() requires named scalar arguments")),
+        _ => Err(template_error("unsupported static SQL macro")),
+    }
+}
+
+/// Render and validate a SQL model, resolve declared refs, and extract the
+/// supported `materialized` setting. Relation names must already be quoted
+/// safely for the target adapter.
+pub fn render_sql_model(
+    source: &str,
+    variables: &BTreeMap<String, Value>,
+    options: &TemplateOptions,
+    relations: &BTreeMap<String, String>,
+) -> Result<RenderedSqlModel> {
+    validate_static_sources(source, relations, options.max_nesting)?;
+    let rendered = render_template(source, variables, options)?;
+    let mut sql = String::with_capacity(rendered.sql.len());
+    let mut position = 0;
+    let mut materialization = Materialization::Table;
+    let mut configured_materialization = false;
+    while let Some(opening_offset) = rendered.sql[position..].find("{{") {
+        let opening = position + opening_offset;
+        sql.push_str(&rendered.sql[position..opening]);
+        let content_start = opening + 2;
+        let close_offset = rendered.sql[content_start..]
+            .find("}}")
+            .ok_or_else(|| template_error("static SQL macro is missing '}}'"))?;
+        let close = content_start + close_offset;
+        match parse_static_macro(rendered.sql[content_start..close].trim())? {
+            StaticMacro::Ref(reference) => {
+                let relation = relations.get(&reference).ok_or_else(|| {
+                    template_error(format!("ref('{reference}') is not in the plan"))
+                })?;
+                sql.push_str(relation);
+            }
+            StaticMacro::Source(source, table) => {
+                let key = source_relation_key(&source, &table);
+                let relation = relations.get(&key).ok_or_else(|| {
+                    template_error(format!(
+                        "source('{source}', '{table}') is not declared in the project"
+                    ))
+                })?;
+                sql.push_str(relation);
+            }
+            StaticMacro::Config(arguments) => {
+                if configured_materialization {
+                    return Err(template_error(
+                        "a SQL model may contain only one config() call",
+                    ));
+                }
+                configured_materialization = true;
+                if arguments.keys().any(|key| key != "materialized") {
+                    return Err(template_error(
+                        "only config(materialized='table'|'view') is supported",
+                    ));
+                }
+                let value = arguments
+                    .get("materialized")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        template_error("config materialized value must be 'table' or 'view'")
+                    })?;
+                materialization = match value {
+                    "table" => Materialization::Table,
+                    "view" => Materialization::View,
+                    _ => {
+                        return Err(template_error(format!(
+                            "unsupported SQL materialization '{value}'"
+                        )))
+                    }
+                };
+            }
+        }
+        position = close + 2;
+    }
+    sql.push_str(&rendered.sql[position..]);
+    Ok(RenderedSqlModel {
+        sql,
+        variables: rendered.variables,
+        materialization,
+    })
+}
+
+fn validate_static_sources(
+    source: &str,
+    relations: &BTreeMap<String, String>,
+    max_nesting: usize,
+) -> Result<()> {
+    let tokens = tokenize(source)?;
+    let mut parser = Parser {
+        tokens,
+        position: 0,
+        max_nesting,
+    };
+    let (nodes, stop) = parser.parse_sequence(0)?;
+    if stop.is_some() {
+        return Err(template_error("unexpected conditional closing tag"));
+    }
+
+    fn validate_nodes(nodes: &[Node], relations: &BTreeMap<String, String>) -> Result<()> {
+        for node in nodes {
+            match node {
+                Node::Text(text) => {
+                    let mut position = 0;
+                    while let Some(opening_offset) = text[position..].find("{{") {
+                        let opening = position + opening_offset;
+                        let content_start = opening + 2;
+                        let close_offset = text[content_start..]
+                            .find("}}")
+                            .ok_or_else(|| template_error("static SQL macro is missing '}}'"))?;
+                        let close = content_start + close_offset;
+                        if let StaticMacro::Source(source, table) =
+                            parse_static_macro(text[content_start..close].trim())?
+                        {
+                            let key = source_relation_key(&source, &table);
+                            if !relations.contains_key(&key) {
+                                return Err(template_error(format!(
+                                    "source('{source}', '{table}') is not declared in the project"
+                                )));
+                            }
+                        }
+                        position = close + 2;
+                    }
+                }
+                Node::Conditional {
+                    branches,
+                    otherwise,
+                } => {
+                    for (_, branch) in branches {
+                        validate_nodes(branch, relations)?;
+                    }
+                    validate_nodes(otherwise, relations)?;
+                }
+                Node::Define { .. } => {}
+            }
+        }
+        Ok(())
+    }
+
+    validate_nodes(&nodes, relations)
+}
+
+pub fn source_relation_key(source: &str, table: &str) -> String {
+    format!("source:{}:{source}:{table}", source.len())
+}
+
+fn parse_directive(content: &str) -> Result<Option<Token>> {
+    let trimmed = content.trim();
+    let (keyword, expression) = split_keyword(trimmed);
+    if matches!(keyword, "if" | "elif") {
+        let condition = parse_condition(expression)?;
+        return Ok(Some(if keyword == "if" {
+            Token::If(condition)
+        } else {
+            Token::Elif(condition)
+        }));
+    }
+    if trimmed.starts_with("def_var") {
+        let (name, value) = parse_definition(trimmed)?;
+        return Ok(Some(Token::Define { name, value }));
+    }
+    match (keyword, expression.trim()) {
+        ("else", "") => Ok(Some(Token::Else)),
+        ("endif", "") => Ok(Some(Token::EndIf)),
+        _ => Ok(None),
+    }
+}
+
+fn split_keyword(content: &str) -> (&str, &str) {
+    let end = content.find(char::is_whitespace).unwrap_or(content.len());
+    (&content[..end], content[end..].trim())
+}
+
+struct Parser {
+    tokens: Vec<Token>,
+    position: usize,
+    max_nesting: usize,
+}
+
+impl Parser {
+    fn parse_sequence(&mut self, nesting: usize) -> Result<(Vec<Node>, Option<Token>)> {
+        let mut nodes = Vec::new();
+        while let Some(token) = self.tokens.get(self.position) {
+            match token {
+                Token::Text(_) => {
+                    if let Token::Text(text) = self.take() {
+                        nodes.push(Node::Text(text));
+                    }
+                }
+                Token::Define { .. } => {
+                    if let Token::Define { name, value } = self.take() {
+                        nodes.push(Node::Define { name, value });
+                    }
+                }
+                Token::If(_) => {
+                    let Token::If(condition) = self.take() else {
+                        unreachable!()
+                    };
+                    nodes.push(self.parse_conditional(condition, nesting + 1)?);
+                }
+                Token::Elif(_) | Token::Else | Token::EndIf => {
+                    return Ok((nodes, Some(self.take())));
+                }
+            }
+        }
+        Ok((nodes, None))
+    }
+
+    fn parse_conditional(&mut self, first: Condition, nesting: usize) -> Result<Node> {
+        if nesting > self.max_nesting {
+            return Err(template_error(format!(
+                "template nesting exceeds configured maximum of {}",
+                self.max_nesting
+            )));
+        }
+
+        let mut branches = Vec::new();
+        let mut condition = first;
+        let mut otherwise = Vec::new();
+        loop {
+            let (body, stop) = self.parse_sequence(nesting)?;
+            branches.push((condition, body));
+            match stop {
+                Some(Token::Elif(next_condition)) => condition = next_condition,
+                Some(Token::Else) => {
+                    let (body, ending) = self.parse_sequence(nesting)?;
+                    if !matches!(ending, Some(Token::EndIf)) {
+                        return Err(template_error(
+                            "conditional else branch is not closed by endif",
+                        ));
+                    }
+                    otherwise = body;
+                    break;
+                }
+                Some(Token::EndIf) => break,
+                Some(Token::If(_) | Token::Define { .. } | Token::Text(_)) => {
+                    return Err(template_error("unexpected token in conditional"));
+                }
+                None => return Err(template_error("conditional block is missing endif")),
+            }
+        }
+        Ok(Node::Conditional {
+            branches,
+            otherwise,
+        })
+    }
+
+    fn take(&mut self) -> Token {
+        let token = self.tokens[self.position].clone();
+        self.position += 1;
+        token
+    }
+}
+
+fn parse_definition(expression: &str) -> Result<(String, Value)> {
+    let mut cursor = Cursor::new(expression);
+    cursor.expect_identifier("def_var")?;
+    cursor.expect_char('(')?;
+    let name = cursor.parse_name()?;
+    cursor.expect_char(',')?;
+    let value = cursor.parse_scalar()?;
+    cursor.expect_char(')')?;
+    cursor.expect_end()?;
+    Ok((name, value))
+}
+
+fn parse_condition(expression: &str) -> Result<Condition> {
+    let mut cursor = Cursor::new(expression);
+    cursor.expect_identifier("var")?;
+    cursor.expect_char('(')?;
+    let name = cursor.parse_name()?;
+    let default = if cursor.consume_char(',') {
+        Some(cursor.parse_scalar()?)
+    } else {
+        None
+    };
+    cursor.expect_char(')')?;
+    cursor.skip_whitespace();
+    let comparison = if cursor.consume_operator("==") {
+        Some((Comparison::Equal, cursor.parse_scalar()?))
+    } else if cursor.consume_operator("!=") {
+        Some((Comparison::NotEqual, cursor.parse_scalar()?))
+    } else {
+        None
+    };
+    cursor.expect_end()?;
+    Ok(Condition {
+        name,
+        default,
+        comparison,
+    })
+}
+
+fn render_nodes(
+    nodes: &[Node],
+    variables: &mut BTreeMap<String, Value>,
+    output: &mut String,
+    strict_undefined: bool,
+) -> Result<()> {
+    for node in nodes {
+        match node {
+            Node::Text(text) => output.push_str(text),
+            Node::Define { name, value } => {
+                variables
+                    .entry(name.clone())
+                    .or_insert_with(|| value.clone());
+            }
+            Node::Conditional {
+                branches,
+                otherwise,
+            } => {
+                let mut selected = None;
+                for (condition, body) in branches {
+                    if evaluate(condition, variables, strict_undefined)? {
+                        selected = Some(body.as_slice());
+                        break;
+                    }
+                }
+                render_nodes(
+                    selected.unwrap_or(otherwise),
+                    variables,
+                    output,
+                    strict_undefined,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn evaluate(
+    condition: &Condition,
+    variables: &BTreeMap<String, Value>,
+    strict_undefined: bool,
+) -> Result<bool> {
+    let null = Value::Null;
+    let value = match variables
+        .get(&condition.name)
+        .or(condition.default.as_ref())
+    {
+        Some(value) => value,
+        None if !strict_undefined => &null,
+        None => {
+            return Err(template_error(format!(
+                "undefined template variable '{}'",
+                condition.name
+            )))
+        }
+    };
+    Ok(match &condition.comparison {
+        Some((Comparison::Equal, expected)) => value == expected,
+        Some((Comparison::NotEqual, expected)) => value != expected,
+        None => truthy(value),
+    })
+}
+
+fn truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::Number(value) => value.as_f64().unwrap_or(0.0) != 0.0,
+        Value::String(value) => !value.is_empty(),
+        Value::Array(value) => !value.is_empty(),
+        Value::Object(value) => !value.is_empty(),
+    }
+}
+
+struct Cursor<'a> {
+    input: &'a str,
+    position: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(input: &'a str) -> Self {
+        Self { input, position: 0 }
+    }
+
+    fn skip_whitespace(&mut self) {
+        while let Some(character) = self.peek_char() {
+            if !character.is_whitespace() {
+                break;
+            }
+            self.position += character.len_utf8();
+        }
+    }
+
+    fn peek_char(&self) -> Option<char> {
+        self.input[self.position..].chars().next()
+    }
+
+    fn consume_char(&mut self, expected: char) -> bool {
+        self.skip_whitespace();
+        if self.peek_char() == Some(expected) {
+            self.position += expected.len_utf8();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn expect_char(&mut self, expected: char) -> Result<()> {
+        if self.consume_char(expected) {
+            Ok(())
+        } else {
+            Err(template_error(format!(
+                "expected '{expected}' in template expression"
+            )))
+        }
+    }
+
+    fn expect_identifier(&mut self, expected: &str) -> Result<()> {
+        self.skip_whitespace();
+        if self.input[self.position..].starts_with(expected) {
+            self.position += expected.len();
+            if self.peek_char().map_or(true, |character| {
+                !character.is_ascii_alphanumeric() && character != '_'
+            }) {
+                return Ok(());
+            }
+        }
+        Err(template_error(format!(
+            "expected '{expected}' in template expression"
+        )))
+    }
+
+    fn parse_name(&mut self) -> Result<String> {
+        self.skip_whitespace();
+        if self.peek_char() == Some('"') || self.peek_char() == Some('\'') {
+            let quote = self.peek_char().expect("checked above");
+            let start = self.position;
+            self.position += quote.len_utf8();
+            let mut escaped = false;
+            while let Some(character) = self.peek_char() {
+                self.position += character.len_utf8();
+                if escaped {
+                    escaped = false;
+                } else if character == '\\' {
+                    escaped = true;
+                } else if character == quote {
+                    let raw = &self.input[start..self.position];
+                    let json = if quote == '"' {
+                        raw.to_owned()
+                    } else {
+                        single_quoted_to_json(raw)?
+                    };
+                    let parsed: Value = serde_json::from_str(&json)
+                        .map_err(|_| template_error("invalid variable name string"))?;
+                    return parsed
+                        .as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| template_error("variable name must be a string"));
+                }
+            }
+            return Err(template_error("unterminated variable name"));
+        }
+        let start = self.position;
+        while let Some(character) = self.peek_char() {
+            if !character.is_ascii_alphanumeric() && character != '_' {
+                break;
+            }
+            self.position += character.len_utf8();
+        }
+        let name = &self.input[start..self.position];
+        if name.is_empty()
+            || !name
+                .chars()
+                .next()
+                .map_or(false, |first| first.is_ascii_alphabetic() || first == '_')
+        {
+            return Err(template_error(
+                "variable name must be a string or identifier",
+            ));
+        }
+        Ok(name.to_owned())
+    }
+
+    fn parse_scalar(&mut self) -> Result<Value> {
+        self.skip_whitespace();
+        let start = self.position;
+        if matches!(self.peek_char(), Some('"' | '\'')) {
+            let quote = self.peek_char().expect("checked above");
+            self.position += quote.len_utf8();
+            let mut escaped = false;
+            let mut terminated = false;
+            while let Some(character) = self.peek_char() {
+                self.position += character.len_utf8();
+                if escaped {
+                    escaped = false;
+                } else if character == '\\' {
+                    escaped = true;
+                } else if character == quote {
+                    terminated = true;
+                    break;
+                }
+            }
+            if !terminated {
+                return Err(template_error("unterminated string literal"));
+            }
+        } else {
+            while let Some(character) = self.peek_char() {
+                if character.is_whitespace() || character == ')' || character == ',' {
+                    break;
+                }
+                self.position += character.len_utf8();
+            }
+        }
+        if start == self.position {
+            return Err(template_error("expected JSON scalar"));
+        }
+        let literal = &self.input[start..self.position];
+        let json = if literal.starts_with('\'') {
+            single_quoted_to_json(literal)?
+        } else {
+            literal.to_owned()
+        };
+        let value: Value =
+            serde_json::from_str(&json).map_err(|_| template_error("expected JSON scalar"))?;
+        if value.is_array() || value.is_object() {
+            return Err(template_error("template values must be JSON scalars"));
+        }
+        Ok(value)
+    }
+
+    fn consume_operator(&mut self, operator: &str) -> bool {
+        self.skip_whitespace();
+        if self.input[self.position..].starts_with(operator) {
+            self.position += operator.len();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn expect_end(&mut self) -> Result<()> {
+        self.skip_whitespace();
+        if self.position == self.input.len() {
+            Ok(())
+        } else {
+            Err(template_error("unsupported template expression"))
+        }
+    }
+}
+
+fn single_quoted_to_json(raw: &str) -> Result<String> {
+    let inner = raw
+        .strip_prefix('\'')
+        .and_then(|text| text.strip_suffix('\''))
+        .ok_or_else(|| template_error("invalid quoted variable name"))?;
+    let mut json = String::from("\"");
+    let mut characters = inner.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '"' => json.push_str("\\\""),
+            '\\' => {
+                let escaped = characters
+                    .next()
+                    .ok_or_else(|| template_error("invalid escape in variable name"))?;
+                match escaped {
+                    '\'' => json.push('\''),
+                    '"' => json.push_str("\\\""),
+                    '\\' => json.push_str("\\\\"),
+                    'n' => json.push_str("\\n"),
+                    'r' => json.push_str("\\r"),
+                    't' => json.push_str("\\t"),
+                    other => {
+                        json.push('\\');
+                        json.push(other);
+                    }
+                }
+            }
+            other => json.push(other),
+        }
+    }
+    json.push('"');
+    Ok(json)
+}

@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dowai.dev/schemas/run.schema.json",
+  "title": "DOWAI SQL run result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "session_id",
+    "run_id",
+    "invocation_id",
+    "status",
+    "execution_mode",
+    "duration_ms",
+    "profile",
+    "nodes",
+    "warnings"
+  ],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "session_id": { "type": "string", "format": "uuid" },
+    "run_id": { "type": "string", "format": "uuid" },
+    "invocation_id": { "type": "string", "format": "uuid" },
+    "status": { "const": "SUCCEEDED" },
+    "execution_mode": { "enum": ["automatic", "manual"] },
+    "duration_ms": { "type": "integer", "minimum": 0 },
+    "profile": { "type": "string", "minLength": 1 },
+    "nodes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "relation", "materialization", "status"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "relation": { "type": "string", "minLength": 1 },
+          "materialization": { "enum": ["table", "view"] },
+          "status": { "const": "SUCCEEDED" }
+        }
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  }
+}

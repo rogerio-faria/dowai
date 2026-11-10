@@ -1,0 +1,10 @@
+[package]
+name = "dowai-postgres"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+postgres.workspace = true
+postgres-native-tls.workspace = true
+native-tls.workspace = true

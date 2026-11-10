@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dowai.dev/schemas/config.schema.json",
+  "title": "DOWAI effective configuration output",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "effective", "origins", "sources"],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "effective": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "execution": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["default_mode", "default_profile", "stop_on_error", "allow_manual_mode", "max_call_depth", "max_invocations_per_run"],
+          "properties": {
+            "default_mode": { "enum": ["automatic", "manual"] },
+            "default_profile": { "type": ["string", "null"], "minLength": 1 },
+            "stop_on_error": { "type": "boolean" },
+            "allow_manual_mode": { "type": "boolean" },
+            "max_call_depth": { "type": "integer", "minimum": 1 },
+            "max_invocations_per_run": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "templates": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["strict_undefined", "allow_dowai_if_alias", "max_nesting_depth"],
+          "properties": {
+            "strict_undefined": { "type": "boolean" },
+            "allow_dowai_if_alias": { "type": "boolean" },
+            "max_nesting_depth": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "security": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["allow_external_writes", "require_approval_for_destructive", "allowed_paths", "allowed_hosts", "allowed_profiles"],
+          "properties": {
+            "allow_external_writes": { "type": "boolean" },
+            "require_approval_for_destructive": { "type": "boolean" },
+            "allowed_paths": { "type": "array", "items": { "type": "string" } },
+            "allowed_hosts": { "type": "array", "items": { "type": "string" } },
+            "allowed_profiles": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "ai": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "allow_data_rows"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "allow_data_rows": { "type": "boolean" }
+          }
+        }
+      },
+      "required": ["execution", "templates", "security", "ai"]
+    },
+    "origins": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "sources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["engine_defaults", "user", "workspace", "project", "admin"],
+      "properties": {
+        "engine_defaults": { "const": "active" },
+        "user": { "enum": ["loaded", "not_loaded"] },
+        "workspace": { "enum": ["loaded", "not_loaded"] },
+        "project": { "enum": ["loaded", "not_loaded"] },
+        "admin": { "enum": ["loaded", "not_loaded"] }
+      }
+    }
+  }
+}

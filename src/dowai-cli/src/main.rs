@@ -1,0 +1,733 @@
+use clap::{Args, Parser, Subcommand};
+use dowai_core::{
+    admin_config_path, create_project, default_session_store_path, plan,
+    resolve_effective_configuration, user_config_path, validate_project_with_configuration,
+    DowaiError, ExecutionMode, Result, SessionMetadata, SessionStore, TemplateOptions,
+};
+use dowai_runtime::{check_postgres_connection, prepare_postgres_plan, run_postgres, RunRequest};
+use serde_json::{json, Value};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::time::Duration;
+
+const DEFAULT_SESSION_TTL_SECONDS: u64 = 86_400;
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "dowai",
+    version,
+    about = "Data Objects With AI — local workflow engine"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    Init(InitArgs),
+    Doctor(JsonArgs),
+    Validate(ValidateArgs),
+    Plan(PlanArgs),
+    Session {
+        #[command(subcommand)]
+        command: SessionCommand,
+    },
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+    Run(RunArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum SessionCommand {
+    Start {
+        #[arg(long)]
+        project_dir: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    Show {
+        session_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    End {
+        session_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Args)]
+struct InitArgs {
+    name: String,
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct JsonArgs {
+    #[arg(long)]
+    check_connections: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ValidateArgs {
+    path: Option<PathBuf>,
+    #[arg(long)]
+    strict: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct PlanArgs {
+    #[arg(required = true, num_args = 1..)]
+    targets: Vec<String>,
+    #[arg(long)]
+    manual: bool,
+    #[arg(long)]
+    vars: Option<String>,
+    #[arg(long)]
+    project_dir: Option<PathBuf>,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    Show {
+        #[arg(long)]
+        effective: bool,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        project_dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Args)]
+struct RunArgs {
+    #[arg(required = true, num_args = 1..)]
+    targets: Vec<String>,
+    #[arg(long)]
+    manual: bool,
+    #[arg(long)]
+    profile: Option<String>,
+    #[arg(long)]
+    session: Option<String>,
+    #[arg(long)]
+    vars: Option<String>,
+    #[arg(long)]
+    full_refresh: bool,
+    #[arg(long, help = "Confirm replacement of existing PostgreSQL relations")]
+    yes: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    let json_output = wants_json(&cli.command);
+    match dispatch(cli.command) {
+        Ok(Some(value)) => match serde_json::to_string_pretty(&value) {
+            Ok(output) => {
+                println!("{output}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("DOWAI_OUTPUT_ERROR: {error}");
+                ExitCode::from(2)
+            }
+        },
+        Ok(None) => ExitCode::SUCCESS,
+        Err(error) => {
+            if json_output {
+                println!(
+                    "{}",
+                    json!({
+                        "schema_version": 2,
+                        "status": "FAILED",
+                        "error_code": error.code(),
+                        "message": error.message(),
+                        "details": error.details()
+                    })
+                );
+            } else {
+                eprintln!("{error}");
+            }
+            ExitCode::from(error.exit_code() as u8)
+        }
+    }
+}
+
+fn dispatch(command: Command) -> Result<Option<Value>> {
+    match command {
+        Command::Init(args) => {
+            let workspace = match args.workspace {
+                Some(path) => path,
+                None => std::env::current_dir()?,
+            };
+            let root = create_project(&workspace, &args.name)?;
+            if args.json {
+                Ok(Some(json!({
+                    "schema_version": 2,
+                    "status": "CREATED",
+                    "project_dir": root,
+                    "message": "Project initialized"
+                })))
+            } else {
+                println!("Project initialized at {}", root.display());
+                Ok(None)
+            }
+        }
+        Command::Doctor(args) => {
+            let current = find_project_root(&std::env::current_dir()?)?;
+            let report = validate_project_with_configuration(
+                &current,
+                user_config_path().as_deref(),
+                admin_config_path().as_deref(),
+            );
+            let report_value = serde_json::to_value(&report)
+                .map_err(|error| DowaiError::Config(error.to_string()))?;
+            let sql_database = if args.check_connections {
+                check_postgres_connection(&current, None)?;
+                "connected"
+            } else {
+                "not_checked"
+            };
+            let result = json!({
+                "schema_version": 2,
+                "status": if report.valid { "HEALTHY" } else { "DEGRADED" },
+                "project": report.project,
+                "diagnostics": report.diagnostics,
+                "checks": {
+                    "project_config": report.valid,
+                    "sql_database": sql_database,
+                    "python_runtime": "partial"
+                }
+            });
+            if !report.valid {
+                return Err(DowaiError::Validation {
+                    message: "Project health check failed".to_owned(),
+                    report: report_value,
+                });
+            }
+            if args.json {
+                Ok(Some(result))
+            } else {
+                println!("DOWAI project checks passed.");
+                if args.check_connections {
+                    println!("PostgreSQL connection check passed.");
+                }
+                println!("Python runtime supports limited Python-only model execution.");
+                Ok(None)
+            }
+        }
+        Command::Validate(args) => {
+            let _strict = args.strict;
+            let project_dir = match args.path {
+                Some(path) => path,
+                None => std::env::current_dir()?,
+            };
+            let report = validate_project_with_configuration(
+                &project_dir,
+                user_config_path().as_deref(),
+                admin_config_path().as_deref(),
+            );
+            let value = serde_json::to_value(&report)
+                .map_err(|error| DowaiError::Config(error.to_string()))?;
+            if !report.valid {
+                return Err(DowaiError::Validation {
+                    message: format!(
+                        "Project validation failed with {} diagnostic(s)",
+                        report.diagnostics.len()
+                    ),
+                    report: value,
+                });
+            }
+            let execution_plan = plan(&project_dir, &["all".to_owned()], ExecutionMode::Automatic)?;
+            let mut validation_options = template_options(&project_dir)?;
+            validation_options.strict_undefined = false;
+            prepare_postgres_plan(
+                &project_dir,
+                &execution_plan,
+                &BTreeMap::new(),
+                &validation_options,
+            )?;
+            if args.json {
+                Ok(Some(value))
+            } else {
+                println!("Project is valid.");
+                Ok(None)
+            }
+        }
+        Command::Plan(args) => {
+            let variables = parse_vars(args.vars.as_deref())?;
+            let project_dir = match args.project_dir {
+                Some(path) => path,
+                None => find_project_root(&std::env::current_dir()?)?,
+            };
+            let mode = if args.manual {
+                ExecutionMode::Manual
+            } else {
+                ExecutionMode::Automatic
+            };
+            let result = plan(&project_dir, &args.targets, mode)?;
+            prepare_postgres_plan(
+                &project_dir,
+                &result,
+                &variables,
+                &template_options(&project_dir)?,
+            )?;
+            if args.json {
+                Ok(Some(
+                    serde_json::to_value(result)
+                        .map_err(|error| DowaiError::Model(error.to_string()))?,
+                ))
+            } else {
+                println!("Plan ({})", result.execution_mode);
+                for node in result.nodes {
+                    if node.depends_on.is_empty() {
+                        println!("  {}", node.id);
+                    } else {
+                        println!("  {} <- {}", node.id, node.depends_on.join(", "));
+                    }
+                }
+                for warning in result.warnings {
+                    eprintln!("Warning: {warning}");
+                }
+                Ok(None)
+            }
+        }
+        Command::Session { command } => {
+            let path = default_session_store_path().ok_or_else(|| {
+                DowaiError::State("No user state directory is available".to_owned())
+            })?;
+            dispatch_session(command, &SessionStore::for_user_state(path))
+        }
+        Command::Config { command } => match command {
+            ConfigCommand::Show {
+                effective,
+                json,
+                project_dir,
+            } => {
+                if !effective {
+                    return Err(DowaiError::Config(
+                        "Specify --effective; partial config inspection is not available"
+                            .to_owned(),
+                    ));
+                }
+                let config_root = match project_dir {
+                    Some(path) => path,
+                    None => find_config_root(&std::env::current_dir()?),
+                };
+                let config = resolve_effective_configuration(
+                    &config_root,
+                    user_config_path().as_deref(),
+                    admin_config_path().as_deref(),
+                )?;
+                if json {
+                    Ok(Some(config))
+                } else {
+                    let output = serde_json::to_string_pretty(&config)
+                        .map_err(|error| DowaiError::Config(error.to_string()))?;
+                    println!("{output}");
+                    Ok(None)
+                }
+            }
+        },
+        Command::Run(args) => {
+            if args.full_refresh {
+                return Err(DowaiError::NotImplemented(
+                    "The separate full-refresh operation is not implemented yet".to_owned(),
+                ));
+            }
+            let project_dir = find_project_root(&std::env::current_dir()?)?;
+            let result = run_postgres(
+                &project_dir,
+                RunRequest {
+                    targets: args.targets,
+                    mode: if args.manual {
+                        Some(ExecutionMode::Manual)
+                    } else {
+                        None
+                    },
+                    profile: args.profile,
+                    session_id: args.session,
+                    variables: parse_vars(args.vars.as_deref())?,
+                    confirm_destructive: args.yes,
+                },
+            )?;
+            if args.json {
+                Ok(Some(
+                    serde_json::to_value(result)
+                        .map_err(|error| DowaiError::Model(error.to_string()))?,
+                ))
+            } else {
+                println!(
+                    "Run {} succeeded (session {}).",
+                    result.run_id, result.session_id
+                );
+                for node in result.nodes {
+                    println!(
+                        "  {} -> {} ({})",
+                        node.id, node.relation, node.materialization
+                    );
+                }
+                for warning in result.warnings {
+                    eprintln!("Warning: {warning}");
+                }
+                Ok(None)
+            }
+        }
+    }
+}
+
+fn template_options(project_dir: &Path) -> Result<TemplateOptions> {
+    let configuration = resolve_effective_configuration(
+        project_dir,
+        user_config_path().as_deref(),
+        admin_config_path().as_deref(),
+    )?;
+    let templates = &configuration["effective"]["templates"];
+    let max_nesting = templates["max_nesting_depth"]
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| {
+            DowaiError::Config("Effective templates.max_nesting_depth is invalid".to_owned())
+        })?;
+    let strict_undefined = templates["strict_undefined"].as_bool().ok_or_else(|| {
+        DowaiError::Config("Effective templates.strict_undefined is invalid".to_owned())
+    })?;
+    Ok(TemplateOptions {
+        max_nesting,
+        strict_undefined,
+    })
+}
+
+fn wants_json(command: &Command) -> bool {
+    match command {
+        Command::Init(args) => args.json,
+        Command::Doctor(args) => args.json,
+        Command::Validate(args) => args.json,
+        Command::Plan(args) => args.json,
+        Command::Session { command } => match command {
+            SessionCommand::Start { json, .. }
+            | SessionCommand::Show { json, .. }
+            | SessionCommand::End { json, .. } => *json,
+        },
+        Command::Config { command } => match command {
+            ConfigCommand::Show { json, .. } => *json,
+        },
+        Command::Run(args) => args.json,
+    }
+}
+
+fn dispatch_session(command: SessionCommand, store: &SessionStore) -> Result<Option<Value>> {
+    match command {
+        SessionCommand::Start { project_dir, json } => {
+            let project_root = match project_dir {
+                Some(path) => path,
+                None => find_project_root(&std::env::current_dir()?)?,
+            };
+            let session = store.create(
+                &project_root,
+                Duration::from_secs(DEFAULT_SESSION_TTL_SECONDS),
+            )?;
+            if json {
+                Ok(Some(session_json(&session, Vec::new())))
+            } else {
+                println!("Session started: {}", session.session_id);
+                println!("Project: {}", session.project_root.display());
+                Ok(None)
+            }
+        }
+        SessionCommand::Show { session_id, json } => {
+            let session = store.get(&session_id)?;
+            let variable_names = store.variable_names(&session_id)?;
+            if json {
+                Ok(Some(session_json(&session, variable_names)))
+            } else {
+                println!("Session: {}", session.session_id);
+                println!("Status: {}", session.status);
+                println!("Project: {}", session.project_root.display());
+                println!("Variables: {}", variable_names.len());
+                Ok(None)
+            }
+        }
+        SessionCommand::End { session_id, json } => {
+            store.end(&session_id)?;
+            if json {
+                Ok(Some(json!({
+                    "schema_version": 2,
+                    "status": "ENDED",
+                    "session_id": session_id
+                })))
+            } else {
+                println!("Session ended: {session_id}");
+                Ok(None)
+            }
+        }
+    }
+}
+
+fn session_json(session: &SessionMetadata, variable_names: Vec<String>) -> Value {
+    json!({
+        "schema_version": 2,
+        "status": session.status,
+        "session_id": session.session_id,
+        "project_root": session.project_root,
+        "created_at_ms": session.created_at_ms,
+        "expires_at_ms": session.expires_at_ms,
+        "variable_names": variable_names
+    })
+}
+
+fn parse_vars(raw: Option<&str>) -> Result<BTreeMap<String, Value>> {
+    if let Some(raw) = raw {
+        let value: Value = serde_json::from_str(raw)
+            .map_err(|error| DowaiError::Config(format!("Invalid --vars JSON: {error}")))?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| DowaiError::Config("--vars must be a JSON object".to_owned()))?;
+        return Ok(object
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect());
+    }
+    Ok(BTreeMap::new())
+}
+
+fn find_project_root(start: &Path) -> Result<PathBuf> {
+    for candidate in start.ancestors() {
+        if candidate.join("dowai_project.json").is_file() {
+            return Ok(candidate.to_path_buf());
+        }
+    }
+    Err(DowaiError::Config(
+        "No dowai_project.json found in the current directory or its parents; use --project-dir"
+            .to_owned(),
+    ))
+}
+
+fn find_config_root(start: &Path) -> PathBuf {
+    start
+        .ancestors()
+        .find(|candidate| {
+            candidate.join("dowai_project.json").is_file()
+                || candidate.join("workspace.json").is_file()
+        })
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| start.to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        dispatch, dispatch_session, parse_vars, Command, PlanArgs, SessionCommand, ValidateArgs,
+    };
+    use dowai_core::{SessionLimits, SessionStore};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TestProject(PathBuf);
+
+    impl TestProject {
+        fn new() -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock is after Unix epoch")
+                .as_nanos();
+            let root =
+                std::env::temp_dir().join(format!("dowai-cli-test-{}-{nonce}", std::process::id()));
+            fs::create_dir_all(root.join("models")).expect("create models directory");
+            fs::write(
+                root.join("dowai_project.json"),
+                r#"{"schema_version":2,"name":"fixture","models_dir":"models"}"#,
+            )
+            .expect("write project configuration");
+            Self(root)
+        }
+
+        fn write_model(&self, source: &str) {
+            fs::write(self.0.join("models/model.sql"), source).expect("write model");
+        }
+    }
+
+    impl Drop for TestProject {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn vars_must_be_a_json_object() {
+        assert!(parse_vars(Some(r#"{"flag":true}"#)).is_ok());
+        assert!(parse_vars(Some(r#"[true]"#)).is_err());
+        assert!(parse_vars(Some("not-json")).is_err());
+    }
+
+    #[test]
+    fn plan_uses_vars_to_validate_sql_templates() {
+        let project = TestProject::new();
+        project.write_model("{% if var('enabled') %}select 1{% endif %}");
+
+        let result = dispatch(Command::Plan(PlanArgs {
+            targets: vec!["model.sql".to_owned()],
+            manual: false,
+            vars: Some(r#"{"enabled":true}"#.to_owned()),
+            project_dir: Some(project.0.clone()),
+            json: true,
+        }))
+        .expect("provided vars should validate the model template");
+
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn plan_fails_for_template_variables_missing_from_vars_and_definitions() {
+        let project = TestProject::new();
+        project.write_model("{% if var('enabled') %}select 1{% endif %}");
+
+        let error = dispatch(Command::Plan(PlanArgs {
+            targets: vec!["model.sql".to_owned()],
+            manual: false,
+            vars: None,
+            project_dir: Some(project.0.clone()),
+            json: true,
+        }))
+        .expect_err("missing strict variables should fail planning");
+
+        assert_eq!(error.code(), "DOWAI_TEMPLATE_INVALID");
+    }
+
+    #[test]
+    fn plan_rejects_undeclared_external_sources_before_execution() {
+        let project = TestProject::new();
+        project.write_model("select * from {{ source('sales', 'orders') }}");
+
+        let error = dispatch(Command::Plan(PlanArgs {
+            targets: vec!["model.sql".to_owned()],
+            manual: false,
+            vars: None,
+            project_dir: Some(project.0.clone()),
+            json: true,
+        }))
+        .expect_err("undeclared sources must fail planning");
+
+        assert_eq!(error.code(), "DOWAI_TEMPLATE_INVALID");
+    }
+
+    #[test]
+    fn plan_does_not_parse_python_models_as_sql_templates() {
+        let project = TestProject::new();
+        fs::write(
+            project.0.join("models/model.py"),
+            "def model(env):\n    return \"{{ var('enabled') }}\"\n",
+        )
+        .expect("write Python model");
+
+        let result = dispatch(Command::Plan(PlanArgs {
+            targets: vec!["model.py".to_owned()],
+            manual: false,
+            vars: None,
+            project_dir: Some(project.0.clone()),
+            json: true,
+        }))
+        .expect("planning Python models must not invoke SQL template rendering");
+
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn validate_rejects_undeclared_external_sources() {
+        let project = TestProject::new();
+        project.write_model("select * from {{ source('sales', 'orders') }}");
+
+        let error = dispatch(Command::Validate(ValidateArgs {
+            path: Some(project.0.clone()),
+            strict: false,
+            json: true,
+        }))
+        .expect_err("validation must resolve all declared source macros");
+
+        assert_eq!(error.code(), "DOWAI_TEMPLATE_INVALID");
+    }
+
+    #[test]
+    fn validate_allows_variables_that_are_supplied_only_at_run_time() {
+        let project = TestProject::new();
+        project.write_model("{% if var('enabled') %}select 1{% endif %}");
+
+        let result = dispatch(Command::Validate(ValidateArgs {
+            path: Some(project.0.clone()),
+            strict: false,
+            json: true,
+        }))
+        .expect("static validation should not require run-time values")
+        .expect("JSON validation report");
+
+        assert_eq!(result["valid"], true);
+    }
+
+    #[test]
+    fn session_commands_show_metadata_without_variable_values() {
+        let project = TestProject::new();
+        let store = SessionStore::with_limits(
+            project.0.join("state/sessions.sqlite3"),
+            SessionLimits::default(),
+        );
+        let started = dispatch_session(
+            SessionCommand::Start {
+                project_dir: Some(project.0.clone()),
+                json: true,
+            },
+            &store,
+        )
+        .expect("start session")
+        .expect("JSON response");
+        let session_id = started["session_id"]
+            .as_str()
+            .expect("session id")
+            .to_owned();
+        store
+            .set_variable(
+                &session_id,
+                "secret_token",
+                &serde_json::json!("must not appear"),
+            )
+            .expect("set session variable");
+
+        let shown = dispatch_session(
+            SessionCommand::Show {
+                session_id: session_id.clone(),
+                json: true,
+            },
+            &store,
+        )
+        .expect("show session")
+        .expect("JSON response");
+
+        assert_eq!(shown["variable_names"], serde_json::json!(["secret_token"]));
+        assert!(shown.to_string().find("must not appear").is_none());
+        let ended = dispatch_session(
+            SessionCommand::End {
+                session_id,
+                json: true,
+            },
+            &store,
+        )
+        .expect("end session")
+        .expect("JSON response");
+        assert_eq!(ended["status"], "ENDED");
+    }
+}
