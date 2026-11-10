@@ -83,6 +83,103 @@ pub struct RunStore {
     secure_parent: bool,
 }
 
+/// Log verbosity for `dowai logs` (plan 12.2). The journal stores no free-form messages, so
+/// levels are a severity threshold over invocation status:
+/// ERROR = FAILED; WARN = FAILED + SKIPPED; INFO, DEBUG and TRACE = every invocation
+/// (DEBUG and TRACE add no data, because none is recorded).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl std::str::FromStr for LogLevel {
+    type Err = DowaiError;
+
+    fn from_str(text: &str) -> Result<Self> {
+        match text.to_ascii_uppercase().as_str() {
+            "ERROR" => Ok(Self::Error),
+            "WARN" => Ok(Self::Warn),
+            "INFO" => Ok(Self::Info),
+            "DEBUG" => Ok(Self::Debug),
+            "TRACE" => Ok(Self::Trace),
+            _ => Err(DowaiError::Config(
+                "Log level must be one of ERROR, WARN, INFO, DEBUG, TRACE".to_owned(),
+            )),
+        }
+    }
+}
+
+impl LogLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "ERROR",
+            Self::Warn => "WARN",
+            Self::Info => "INFO",
+            Self::Debug => "DEBUG",
+            Self::Trace => "TRACE",
+        }
+    }
+
+    fn admits(self, status: &str) -> bool {
+        match self {
+            Self::Error => status == "FAILED",
+            Self::Warn => status == "FAILED" || status == "SKIPPED",
+            Self::Info | Self::Debug | Self::Trace => true,
+        }
+    }
+}
+
+/// Keep invocations admitted by `level` whose target equals `node` or whose file name
+/// (last path segment) equals `node`. Order is preserved.
+pub fn filter_invocations(
+    invocations: &[InvocationEntry],
+    node: Option<&str>,
+    level: LogLevel,
+) -> Vec<InvocationEntry> {
+    invocations
+        .iter()
+        .filter(|entry| level.admits(&entry.status))
+        .filter(|entry| {
+            node.is_none_or(|node| {
+                entry.target == node || entry.target.rsplit(['/', '\\']).next() == Some(node)
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+/// Tree depth of each invocation (roots and entries with unknown parents are 0).
+pub fn invocation_depths(invocations: &[InvocationEntry]) -> Vec<usize> {
+    let parents: std::collections::HashMap<&str, Option<&str>> = invocations
+        .iter()
+        .map(|entry| {
+            (
+                entry.invocation_id.as_str(),
+                entry.parent_invocation_id.as_deref(),
+            )
+        })
+        .collect();
+    invocations
+        .iter()
+        .map(|entry| {
+            let mut depth = 0;
+            let mut current = entry.parent_invocation_id.as_deref();
+            while let Some(parent) = current.filter(|id| parents.contains_key(id)) {
+                depth += 1;
+                if depth > invocations.len() {
+                    break;
+                }
+                current = parents[parent];
+            }
+            depth
+        })
+        .collect()
+}
+
 /// The journal lives next to the session store, in the same user state directory.
 pub fn default_run_store_path() -> Option<PathBuf> {
     crate::default_session_store_path().map(|path| path.with_file_name("runs.sqlite3"))
@@ -601,5 +698,89 @@ mod tests {
     fn invalid_status_is_rejected() {
         let fixture = Fixture::new();
         assert!(fixture.store.record(&run("r", 1, "BOGUS"), &[]).is_err());
+    }
+
+    fn entry(id: &str, parent: Option<&str>, target: &str, status: &str) -> InvocationEntry {
+        InvocationEntry {
+            invocation_id: id.to_owned(),
+            run_id: "run".to_owned(),
+            parent_invocation_id: parent.map(str::to_owned),
+            kind: "sql".to_owned(),
+            target: target.to_owned(),
+            call_type: "static".to_owned(),
+            status: status.to_owned(),
+            error_code: None,
+            duration_ms: 1,
+        }
+    }
+
+    fn sample() -> Vec<InvocationEntry> {
+        vec![
+            entry("a", None, "models/a.sql", "SUCCEEDED"),
+            entry("b", Some("a"), "b.sql", "SKIPPED"),
+            entry("c", Some("a"), "c.py", "FAILED"),
+        ]
+    }
+
+    fn ids(entries: &[InvocationEntry]) -> Vec<&str> {
+        entries.iter().map(|e| e.invocation_id.as_str()).collect()
+    }
+
+    #[test]
+    fn log_levels_parse_case_insensitively_and_reject_unknown() {
+        for (text, level) in [
+            ("ERROR", LogLevel::Error),
+            ("warn", LogLevel::Warn),
+            ("Info", LogLevel::Info),
+            ("DEBUG", LogLevel::Debug),
+            ("trace", LogLevel::Trace),
+        ] {
+            assert_eq!(text.parse::<LogLevel>().expect("level"), level);
+        }
+        for bad in ["", "FATAL", "warning", " INFO"] {
+            assert!(matches!(
+                bad.parse::<LogLevel>(),
+                Err(DowaiError::Config(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn level_filter_is_a_severity_threshold_over_statuses() {
+        let all = sample();
+        assert_eq!(ids(&filter_invocations(&all, None, LogLevel::Error)), ["c"]);
+        assert_eq!(
+            ids(&filter_invocations(&all, None, LogLevel::Warn)),
+            ["b", "c"]
+        );
+        for level in [LogLevel::Info, LogLevel::Debug, LogLevel::Trace] {
+            assert_eq!(ids(&filter_invocations(&all, None, level)), ["a", "b", "c"]);
+        }
+    }
+
+    #[test]
+    fn node_filter_matches_target_path_or_file_name_exactly() {
+        let all = sample();
+        for node in ["models/a.sql", "a.sql"] {
+            assert_eq!(
+                ids(&filter_invocations(&all, Some(node), LogLevel::Info)),
+                ["a"]
+            );
+        }
+        assert!(filter_invocations(&all, Some("a"), LogLevel::Info).is_empty());
+        assert!(filter_invocations(&all, Some("missing.sql"), LogLevel::Error).is_empty());
+        assert_eq!(
+            ids(&filter_invocations(&all, Some("c.py"), LogLevel::Warn)),
+            ["c"]
+        );
+        assert!(filter_invocations(&all, Some("a.sql"), LogLevel::Error).is_empty());
+    }
+
+    #[test]
+    fn depths_follow_parent_links_and_tolerate_missing_parents() {
+        let mut all = sample();
+        all.push(entry("d", Some("c"), "d.sql", "FAILED"));
+        all.push(entry("e", Some("ghost"), "e.sql", "FAILED"));
+        assert_eq!(invocation_depths(&all), [0, 1, 1, 2, 0]);
     }
 }

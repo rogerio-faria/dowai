@@ -1,9 +1,9 @@
 use clap::{Args, Parser, Subcommand};
 use dowai_core::{
-    admin_config_path, create_project, default_run_store_path, default_session_store_path, plan,
-    resolve_effective_configuration, user_config_path, validate_project_with_configuration,
-    DowaiError, ExecutionMode, Result, RunDetail, RunStore, RunSummary, SessionMetadata,
-    SessionStore, TemplateOptions,
+    admin_config_path, create_project, default_run_store_path, default_session_store_path,
+    filter_invocations, invocation_depths, plan, resolve_effective_configuration, user_config_path,
+    validate_project_with_configuration, DowaiError, ExecutionMode, InvocationEntry, LogLevel,
+    Result, RunDetail, RunStore, RunSummary, SessionMetadata, SessionStore, TemplateOptions,
 };
 use dowai_runtime::{check_postgres_connection, prepare_postgres_plan, run_postgres, RunRequest};
 use serde_json::{json, Value};
@@ -41,6 +41,20 @@ enum Command {
         command: ConfigCommand,
     },
     Run(RunArgs),
+    /// Show the invocation tree of one run from the journal (no free-form messages).
+    ///
+    /// Levels: ERROR = FAILED; WARN = FAILED and SKIPPED; INFO (default), DEBUG and
+    /// TRACE = every invocation (the journal records nothing more detailed).
+    Logs {
+        run_id: String,
+        /// Only invocations whose target (or its file name) equals this value.
+        #[arg(long)]
+        node: Option<String>,
+        #[arg(long, default_value = "INFO")]
+        level: String,
+        #[arg(long)]
+        json: bool,
+    },
     Runs {
         #[command(subcommand)]
         command: RunsCommand,
@@ -336,6 +350,23 @@ fn dispatch(command: Command) -> Result<Option<Value>> {
             })?;
             dispatch_session(command, &SessionStore::for_user_state(path))
         }
+        Command::Logs {
+            run_id,
+            node,
+            level,
+            json,
+        } => {
+            let path = default_run_store_path().ok_or_else(|| {
+                DowaiError::State("No user state directory is available".to_owned())
+            })?;
+            dispatch_logs(
+                &run_id,
+                node.as_deref(),
+                &level,
+                json,
+                &RunStore::for_user_state(path),
+            )
+        }
         Command::Runs { command } => {
             let path = default_run_store_path().ok_or_else(|| {
                 DowaiError::State("No user state directory is available".to_owned())
@@ -457,6 +488,7 @@ fn wants_json(command: &Command) -> bool {
             ConfigCommand::Show { json, .. } => *json,
         },
         Command::Run(args) => args.json,
+        Command::Logs { json, .. } => *json,
         Command::Runs { command } => match command {
             RunsCommand::List { json, .. } | RunsCommand::Show { json, .. } => *json,
         },
@@ -492,6 +524,67 @@ fn dispatch_runs(command: RunsCommand, store: &RunStore) -> Result<Option<Value>
             Ok(None)
         }
     }
+}
+
+fn dispatch_logs(
+    run_id: &str,
+    node: Option<&str>,
+    level: &str,
+    json: bool,
+    store: &RunStore,
+) -> Result<Option<Value>> {
+    let level: LogLevel = level.parse()?;
+    validate_run_id(run_id)?;
+    let detail = store.get(run_id)?;
+    let depths = invocation_depths(&detail.invocations);
+    let visible = filter_invocations(&detail.invocations, node, level);
+    let entries: Vec<(usize, &InvocationEntry)> = visible
+        .iter()
+        .map(|entry| {
+            let depth = detail
+                .invocations
+                .iter()
+                .position(|candidate| candidate.invocation_id == entry.invocation_id)
+                .map_or(0, |index| depths[index]);
+            (depth, entry)
+        })
+        .collect();
+    if json {
+        let invocations: Vec<Value> = entries
+            .iter()
+            .map(|(depth, entry)| {
+                let mut value = json!(entry);
+                value["depth"] = json!(depth);
+                value
+            })
+            .collect();
+        return Ok(Some(json!({
+            "schema_version": 2,
+            "run_id": detail.run.run_id,
+            "status": detail.run.status,
+            "level": level.as_str(),
+            "node": node,
+            "invocations": invocations
+        })));
+    }
+    print_run_line(&detail.run);
+    for (depth, entry) in entries {
+        println!(
+            "{}{} {} {} {} {} ms{}",
+            "  ".repeat(depth),
+            entry.status,
+            entry.kind,
+            entry.call_type,
+            entry.target,
+            entry.duration_ms,
+            entry
+                .error_code
+                .as_deref()
+                .map(|code| format!("  {code}"))
+                .unwrap_or_default()
+        );
+    }
+    Ok(None)
 }
 
 fn print_run_line(run: &RunSummary) {

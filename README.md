@@ -87,6 +87,9 @@ static `source()` macros; source relations are not executable plan nodes. See
 - `dowai run <model|all> [--profile NAME] [--session ID] [--vars JSON] [--yes] [--json]`
 - `dowai runs list [--limit N] [--json]` (N from 1 to 1000, default 20)
 - `dowai runs show <run_id> [--json]`
+- `dowai logs <run_id> [--node NODE] [--level ERROR|WARN|INFO|DEBUG|TRACE] [--json]`
+  (levels filter invocation status: ERROR = failed; WARN = failed or skipped;
+  INFO/DEBUG/TRACE = all recorded invocations; no free-text messages are shown)
 
 Every PostgreSQL run, including a failed one, is recorded in a local run journal
 (`runs.sqlite3`, next to the session store) with status, timings, error codes

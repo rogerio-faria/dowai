@@ -19,8 +19,9 @@ pub use project::{
     ProjectPython, ProjectSource, ValidationReport,
 };
 pub use runs::{
-    current_time_ms, default_run_store_path, InvocationEntry, NewInvocation, NewRun, RunDetail,
-    RunStore, RunSummary, RUN_SCHEMA_VERSION,
+    current_time_ms, default_run_store_path, filter_invocations, invocation_depths,
+    InvocationEntry, LogLevel, NewInvocation, NewRun, RunDetail, RunStore, RunSummary,
+    RUN_SCHEMA_VERSION,
 };
 pub use sessions::{default_session_store_path, SessionLimits, SessionMetadata, SessionStore};
 pub use templates::{

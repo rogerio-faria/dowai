@@ -25,3 +25,6 @@
   succeeds. Requires a configured PostgreSQL profile for mixed plans.
 - Record every run outcome in a local run journal and add `dowai runs list` and
   `dowai runs show`. Failed runs keep their invocation history.
+- Add `dowai logs <run_id>` over the run journal with status-based level filters.
+- Add tests showing that CLI variables select SQL template branches without
+  interpolating values (AC036), including a PostgreSQL case.
