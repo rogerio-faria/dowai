@@ -24,7 +24,7 @@ release gates are not inferred from scaffolding or documentation.
 
 Linux (Ubuntu 24.04, x86_64, rustc 1.99.1 stable, 2026-11-10):
 `cargo fmt --all -- --check`, `cargo check --workspace --all-targets --locked`,
-and `cargo test --workspace --locked` pass with 110 tests passed and 3 opt-in
+and `cargo test --workspace --locked` pass with 119 tests passed and 3 opt-in
 PostgreSQL tests ignored. Building on Linux with the system OpenSSL headers
 requires `OPENSSL_DIR=/usr OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu
 OPENSSL_INCLUDE_DIR=/usr/include` when `pkg-config` is absent. The Python SDK
