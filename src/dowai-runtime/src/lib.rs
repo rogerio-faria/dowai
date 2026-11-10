@@ -14,6 +14,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -460,6 +461,14 @@ fn execute_run(
             }
             Some(metadata)
         }
+        None => None,
+    };
+    // `wait_process`: the exclusive session lock is taken before the snapshot (so the base is
+    // current) and before any node, and is held by this guard until the function returns on
+    // every path. Nested `env.run` calls never reach this code, so they cannot self-block. An
+    // implicit session (none requested) does not exist yet and nobody can share it: no lock.
+    let _session_lock = match prior_session.as_ref() {
+        Some(session) => acquire_session_lock(&store, &session.session_id, &configuration, cancel)?,
         None => None,
     };
     // Versioned snapshot taken once at run start: its revisions are the base against which
@@ -1210,6 +1219,41 @@ fn map_execution_error(error: AdapterError) -> DowaiError {
         AdapterError::MissingPassword
         | AdapterError::TlsConfigurationFailed
         | AdapterError::ConnectionFailed => DowaiError::Connection(error.to_string()),
+    }
+}
+
+const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Honours `sessions.conflict_policy`: `None` for `error`; for `wait_process` polls the
+/// per-session lock until acquired, cancelled, or `wait_process_timeout_seconds` elapses.
+fn acquire_session_lock(
+    store: &SessionStore,
+    session_id: &str,
+    configuration: &Value,
+    cancel: &CancellationToken,
+) -> Result<Option<dowai_core::SessionLock>> {
+    let sessions = &configuration["effective"]["sessions"];
+    if sessions["conflict_policy"].as_str() != Some("wait_process") {
+        return Ok(None);
+    }
+    let seconds = sessions["wait_process_timeout_seconds"]
+        .as_u64()
+        .ok_or_else(|| {
+            DowaiError::Config("Effective sessions.wait_process_timeout_seconds is invalid".into())
+        })?;
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    loop {
+        cancel.check()?;
+        if let Some(lock) = store.try_lock_session(session_id)? {
+            return Ok(Some(lock));
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(DowaiError::SessionConflict(format!(
+                "Session is held by another run; waited {seconds}s (sessions.wait_process_timeout_seconds)"
+            )));
+        }
+        thread::sleep(LOCK_POLL_INTERVAL.min(deadline - now));
     }
 }
 

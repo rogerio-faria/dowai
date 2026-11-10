@@ -252,7 +252,8 @@ fn configuration_defaults() -> Value {
             "allow_data_rows": false
         },
         "sessions": {
-            "conflict_policy": "error"
+            "conflict_policy": "error",
+            "wait_process_timeout_seconds": 300
         }
     })
 }
@@ -369,8 +370,14 @@ fn validate_setting(section: &str, setting: &str, value: &Value, path: &Path) ->
         | ("ai", "enabled" | "allow_data_rows") => value.is_boolean(),
         ("execution", "max_call_depth" | "max_invocations_per_run")
         | ("templates", "max_nesting_depth") => value.as_u64().is_some_and(|number| number > 0),
-        // AC040: the only policy is "error"; last-writer-wins is deliberately not offered.
-        ("sessions", "conflict_policy") => value.as_str() == Some("error"),
+        // AC040: last-writer-wins is deliberately not offered; "wait_process" serialises
+        // runs on one session through an exclusive per-session lock.
+        ("sessions", "conflict_policy") => {
+            matches!(value.as_str(), Some("error" | "wait_process"))
+        }
+        ("sessions", "wait_process_timeout_seconds") => value
+            .as_u64()
+            .is_some_and(|seconds| (1..=86_400).contains(&seconds)),
         ("security", "allowed_paths" | "allowed_hosts" | "allowed_profiles") => value
             .as_array()
             .is_some_and(|values| values.iter().all(Value::is_string)),

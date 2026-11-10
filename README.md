@@ -102,6 +102,14 @@ nested-invocation events with correlation IDs and SHA-256 hashes of the model,
 effective configuration and plan. It is append-only by convention, not immutable,
 and it cannot be disabled by project configuration.
 
+Concurrent writes to the same session variable are never silently overwritten.
+By default (`sessions.conflict_policy` = `error`) a run whose base revision changed
+fails with `DOWAI_SESSION_CONFLICT` (exit 3) and publishes nothing. With
+`wait_process`, the run waits for the session lock before running any node, up to
+`sessions.wait_process_timeout_seconds` (default 300, range 1 to 86400); if the
+wait times out, it fails with `DOWAI_SESSION_CONFLICT` and runs no node. Nested
+`env.run` calls inherit the lock.
+
 Ctrl+C and SIGTERM (SIGHUP on Unix) cancel a running `dowai run`: the run ends
 `CANCELLED` with exit code 130 and error code `DOWAI_CANCELLED`, Python worker
 process trees are terminated, an in-flight PostgreSQL statement is cancelled and

@@ -38,3 +38,7 @@
   changed fails with `DOWAI_SESSION_CONFLICT` and publishes nothing (no
   last-writer-wins). Session revisions are monotonic per session; the session
   store moves to schema version 1 with an automatic, idempotent migration.
+- Detect concurrent writes to session variables explicitly (AC040). New
+  `sessions.conflict_policy` (`error` default, or `wait_process`) and
+  `sessions.wait_process_timeout_seconds` (default 300) serialise runs of the same
+  session; a wait that times out fails with `DOWAI_SESSION_CONFLICT`.

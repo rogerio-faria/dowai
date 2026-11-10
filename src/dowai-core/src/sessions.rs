@@ -477,6 +477,51 @@ impl SessionStore {
     }
 }
 
+/// Exclusive per-session lock (`sessions.conflict_policy = "wait_process"`). Held for the
+/// lifetime of the value; the operating system releases it on drop and also if the process dies.
+#[derive(Debug)]
+pub struct SessionLock {
+    _file: fs::File,
+}
+
+impl SessionStore {
+    /// Try to take the exclusive lock of `session_id` without blocking. `Ok(None)` means another
+    /// run holds it. The lock file lives in `session-locks/` beside the session database and is
+    /// never deleted (removing a lock file others may be waiting on would split the lock).
+    pub fn try_lock_session(&self, session_id: &str) -> Result<Option<SessionLock>> {
+        Uuid::parse_str(session_id)
+            .map_err(|_| DowaiError::Session("Session id is malformed".to_owned()))?;
+        let directory = self
+            .path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("session-locks");
+        fs::create_dir_all(&directory).map_err(lock_error)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+                .map_err(lock_error)?;
+        }
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(directory.join(format!("{session_id}.lock")))
+            .map_err(lock_error)?;
+        set_private_file_permissions(&directory.join(format!("{session_id}.lock")))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(SessionLock { _file: file })),
+            Err(fs::TryLockError::WouldBlock) => Ok(None),
+            Err(fs::TryLockError::Error(error)) => Err(lock_error(error)),
+        }
+    }
+}
+
+fn lock_error(error: std::io::Error) -> DowaiError {
+    DowaiError::State(format!("Session lock is unavailable: {error}"))
+}
+
 pub fn default_session_store_path() -> Option<PathBuf> {
     if cfg!(windows) {
         std::env::var_os("LOCALAPPDATA")

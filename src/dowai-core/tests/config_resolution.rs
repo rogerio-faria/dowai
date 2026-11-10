@@ -374,3 +374,55 @@ fn conflict_policy_defaults_to_error_and_rejects_any_other_value() {
         assert_eq!(error.code(), "DOWAI_CONFIG_INVALID");
     }
 }
+
+#[test]
+fn wait_process_policy_and_timeout_are_validated() {
+    let tree = TestConfigTree::new();
+    let project = tree.path().join("project");
+    fs::create_dir_all(&project).expect("create project");
+    let write = |sessions: serde_json::Value| {
+        tree.write_json(
+            "project/dowai_project.json",
+            &json!({ "schema_version": 2, "name": "p", "config": { "sessions": sessions } }),
+        );
+    };
+    write(json!({}));
+    let defaults = resolve(&project, None, None).expect("defaults");
+    assert_eq!(
+        defaults["effective"]["sessions"]["conflict_policy"],
+        "error"
+    );
+    assert_eq!(
+        defaults["effective"]["sessions"]["wait_process_timeout_seconds"],
+        300
+    );
+
+    write(json!({ "conflict_policy": "wait_process", "wait_process_timeout_seconds": 86400 }));
+    let waiting = resolve(&project, None, None).expect("wait_process accepted");
+    assert_eq!(
+        waiting["effective"]["sessions"]["conflict_policy"],
+        "wait_process"
+    );
+    assert_eq!(
+        waiting["effective"]["sessions"]["wait_process_timeout_seconds"],
+        86400
+    );
+    write(json!({ "wait_process_timeout_seconds": 1 }));
+    resolve(&project, None, None).expect("lower bound accepted");
+
+    for rejected in [
+        json!({ "conflict_policy": "WAIT_PROCESS" }),
+        json!({ "conflict_policy": "wait" }),
+        json!({ "wait_process_timeout_seconds": 0 }),
+        json!({ "wait_process_timeout_seconds": 86401 }),
+        json!({ "wait_process_timeout_seconds": -1 }),
+        json!({ "wait_process_timeout_seconds": "30" }),
+        json!({ "wait_process_timeout_seconds": 1.5 }),
+        json!({ "wait_process_timeout_seconds": true }),
+        json!({ "lock_dir": "/tmp" }),
+    ] {
+        write(rejected);
+        let error = resolve(&project, None, None).expect_err("must be rejected");
+        assert_eq!(error.code(), "DOWAI_CONFIG_INVALID");
+    }
+}
