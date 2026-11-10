@@ -18,12 +18,22 @@ pub enum DowaiError {
     PythonTimeout(String),
     PythonProtocol(String),
     Policy(String),
-    Validation { message: String, report: Value },
+    /// The run was cancelled by the user (Ctrl+C, SIGTERM) or through the API.
+    Cancelled(String),
+    Validation {
+        message: String,
+        report: Value,
+    },
     NotImplemented(String),
     Io(std::io::Error),
 }
 
 impl DowaiError {
+    /// Cancellation with the fixed, free-text-free message used everywhere.
+    pub fn cancelled() -> Self {
+        Self::Cancelled("The run was cancelled".to_owned())
+    }
+
     pub fn code(&self) -> &'static str {
         match self {
             Self::Config(_) => "DOWAI_CONFIG_INVALID",
@@ -39,6 +49,7 @@ impl DowaiError {
             Self::PythonTimeout(_) => "DOWAI_PYTHON_TIMEOUT",
             Self::PythonProtocol(_) => "DOWAI_PYTHON_PROTOCOL",
             Self::Policy(_) => "DOWAI_POLICY_DENIED",
+            Self::Cancelled(_) => "DOWAI_CANCELLED",
             Self::Validation { .. } => "DOWAI_CONFIG_INVALID",
             Self::NotImplemented(_) => "DOWAI_NOT_IMPLEMENTED",
             Self::Io(_) => "DOWAI_IO_ERROR",
@@ -60,6 +71,7 @@ impl DowaiError {
             Self::Execution(_) => 3,
             Self::PythonFailure(_) | Self::PythonTimeout(_) | Self::PythonProtocol(_) => 3,
             Self::NotImplemented(_) => 6,
+            Self::Cancelled(_) => 130,
             Self::Io(_) => 2,
         }
     }
@@ -79,10 +91,15 @@ impl DowaiError {
             | Self::PythonTimeout(message)
             | Self::PythonProtocol(message)
             | Self::Policy(message)
+            | Self::Cancelled(message)
             | Self::NotImplemented(message) => message.clone(),
             Self::Validation { message, .. } => message.clone(),
             Self::Io(error) => error.to_string(),
         }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled(_))
     }
 
     pub fn details(&self) -> Option<&Value> {

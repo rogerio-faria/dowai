@@ -5,7 +5,9 @@
 
 use crate::python_runtime::{self, ChildCall, ChildOutcome, ModelInvocation};
 use crate::{resolve_execution_mode, resolve_python_model_path, InvocationRecord};
-use dowai_core::{plan, DowaiError, ExecutionMode, PlanNode, Result, SessionStore};
+use dowai_core::{
+    plan, CancellationToken, DowaiError, ExecutionMode, PlanNode, Result, SessionStore,
+};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -23,6 +25,7 @@ pub(crate) struct Executor<'a> {
     pub max_invocations: usize,
     pub configuration: &'a Value,
     pub store: &'a SessionStore,
+    pub cancel: CancellationToken,
     pub invocations: Vec<InvocationRecord>,
     stack: Vec<String>,
     /// Every invocation attempt received, including rejected ones.
@@ -37,6 +40,7 @@ impl<'a> Executor<'a> {
         timeout: Duration,
         configuration: &'a Value,
         store: &'a SessionStore,
+        cancel: CancellationToken,
     ) -> Result<Self> {
         let limit = |name: &str| {
             configuration["effective"]["execution"][name]
@@ -53,6 +57,7 @@ impl<'a> Executor<'a> {
             max_invocations: limit("max_invocations_per_run")?,
             configuration,
             store,
+            cancel,
             invocations: Vec::new(),
             stack: Vec::new(),
             attempts: 0,
@@ -148,7 +153,12 @@ impl<'a> Executor<'a> {
                 (invocation_id, Ok(value))
             }
             Err(error) => {
-                entry.status = "FAILED".to_owned();
+                entry.status = if error.is_cancelled() {
+                    "CANCELLED"
+                } else {
+                    "FAILED"
+                }
+                .to_owned();
                 entry.error_code = Some(error.code().to_owned());
                 (invocation_id, Err(error))
             }
@@ -165,6 +175,7 @@ impl<'a> Executor<'a> {
         invocation_id: &str,
         parent_deadline: Option<Instant>,
     ) -> Result<Variables> {
+        self.cancel.check()?;
         if self.stack.iter().any(|entry| entry == model_id) {
             return Err(DowaiError::Cycle(format!(
                 "Imperative call cycle detected: {}",
@@ -185,6 +196,7 @@ impl<'a> Executor<'a> {
             deadline = deadline.min(cap);
         }
         let (root, interpreter) = (self.root, self.interpreter);
+        let cancel = self.cancel.clone();
         self.stack.push(model_id.to_owned());
         let result = python_runtime::execute_model(
             &ModelInvocation {
@@ -194,6 +206,7 @@ impl<'a> Executor<'a> {
                 model_path: &model_path,
                 dependencies: depends_on,
                 mode: mode.as_str(),
+                cancel: &cancel,
             },
             &variables,
             &mut |call| self.handle_call(call, invocation_id, deadline),

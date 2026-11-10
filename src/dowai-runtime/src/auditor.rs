@@ -108,14 +108,7 @@ impl Auditor {
         event.parent_invocation_id = Some(self.root_invocation_id.clone());
         event.node_id = Some(node_id.to_owned());
         event.call_type = Some("static".to_owned());
-        event.result = Some(
-            if error.is_some() {
-                "FAILED"
-            } else {
-                "SUCCEEDED"
-            }
-            .to_owned(),
-        );
+        event.result = Some(result_label(error).to_owned());
         event.error_code = error.map(|error| error.code().to_owned());
         self.emit(&event);
     }
@@ -171,15 +164,17 @@ impl Auditor {
         let mut event = self.event("run.finished");
         event.invocation_id = Some(self.root_invocation_id.clone());
         event.attempt_id = event.invocation_id.clone();
-        event.result = Some(
-            if error.is_some() {
-                "FAILED"
-            } else {
-                "SUCCEEDED"
-            }
-            .to_owned(),
-        );
+        event.result = Some(result_label(error).to_owned());
         event.error_code = error.map(|error| error.code().to_owned());
         self.emit(&event);
+    }
+}
+
+/// Audit `result` of a node or run: `CANCELLED` is distinct from `FAILED` (plan 5.5).
+fn result_label(error: Option<&DowaiError>) -> &'static str {
+    match error {
+        None => "SUCCEEDED",
+        Some(error) if error.is_cancelled() => "CANCELLED",
+        Some(_) => "FAILED",
     }
 }

@@ -2,9 +2,9 @@ use auditor::Auditor;
 use dowai_core::{
     admin_config_path, current_time_ms, default_run_store_path, load_project,
     load_workspace_profile, plan, read_planned_model, resolve_effective_configuration, sha256_hex,
-    source_relation_key, user_config_path, DowaiError, ExecutionMode, ExecutionPlan,
-    Materialization, NewInvocation, NewRun, PlanNode, Result, RunStore, SessionStore,
-    TemplateOptions, WorkspaceProfile,
+    source_relation_key, user_config_path, CancellationToken, DowaiError, ExecutionMode,
+    ExecutionPlan, Materialization, NewInvocation, NewRun, PlanNode, Result, RunStore,
+    SessionStore, TemplateOptions, WorkspaceProfile,
 };
 use dowai_postgres::{
     quote_identifier, AdapterError, Materialization as PostgresMaterialization, PgProfile,
@@ -139,6 +139,19 @@ impl Trace {
 /// a warning is appended to `RunResult.warnings`; on failure the original error is
 /// returned unchanged and a sanitized warning goes to stderr.
 pub fn run_postgres(project_dir: &Path, request: RunRequest) -> Result<RunResult> {
+    run_postgres_with_cancel(project_dir, request, &CancellationToken::new())
+}
+
+/// Same as [`run_postgres`], observing `cancel` (plan 5.5): between nodes, while a Python
+/// worker is supervised (its process tree is terminated) and while a SQL statement runs
+/// (PostgreSQL cancel request; the open transaction rolls back). A cancelled run ends as
+/// `CANCELLED` with `DOWAI_CANCELLED`; nodes not started are `SKIPPED` and no session
+/// variables are published.
+pub fn run_postgres_with_cancel(
+    project_dir: &Path,
+    request: RunRequest,
+    cancel: &CancellationToken,
+) -> Result<RunResult> {
     let started_ms = current_time_ms();
     let started = Instant::now();
     let run_id = Uuid::new_v4().to_string();
@@ -158,7 +171,7 @@ pub fn run_postgres(project_dir: &Path, request: RunRequest) -> Result<RunResult
         python: Vec::new(),
         extra: Vec::new(),
     };
-    let outcome = execute_run(project_dir, request, &run_id, &mut trace);
+    let outcome = execute_run(project_dir, request, &run_id, &mut trace, cancel);
     finish_audit(&mut trace, &outcome);
     let audit_failed = trace.audit.failed;
     let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -308,7 +321,11 @@ fn journal_run(
             result.invocations.as_slice(),
         ),
         Err(error) => (
-            "FAILED",
+            if error.is_cancelled() {
+                "CANCELLED"
+            } else {
+                "FAILED"
+            },
             Some(error.code().to_owned()),
             requested_session,
             trace.execution_mode.clone(),
@@ -356,7 +373,9 @@ fn execute_run(
     request: RunRequest,
     run_id: &str,
     trace: &mut Trace,
+    cancel: &CancellationToken,
 ) -> Result<RunResult> {
+    cancel.check()?;
     let started = Instant::now();
     let root = project_dir.canonicalize().map_err(|error| {
         DowaiError::Path(format!(
@@ -440,9 +459,15 @@ fn execute_run(
             Duration::from_secs(python.timeout_seconds),
             &configuration,
             &store,
+            cancel.clone(),
         )?;
         let mut completed_nodes = Vec::with_capacity(execution_plan.nodes.len());
         for (index, node) in execution_plan.nodes.iter().enumerate() {
+            if let Err(error) = cancel.check() {
+                trace.python = executor.invocations;
+                trace.skip(&execution_plan.nodes[index..], mode);
+                return Err(error);
+            }
             match run_python_node(
                 &mut executor,
                 &mut trace.audit,
@@ -517,11 +542,17 @@ fn execute_run(
             Duration::from_secs(python.timeout_seconds),
             &configuration,
             &store,
+            cancel.clone(),
         )?;
         let mut adapter = PostgresAdapter::connect(&postgres_profile(profile))
             .map_err(|error| DowaiError::Connection(error.to_string()))?;
         let mut completed_nodes = Vec::with_capacity(execution_plan.nodes.len());
         for (index, node) in execution_plan.nodes.iter().enumerate() {
+            if let Err(error) = cancel.check() {
+                trace.python = std::mem::take(&mut executor.invocations);
+                trace.skip(&execution_plan.nodes[index..], mode);
+                return Err(error);
+            }
             if is_python_path(&node.path) {
                 match run_python_node(
                     &mut executor,
@@ -563,7 +594,7 @@ fn execute_run(
                 }
                 store.validate_variables(&next_variables)?;
                 adapter
-                    .materialize(
+                    .materialize_cancellable(
                         &prepared.relation,
                         match prepared.materialization {
                             Materialization::Table => PostgresMaterialization::Table,
@@ -571,6 +602,7 @@ fn execute_run(
                         },
                         &prepared.sql,
                         allow_replace,
+                        &|| cancel.is_cancelled(),
                     )
                     .map_err(map_execution_error)?;
                 Ok((prepared, next_variables))
@@ -611,7 +643,7 @@ fn execute_run(
                         sql_invocation_id,
                         node,
                         mode,
-                        "FAILED",
+                        node_failure_status(&error),
                         node_started,
                         Some(&error),
                     );
@@ -660,6 +692,10 @@ fn execute_run(
     let allow_replace = replacement_approval(&configuration, request.confirm_destructive)?;
     let mut completed_nodes = Vec::with_capacity(prepared.nodes.len());
     for (index, node) in prepared.nodes.iter().enumerate() {
+        if let Err(error) = cancel.check() {
+            trace.skip(&execution_plan.nodes[index..], mode);
+            return Err(error);
+        }
         let materialization = match node.materialization {
             Materialization::Table => PostgresMaterialization::Table,
             Materialization::View => PostgresMaterialization::View,
@@ -674,7 +710,13 @@ fn execute_run(
             model_hash(&root, plan_node),
         );
         if let Err(error) = adapter
-            .materialize(&node.relation, materialization, &node.sql, allow_replace)
+            .materialize_cancellable(
+                &node.relation,
+                materialization,
+                &node.sql,
+                allow_replace,
+                &|| cancel.is_cancelled(),
+            )
             .map_err(map_execution_error)
         {
             trace
@@ -684,7 +726,7 @@ fn execute_run(
                 sql_invocation_id,
                 plan_node,
                 mode,
-                "FAILED",
+                node_failure_status(&error),
                 node_started,
                 Some(&error),
             );
@@ -739,6 +781,15 @@ fn execute_run(
         invocations: Vec::new(),
         warnings: execution_plan.warnings,
     })
+}
+
+/// Final status of a node whose execution ended in `error`.
+fn node_failure_status(error: &DowaiError) -> &'static str {
+    if error.is_cancelled() {
+        "CANCELLED"
+    } else {
+        "FAILED"
+    }
 }
 
 /// Load and validate the project's supervised Python runtime settings.
@@ -1109,6 +1160,7 @@ fn map_execution_error(error: AdapterError) -> DowaiError {
         AdapterError::QueryFailed
         | AdapterError::UnsupportedRelationType
         | AdapterError::MultipleStatements => DowaiError::Execution(error.to_string()),
+        AdapterError::Cancelled => DowaiError::cancelled(),
         AdapterError::MissingPassword
         | AdapterError::TlsConfigurationFailed
         | AdapterError::ConnectionFailed => DowaiError::Connection(error.to_string()),

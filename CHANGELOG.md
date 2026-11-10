@@ -31,3 +31,6 @@
 - Add a separate audit trail (`audit.jsonl`) with run, node, variable-name,
   external-write, policy-denial, and nested-invocation events, correlation IDs,
   and SHA-256 hashes. It is independent of log levels and not disableable per project.
+- Cancel `dowai run` with Ctrl+C or SIGTERM (exit 130, status CANCELLED,
+  `DOWAI_CANCELLED`). Python process trees and in-flight PostgreSQL statements
+  are cancelled, and no variables are published.

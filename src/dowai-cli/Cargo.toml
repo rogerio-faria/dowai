@@ -13,3 +13,4 @@ clap.workspace = true
 serde_json.workspace = true
 dowai-core = { path = "../dowai-core" }
 dowai-runtime = { path = "../dowai-runtime" }
+ctrlc = { version = "3", features = ["termination"] }

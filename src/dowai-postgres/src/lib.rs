@@ -1,5 +1,7 @@
 use std::net::IpAddr;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use native_tls::TlsConnector;
 use postgres::config::SslMode;
@@ -94,6 +96,8 @@ pub enum AdapterError {
     TlsConfigurationFailed,
     ConnectionFailed,
     QueryFailed,
+    /// The caller cancelled the operation; the transaction was rolled back.
+    Cancelled,
 }
 
 impl std::fmt::Display for AdapterError {
@@ -122,6 +126,7 @@ impl std::fmt::Display for AdapterError {
             }
             Self::ConnectionFailed => formatter.write_str("PostgreSQL connection failed"),
             Self::QueryFailed => formatter.write_str("PostgreSQL query failed"),
+            Self::Cancelled => formatter.write_str("PostgreSQL operation cancelled"),
         }
     }
 }
@@ -143,6 +148,7 @@ pub fn quote_identifier(identifier: &str) -> Result<String, AdapterError> {
 
 pub struct PostgresAdapter {
     client: Client,
+    tls: MakeTlsConnector,
 }
 
 impl PostgresAdapter {
@@ -166,9 +172,9 @@ impl PostgresAdapter {
         let connector = TlsConnector::new().map_err(|_| AdapterError::TlsConfigurationFailed)?;
         let tls = MakeTlsConnector::new(connector);
         let client = config
-            .connect(tls)
+            .connect(tls.clone())
             .map_err(|_| AdapterError::ConnectionFailed)?;
-        Ok(Self { client })
+        Ok(Self { client, tls })
     }
 
     pub fn execute(
@@ -240,6 +246,49 @@ impl PostgresAdapter {
             .batch_execute(&format!("CREATE {create} {quoted} AS {query}"))
             .map_err(|_| AdapterError::QueryFailed)?;
         transaction.commit().map_err(|_| AdapterError::QueryFailed)
+    }
+
+    /// Like [`Self::materialize`], but a watcher sends a PostgreSQL cancel request as soon
+    /// as `cancelled()` turns true. The statement then fails server-side and the dropped
+    /// transaction rolls back, so a replacement is never partially applied.
+    pub fn materialize_cancellable(
+        &mut self,
+        relation: &str,
+        materialization: Materialization,
+        query: &str,
+        allow_replace: bool,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(), AdapterError> {
+        if cancelled() {
+            return Err(AdapterError::Cancelled);
+        }
+        let token = self.client.cancel_token();
+        let tls = self.tls.clone();
+        let done = AtomicBool::new(false);
+        let result = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let mut last_request: Option<Instant> = None;
+                while !done.load(Ordering::SeqCst) {
+                    // Re-sent periodically: a request that races ahead of the statement
+                    // reaching the server would otherwise be ignored.
+                    if cancelled()
+                        && last_request
+                            .is_none_or(|sent| sent.elapsed() >= Duration::from_millis(100))
+                    {
+                        let _ = token.cancel_query(tls.clone());
+                        last_request = Some(Instant::now());
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            });
+            let result = self.materialize(relation, materialization, query, allow_replace);
+            done.store(true, Ordering::SeqCst);
+            result
+        });
+        match result {
+            Err(AdapterError::QueryFailed) if cancelled() => Err(AdapterError::Cancelled),
+            other => other,
+        }
     }
 
     pub fn drop_relation(

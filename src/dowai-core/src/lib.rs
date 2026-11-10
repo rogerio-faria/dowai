@@ -1,4 +1,5 @@
 mod audit;
+mod cancel;
 mod config;
 mod error;
 mod planner;
@@ -8,6 +9,7 @@ mod sessions;
 mod templates;
 
 pub use audit::{default_audit_log_path, sha256_hex, AuditEvent, AuditLog, AUDIT_SCHEMA_VERSION};
+pub use cancel::CancellationToken;
 pub use config::{
     admin_config_path, load_workspace_profile, resolve_effective_configuration, user_config_path,
     ProfileTlsMode, WorkspaceProfile,

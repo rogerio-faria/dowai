@@ -2,10 +2,13 @@ use clap::{Args, Parser, Subcommand};
 use dowai_core::{
     admin_config_path, create_project, default_run_store_path, default_session_store_path,
     filter_invocations, invocation_depths, plan, resolve_effective_configuration, user_config_path,
-    validate_project_with_configuration, DowaiError, ExecutionMode, InvocationEntry, LogLevel,
-    Result, RunDetail, RunStore, RunSummary, SessionMetadata, SessionStore, TemplateOptions,
+    validate_project_with_configuration, CancellationToken, DowaiError, ExecutionMode,
+    InvocationEntry, LogLevel, Result, RunDetail, RunStore, RunSummary, SessionMetadata,
+    SessionStore, TemplateOptions,
 };
-use dowai_runtime::{check_postgres_connection, prepare_postgres_plan, run_postgres, RunRequest};
+use dowai_runtime::{
+    check_postgres_connection, prepare_postgres_plan, run_postgres_with_cancel, RunRequest,
+};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -191,7 +194,7 @@ fn main() -> ExitCode {
                     "{}",
                     json!({
                         "schema_version": 2,
-                        "status": "FAILED",
+                        "status": if error.is_cancelled() { "CANCELLED" } else { "FAILED" },
                         "error_code": error.code(),
                         "message": error.message(),
                         "details": error.details()
@@ -411,7 +414,14 @@ fn dispatch(command: Command) -> Result<Option<Value>> {
                 ));
             }
             let project_dir = find_project_root(&std::env::current_dir()?)?;
-            let result = run_postgres(
+            // SIGINT/SIGTERM (Ctrl+C on Windows) only flip the token; the runtime stops
+            // the Python process tree and cancels any running SQL, then reports exit 130.
+            let cancel = CancellationToken::new();
+            let signal_token = cancel.clone();
+            ctrlc::set_handler(move || signal_token.cancel()).map_err(|_| {
+                DowaiError::State("Could not install the cancellation signal handler".to_owned())
+            })?;
+            let result = run_postgres_with_cancel(
                 &project_dir,
                 RunRequest {
                     targets: args.targets,
@@ -425,6 +435,7 @@ fn dispatch(command: Command) -> Result<Option<Value>> {
                     variables: parse_vars(args.vars.as_deref())?,
                     confirm_destructive: args.yes,
                 },
+                &cancel,
             )?;
             if args.json {
                 Ok(Some(

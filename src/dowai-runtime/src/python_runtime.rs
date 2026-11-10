@@ -1,4 +1,4 @@
-use dowai_core::{DowaiError, ProjectPython, Result};
+use dowai_core::{CancellationToken, DowaiError, ProjectPython, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -269,6 +269,7 @@ pub(crate) struct ModelInvocation<'a> {
     pub model_path: &'a Path,
     pub dependencies: &'a [String],
     pub mode: &'a str,
+    pub cancel: &'a CancellationToken,
 }
 
 type CallHandler<'a> = dyn FnMut(ChildCall) -> ChildOutcome + 'a;
@@ -290,6 +291,7 @@ pub(crate) fn execute_model(
     }
     request.push(b'\n');
 
+    invocation.cancel.check()?;
     let mut command = Command::new(invocation.interpreter);
     command
         .arg("-c")
@@ -362,6 +364,7 @@ pub(crate) fn execute_model(
 
     let mut supervision = Supervision {
         deadline: invocation.deadline,
+        cancel: invocation.cancel.clone(),
         messages: read_receiver,
         replies: write_sender,
         final_message: None,
@@ -445,6 +448,7 @@ pub(crate) fn execute_model(
 
 struct Supervision {
     deadline: Instant,
+    cancel: CancellationToken,
     messages: Receiver<io::Result<Vec<u8>>>,
     replies: SyncSender<Vec<u8>>,
     final_message: Option<WorkerMessage>,
@@ -458,6 +462,9 @@ impl Supervision {
         on_call: &mut CallHandler<'_>,
     ) -> Result<std::process::ExitStatus> {
         loop {
+            // Checked first so a cancelled run never serves further nested calls; the
+            // caller terminates the whole process tree on any error.
+            self.cancel.check()?;
             while let Ok(line) = self.messages.try_recv() {
                 self.handle(line, on_call)?;
             }
@@ -549,6 +556,7 @@ fn worker_visible_message(code: &str) -> String {
         "DOWAI_PYTHON_TIMEOUT" => "Nested Python model exceeded its timeout",
         "DOWAI_PYTHON_PROTOCOL" => "Nested Python model returned an invalid IPC response",
         "DOWAI_POLICY_DENIED" => "Nested call denied by policy",
+        "DOWAI_CANCELLED" => "Nested call cancelled",
         _ => "Nested model invocation failed",
     }
     .to_owned()

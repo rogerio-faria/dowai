@@ -102,6 +102,13 @@ nested-invocation events with correlation IDs and SHA-256 hashes of the model,
 effective configuration and plan. It is append-only by convention, not immutable,
 and it cannot be disabled by project configuration.
 
+Ctrl+C and SIGTERM (SIGHUP on Unix) cancel a running `dowai run`: the run ends
+`CANCELLED` with exit code 130 and error code `DOWAI_CANCELLED`, Python worker
+process trees are terminated, an in-flight PostgreSQL statement is cancelled and
+its transaction rolled back, and no variables are published. Nodes not yet
+started are `SKIPPED`. On Windows only Ctrl+C is handled, and no real-signal test
+exists there yet.
+
 `--json` keeps machine-readable output on stdout. Errors use stable
 `DOWAI_*` codes and the exit codes documented in the master plan.
 The implemented configuration layers and limits are documented in
