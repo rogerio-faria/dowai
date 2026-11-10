@@ -164,6 +164,7 @@ impl PostgresAdapter {
             .password(password)
             .dbname(&profile.database)
             .options("-c standard_conforming_strings=on")
+            .connect_timeout(std::time::Duration::from_secs(10))
             .ssl_mode(match profile.tls_mode {
                 TlsMode::Required => SslMode::Require,
                 TlsMode::Disabled => SslMode::Disable,
@@ -195,6 +196,28 @@ impl PostgresAdapter {
         self.client
             .query(sql, params)
             .map_err(|_| AdapterError::QueryFailed)
+    }
+
+    /// Column names and type names of a relation. Only prepares the statement: no row is read.
+    /// `relation` must be built from identifiers quoted by [`quote_identifier`].
+    /// Waits are bounded (`lock_timeout` 5 s, `statement_timeout` 10 s) so a locked relation
+    /// cannot stall the host indefinitely. Use this only on a dedicated, read-only connection.
+    pub fn describe_relation(
+        &mut self,
+        relation: &str,
+    ) -> Result<Vec<(String, String)>, AdapterError> {
+        self.client
+            .batch_execute("SET lock_timeout = '5s'; SET statement_timeout = '10s'")
+            .map_err(|_| AdapterError::QueryFailed)?;
+        let statement = self
+            .client
+            .prepare(&format!("SELECT * FROM {relation} LIMIT 0"))
+            .map_err(|_| AdapterError::QueryFailed)?;
+        Ok(statement
+            .columns()
+            .iter()
+            .map(|column| (column.name().to_owned(), column.type_().name().to_owned()))
+            .collect())
     }
 
     pub fn test_connection(&mut self) -> Result<(), AdapterError> {

@@ -509,3 +509,61 @@ fn second_mixed_run_sees_variables_committed_by_the_session() {
     assert_eq!(variables["first_run"], json!(1));
     assert_eq!(variables["second_run"], json!(2));
 }
+
+/// AC002: a Python model reads the schema of a SQL predecessor declared with `env.ref`.
+/// The predecessor is committed first (automatic order), so the schema is the real one.
+#[test]
+#[ignore = "opt-in E2E; requires a dedicated disposable PostgreSQL database"]
+fn ac002_python_ref_reads_schema_of_committed_sql_predecessor() {
+    let fx = Fixture::new("ac002-schema");
+    let (sql, py) = (fx.name("upstream"), fx.name("reader"));
+    let _cleanup = TableCleanup(vec![sql.clone()]);
+    fx.write_model(
+        &format!("{sql}.sql"),
+        "select 1::int4 as id, 'x'::text as label",
+    );
+    fx.write_model(
+        &format!("{py}.py"),
+        &format!(
+            "def model(env):\n    env.depends_on('{sql}')\n    columns = env.ref('{sql}').schema()\n    env.setVar('ref_columns', ','.join(c['name'] for c in columns))\n    env.setVar('ref_types', ','.join(c['type'] for c in columns))\n    return None\n"
+        ),
+    );
+
+    let result = fx
+        .run(&[&format!("{py}.py")], None, None)
+        .expect("mixed run");
+
+    assert_eq!(result.status, "SUCCEEDED");
+    assert_eq!(ids(&result), [format!("{sql}.sql"), format!("{py}.py")]);
+    let variables = fx.variables(&result.session_id);
+    assert_eq!(variables["ref_columns"], json!("id,label"));
+    assert_eq!(variables["ref_types"], json!("int4,text"));
+}
+
+/// AC002: `env.ref` to a Python model is refused with a stable code, not read as a table.
+#[test]
+#[ignore = "opt-in E2E; requires a dedicated disposable PostgreSQL database"]
+fn ac002_python_ref_refuses_a_python_model_with_stable_code() {
+    let fx = Fixture::new("ac002-not-sql");
+    let (sql, py_dep, py) = (fx.name("filler"), fx.name("helper"), fx.name("reader"));
+    let _cleanup = TableCleanup(vec![sql.clone()]);
+    fx.write_model(&format!("{sql}.sql"), "select 1 as id");
+    fx.write_model(
+        &format!("{py_dep}.py"),
+        "def model(env):\n    return None\n",
+    );
+    fx.write_model(
+        &format!("{py}.py"),
+        &format!(
+            "def model(env):\n    env.depends_on('{sql}')\n    try:\n        env.ref('{py_dep}').schema()\n    except Exception as error:\n        env.setVar('ref_code', error.code)\n    return None\n"
+        ),
+    );
+
+    let result = fx
+        .run(&[&format!("{py}.py")], None, None)
+        .expect("mixed run");
+
+    assert_eq!(result.status, "SUCCEEDED");
+    let variables = fx.variables(&result.session_id);
+    assert_eq!(variables["ref_code"], json!("DOWAI_DATASET_NOT_SQL"));
+}

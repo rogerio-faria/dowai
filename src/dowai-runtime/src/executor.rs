@@ -3,18 +3,109 @@
 //! resolved at run time with the existing planner and recorded in a flat
 //! invocation history linked by `parent_invocation_id`.
 
-use crate::python_runtime::{self, ChildCall, ChildOutcome, ModelInvocation};
+use crate::python_runtime::{
+    self, ChildCall, ChildOutcome, DatasetColumn, HostReply, HostRequest, ModelInvocation,
+};
 use crate::{resolve_execution_mode, resolve_python_model_path, InvocationRecord};
 use dowai_core::{
     plan, CancellationToken, DowaiError, ExecutionMode, PlanNode, Result, SessionStore,
 };
+use dowai_postgres::{PgProfile, PostgresAdapter};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 type Variables = BTreeMap<String, Value>;
+
+pub(crate) const DATASET_UNAVAILABLE: &str = "DOWAI_DATASET_UNAVAILABLE";
+pub(crate) const DATASET_NOT_SQL: &str = "DOWAI_DATASET_NOT_SQL";
+pub(crate) const DATASET_UNDECLARED: &str = "DOWAI_DATASET_UNDECLARED";
+pub(crate) const DATASET_LIMIT: &str = "DOWAI_DATASET_LIMIT";
+/// Dataset requests served per run; a model cannot probe the database without bound.
+const MAX_DATASET_REQUESTS: usize = 256;
+
+fn dataset_error(code: &'static str, message: &str) -> DowaiError {
+    DowaiError::DatasetAccess {
+        code,
+        message: message.to_owned(),
+    }
+}
+
+/// Read-only dataset access (`env.ref`) for a mixed run. Only the relations of SQL models
+/// of the plan are reachable, and only through a model that declares them as dependencies,
+/// so the predecessor has already committed when the request is served.
+pub(crate) struct DatasetSource {
+    profile: PgProfile,
+    /// Every plan name (id, path, stem) to its quoted relation.
+    relations: BTreeMap<String, String>,
+    /// Quoted relations written by SQL models of the plan.
+    sql_relations: BTreeSet<String>,
+    adapter: Option<PostgresAdapter>,
+    requests: usize,
+}
+
+impl DatasetSource {
+    pub(crate) fn new(
+        profile: PgProfile,
+        relations: BTreeMap<String, String>,
+        sql_relations: BTreeSet<String>,
+    ) -> Self {
+        Self {
+            profile,
+            relations,
+            sql_relations,
+            adapter: None,
+            requests: 0,
+        }
+    }
+
+    fn describe(&mut self, dataset: &str, depends_on: &[String]) -> Result<Vec<DatasetColumn>> {
+        if self.requests >= MAX_DATASET_REQUESTS {
+            return Err(dataset_error(
+                DATASET_LIMIT,
+                "Dataset request limit reached for this run",
+            ));
+        }
+        self.requests += 1;
+        let relation =
+            self.relations.get(dataset).cloned().ok_or_else(|| {
+                dataset_error(DATASET_UNAVAILABLE, "Dataset is not part of the plan")
+            })?;
+        if !self.sql_relations.contains(&relation) {
+            return Err(dataset_error(
+                DATASET_NOT_SQL,
+                "Dataset is not produced by a SQL model",
+            ));
+        }
+        let declared = depends_on
+            .iter()
+            .any(|id| self.relations.get(id) == Some(&relation));
+        if !declared {
+            return Err(dataset_error(
+                DATASET_UNDECLARED,
+                "Dataset was not declared as a dependency of this model",
+            ));
+        }
+        if self.adapter.is_none() {
+            let adapter = PostgresAdapter::connect(&self.profile).map_err(|_| {
+                dataset_error(DATASET_UNAVAILABLE, "Dataset source connection failed")
+            })?;
+            self.adapter = Some(adapter);
+        }
+        let adapter = self.adapter.as_mut().ok_or_else(|| {
+            dataset_error(DATASET_UNAVAILABLE, "Dataset source connection failed")
+        })?;
+        let columns = adapter
+            .describe_relation(&relation)
+            .map_err(|_| dataset_error(DATASET_UNAVAILABLE, "Dataset could not be described"))?;
+        Ok(columns
+            .into_iter()
+            .map(|(name, data_type)| DatasetColumn { name, data_type })
+            .collect())
+    }
+}
 
 pub(crate) struct Executor<'a> {
     pub root: &'a Path,
@@ -27,6 +118,8 @@ pub(crate) struct Executor<'a> {
     pub store: &'a SessionStore,
     pub cancel: CancellationToken,
     pub invocations: Vec<InvocationRecord>,
+    /// Present only in mixed SQL + Python runs (AC002).
+    pub(crate) datasets: Option<DatasetSource>,
     stack: Vec<String>,
     /// Every invocation attempt received, including rejected ones.
     attempts: usize,
@@ -59,6 +152,7 @@ impl<'a> Executor<'a> {
             store,
             cancel,
             invocations: Vec::new(),
+            datasets: None,
             stack: Vec::new(),
             attempts: 0,
         })
@@ -209,7 +303,7 @@ impl<'a> Executor<'a> {
                 cancel: &cancel,
             },
             &variables,
-            &mut |call| self.handle_call(call, invocation_id, deadline),
+            &mut |request| self.handle_request(request, invocation_id, deadline, depends_on),
         );
         self.stack.pop();
         let variables = result?;
@@ -224,6 +318,52 @@ impl<'a> Executor<'a> {
             .chain(std::iter::once(next))
             .collect::<Vec<_>>()
             .join(" -> ")
+    }
+
+    fn handle_request(
+        &mut self,
+        request: HostRequest,
+        parent_invocation_id: &str,
+        deadline: Instant,
+        depends_on: &[String],
+    ) -> HostReply {
+        match request {
+            HostRequest::Call(call) => {
+                HostReply::Call(self.handle_call(call, parent_invocation_id, deadline))
+            }
+            HostRequest::Dataset { dataset, operation } => {
+                HostReply::Dataset(self.dataset_request(&dataset, &operation, depends_on))
+            }
+        }
+    }
+
+    fn dataset_request(
+        &mut self,
+        dataset: &str,
+        operation: &str,
+        depends_on: &[String],
+    ) -> Result<Vec<DatasetColumn>> {
+        self.cancel.check()?;
+        match self.datasets.as_mut() {
+            // Every request counts, including unknown operations (bounded per run).
+            Some(source) if source.requests < MAX_DATASET_REQUESTS => {
+                if operation != "schema" {
+                    source.requests += 1;
+                    return Err(DowaiError::NotImplemented(
+                        "This dataset operation is not available yet".to_owned(),
+                    ));
+                }
+                source.describe(dataset, depends_on)
+            }
+            Some(_) => Err(dataset_error(
+                DATASET_LIMIT,
+                "Dataset request limit reached for this run",
+            )),
+            None => Err(dataset_error(
+                DATASET_UNAVAILABLE,
+                "Datasets are only available in runs that include SQL models",
+            )),
+        }
     }
 
     fn handle_call(

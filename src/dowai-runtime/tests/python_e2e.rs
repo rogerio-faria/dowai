@@ -231,7 +231,7 @@ fn supervised_python_dag_persists_variables_and_does_not_commit_failed_runs() {
 
     workspace.write_model(
         "unsupported.py",
-        "def model(env):\n    env.setVar('uncommitted', True)\n    env.ref('upstream')\n",
+        "def model(env):\n    env.setVar('uncommitted', True)\n    env.write('upstream')\n",
     );
     let unsupported = run_postgres(
         &workspace.project,
@@ -325,4 +325,38 @@ fn supervised_python_dag_persists_variables_and_does_not_commit_failed_runs() {
 
     drop(workspace);
     fs::remove_dir_all(state_root).expect("remove isolated session state");
+}
+
+/// AC002: without SQL models in the plan there are no datasets; `env.ref` fails with a stable,
+/// catchable code and the run still succeeds when the model handles it.
+#[test]
+fn env_ref_without_sql_datasets_fails_with_a_catchable_code() {
+    let system_interpreter = python_executable();
+    let workspace = TestWorkspace::new(&system_interpreter);
+    workspace.write_model("upstream.py", "def model(env):\n    return None\n");
+    workspace.write_model(
+        "reader.py",
+        "def model(env):\n    try:\n        env.ref('upstream').schema()\n    except Exception as error:\n        env.setVar('ref_code', error.code)\n    return None\n",
+    );
+
+    let result = run_postgres(
+        &workspace.project,
+        RunRequest {
+            targets: vec!["reader.py".to_owned()],
+            mode: None,
+            profile: None,
+            session_id: None,
+            variables: BTreeMap::new(),
+            confirm_destructive: false,
+        },
+    )
+    .expect("Python-only run should succeed when the model handles the refusal");
+
+    assert_eq!(result.status, "SUCCEEDED");
+    let session_store =
+        SessionStore::for_user_state(default_session_store_path().expect("isolated state path"));
+    let variables = session_store
+        .snapshot(&result.session_id)
+        .expect("load persisted session variables");
+    assert_eq!(variables["ref_code"], json!("DOWAI_DATASET_UNAVAILABLE"));
 }

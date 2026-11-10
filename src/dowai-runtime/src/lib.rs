@@ -585,6 +585,18 @@ fn execute_run(
             &store,
             cancel.clone(),
         )?;
+        // AC002: Python models read SQL datasets of this plan, read-only, through the host.
+        let sql_relations: BTreeSet<String> = execution_plan
+            .nodes
+            .iter()
+            .filter(|node| !is_python_path(&node.path))
+            .filter_map(|node| relations.get(&node.id.replace('\\', "/")).cloned())
+            .collect();
+        executor.datasets = Some(executor::DatasetSource::new(
+            postgres_profile(profile.clone()),
+            relations.clone(),
+            sql_relations,
+        ));
         let mut adapter = PostgresAdapter::connect(&postgres_profile(profile))
             .map_err(|error| DowaiError::Connection(error.to_string()))?;
         let mut completed_nodes = Vec::with_capacity(execution_plan.nodes.len());

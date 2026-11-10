@@ -23,6 +23,12 @@ use std::time::{Duration, Instant};
 // The `message` of `call_failed` is a static text chosen by `code`; it never
 // carries paths or other host detail (the full error stays on the host).
 //
+// Worker -> host, zero or more `{"kind":"dataset"}` lines (AC002, `env.ref`),
+// each with `dataset` and `operation` ("schema"). The host answers each with
+// exactly one line: `dataset_ok` (`columns`: [{name, type}]) or `dataset_failed`
+// (`code`). Only datasets declared as dependencies of the model are served, and
+// only from SQL models already committed by the run.
+//
 // Worker -> host, last line (final): `ok`/`failed`/`unsupported`/`protocol`
 // exactly as before; `failed` may additionally carry the stable `code` of an
 // uncaught DowaiExecutionError, plus the `invocation_id` of the failed call it
@@ -168,12 +174,51 @@ def main():
                 )
             raise RuntimeError("invalid nested call reply")
 
-        def ref(self, *args, **kwargs):
+        def _dataset_request(self, name, operation):
+            if not isinstance(name, str) or name not in self._dependencies:
+                raise ExecutionError(
+                    "DOWAI_DATASET_UNDECLARED",
+                    "dataset was not declared as a dependency of this model",
+                )
+            respond({"protocol_version": 1, "kind": "dataset", "dataset": name, "operation": operation})
+            line = _in.readline()
+            if not line:
+                raise RuntimeError("the DOWAI host closed the dataset channel")
+            reply = json.loads(line)
+            if reply.get("protocol_version") != 1:
+                raise RuntimeError("invalid dataset reply")
+            if reply.get("kind") == "dataset_ok" and isinstance(reply.get("columns"), list):
+                return [dict(column) for column in reply["columns"]]
+            if reply.get("kind") == "dataset_failed":
+                raise ExecutionError(
+                    str(reply.get("code") or "DOWAI_DATASET_UNAVAILABLE"),
+                    "dataset is not available to this model",
+                )
+            raise RuntimeError("invalid dataset reply")
+
+        def ref(self, name):
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("name must be a non-empty string")
+            return Dataset(self, name)
+
+        def _unsupported(self, *args, **kwargs):
             raise NotImplementedError()
 
-        source = ref
-        write = ref
-        generateCsv = ref
+        source = _unsupported
+        write = _unsupported
+        generateCsv = _unsupported
+
+    class Dataset:
+        def __init__(self, environment, name):
+            self._environment = environment
+            self._name = name
+
+        @property
+        def name(self):
+            return self._name
+
+        def schema(self):
+            return self._environment._dataset_request(self._name, "schema")
 
     dependencies = set(request.get("dependencies", []))
     for dependency in list(dependencies):
@@ -233,6 +278,40 @@ struct WorkerMessage {
     code: Option<String>,
     #[serde(default)]
     invocation_id: Option<String>,
+    #[serde(default)]
+    dataset: Option<String>,
+    #[serde(default)]
+    operation: Option<String>,
+}
+
+/// One column of a dataset, as the worker sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct DatasetColumn {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub data_type: String,
+}
+
+/// A request from the worker: a nested call or a dataset operation.
+pub(crate) enum HostRequest {
+    Call(ChildCall),
+    Dataset { dataset: String, operation: String },
+}
+
+/// The host's answer to a [`HostRequest`]; the variant matches the request.
+pub(crate) enum HostReply {
+    Call(ChildOutcome),
+    Dataset(Result<Vec<DatasetColumn>>),
+}
+
+#[derive(Serialize)]
+struct DatasetReply<'a> {
+    protocol_version: u32,
+    kind: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    columns: Option<&'a [DatasetColumn]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -272,12 +351,12 @@ pub(crate) struct ModelInvocation<'a> {
     pub cancel: &'a CancellationToken,
 }
 
-type CallHandler<'a> = dyn FnMut(ChildCall) -> ChildOutcome + 'a;
+type RequestHandler<'a> = dyn FnMut(HostRequest) -> HostReply + 'a;
 
 pub(crate) fn execute_model(
     invocation: &ModelInvocation<'_>,
     variables: &BTreeMap<String, Value>,
-    on_call: &mut CallHandler<'_>,
+    on_request: &mut RequestHandler<'_>,
 ) -> Result<BTreeMap<String, Value>> {
     let mut request = serde_json::to_vec(&WorkerRequest {
         protocol_version: IPC_PROTOCOL_VERSION,
@@ -370,7 +449,7 @@ pub(crate) fn execute_model(
         final_message: None,
         failed_calls: HashMap::new(),
     };
-    let driven = supervision.drive(&mut child, on_call);
+    let driven = supervision.drive(&mut child, on_request);
     let Supervision {
         replies,
         final_message,
@@ -409,7 +488,7 @@ pub(crate) fn execute_model(
             return Err(protocol_error());
         }
         let message = parse_message(&line)?;
-        if message.kind == "call" {
+        if matches!(message.kind.as_str(), "call" | "dataset") {
             return Err(protocol_error());
         }
         final_message = Some(message);
@@ -459,14 +538,14 @@ impl Supervision {
     fn drive(
         &mut self,
         child: &mut Child,
-        on_call: &mut CallHandler<'_>,
+        on_request: &mut RequestHandler<'_>,
     ) -> Result<std::process::ExitStatus> {
         loop {
             // Checked first so a cancelled run never serves further nested calls; the
             // caller terminates the whole process tree on any error.
             self.cancel.check()?;
             while let Ok(line) = self.messages.try_recv() {
-                self.handle(line, on_call)?;
+                self.handle(line, on_request)?;
             }
             match child.try_wait() {
                 Ok(Some(status)) => return Ok(status),
@@ -477,59 +556,100 @@ impl Supervision {
                 return Err(timeout_error());
             }
             match self.messages.recv_timeout(POLL_INTERVAL) {
-                Ok(line) => self.handle(line, on_call)?,
+                Ok(line) => self.handle(line, on_request)?,
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => thread::sleep(POLL_INTERVAL),
             }
         }
     }
 
-    fn handle(&mut self, line: io::Result<Vec<u8>>, on_call: &mut CallHandler<'_>) -> Result<()> {
+    fn handle(
+        &mut self,
+        line: io::Result<Vec<u8>>,
+        on_request: &mut RequestHandler<'_>,
+    ) -> Result<()> {
         let line = line.map_err(|_| protocol_error())?;
         if line.len() > MAX_IPC_BYTES || self.final_message.is_some() {
             return Err(protocol_error());
         }
         let message = parse_message(&line)?;
-        if message.kind != "call" {
-            self.final_message = Some(message);
-            return Ok(());
+        match message.kind.as_str() {
+            "call" => {
+                let (Some(target), Some(variables)) = (message.target, message.variables) else {
+                    return Err(protocol_error());
+                };
+                let HostReply::Call(outcome) = on_request(HostRequest::Call(ChildCall {
+                    target,
+                    mode: message.mode,
+                    variables,
+                })) else {
+                    return Err(protocol_error());
+                };
+                let reply = match &outcome.result {
+                    Ok(variables) => CallReply {
+                        protocol_version: IPC_PROTOCOL_VERSION,
+                        kind: "call_ok",
+                        invocation_id: &outcome.invocation_id,
+                        variables: Some(variables),
+                        code: None,
+                        message: None,
+                    },
+                    Err(error) => CallReply {
+                        protocol_version: IPC_PROTOCOL_VERSION,
+                        kind: "call_failed",
+                        invocation_id: &outcome.invocation_id,
+                        variables: None,
+                        code: Some(error.code()),
+                        message: Some(worker_visible_message(error.code())),
+                    },
+                };
+                let mut bytes = serde_json::to_vec(&reply).map_err(|_| protocol_error())?;
+                if bytes.len() > MAX_IPC_BYTES {
+                    return Err(protocol_error());
+                }
+                bytes.push(b'\n');
+                self.replies.send(bytes).map_err(|_| protocol_error())?;
+                if let Err(error) = outcome.result {
+                    self.failed_calls.insert(outcome.invocation_id, error);
+                }
+                Ok(())
+            }
+            "dataset" => {
+                let (Some(dataset), Some(operation)) = (message.dataset, message.operation) else {
+                    return Err(protocol_error());
+                };
+                let HostReply::Dataset(result) =
+                    on_request(HostRequest::Dataset { dataset, operation })
+                else {
+                    return Err(protocol_error());
+                };
+                let reply = match &result {
+                    Ok(columns) => DatasetReply {
+                        protocol_version: IPC_PROTOCOL_VERSION,
+                        kind: "dataset_ok",
+                        columns: Some(columns),
+                        code: None,
+                    },
+                    Err(error) => DatasetReply {
+                        protocol_version: IPC_PROTOCOL_VERSION,
+                        kind: "dataset_failed",
+                        columns: None,
+                        code: Some(error.code()),
+                    },
+                };
+                let mut bytes = serde_json::to_vec(&reply).map_err(|_| protocol_error())?;
+                if bytes.len() > MAX_IPC_BYTES {
+                    return Err(protocol_error());
+                }
+                bytes.push(b'\n');
+                self.replies.send(bytes).map_err(|_| protocol_error())?;
+                Ok(())
+            }
+            _ => {
+                self.final_message = Some(message);
+                Ok(())
+            }
         }
-        let (Some(target), Some(variables)) = (message.target, message.variables) else {
-            return Err(protocol_error());
-        };
-        let outcome = on_call(ChildCall {
-            target,
-            mode: message.mode,
-            variables,
-        });
-        let reply = match &outcome.result {
-            Ok(variables) => CallReply {
-                protocol_version: IPC_PROTOCOL_VERSION,
-                kind: "call_ok",
-                invocation_id: &outcome.invocation_id,
-                variables: Some(variables),
-                code: None,
-                message: None,
-            },
-            Err(error) => CallReply {
-                protocol_version: IPC_PROTOCOL_VERSION,
-                kind: "call_failed",
-                invocation_id: &outcome.invocation_id,
-                variables: None,
-                code: Some(error.code()),
-                message: Some(worker_visible_message(error.code())),
-            },
-        };
-        let mut bytes = serde_json::to_vec(&reply).map_err(|_| protocol_error())?;
-        if bytes.len() > MAX_IPC_BYTES {
-            return Err(protocol_error());
-        }
-        bytes.push(b'\n');
-        self.replies.send(bytes).map_err(|_| protocol_error())?;
-        if let Err(error) = outcome.result {
-            self.failed_calls.insert(outcome.invocation_id, error);
-        }
-        Ok(())
     }
 }
 

@@ -27,6 +27,11 @@ pub enum DowaiError {
         report: Value,
     },
     NotImplemented(String),
+    /// Dataset access requested by a Python model (`env.ref`), with a stable code (AC002).
+    DatasetAccess {
+        code: &'static str,
+        message: String,
+    },
     Io(std::io::Error),
 }
 
@@ -55,6 +60,7 @@ impl DowaiError {
             Self::Cancelled(_) => "DOWAI_CANCELLED",
             Self::Validation { .. } => "DOWAI_CONFIG_INVALID",
             Self::NotImplemented(_) => "DOWAI_NOT_IMPLEMENTED",
+            Self::DatasetAccess { code, .. } => code,
             Self::Io(_) => "DOWAI_IO_ERROR",
         }
     }
@@ -76,6 +82,7 @@ impl DowaiError {
             Self::SessionConflict(_) => 3,
             Self::PythonFailure(_) | Self::PythonTimeout(_) | Self::PythonProtocol(_) => 3,
             Self::NotImplemented(_) => 6,
+            Self::DatasetAccess { .. } => 3,
             Self::Cancelled(_) => 130,
             Self::Io(_) => 2,
         }
@@ -98,7 +105,8 @@ impl DowaiError {
             | Self::PythonProtocol(message)
             | Self::Policy(message)
             | Self::Cancelled(message)
-            | Self::NotImplemented(message) => message.clone(),
+            | Self::NotImplemented(message)
+            | Self::DatasetAccess { message, .. } => message.clone(),
             Self::Validation { message, .. } => message.clone(),
             Self::Io(error) => error.to_string(),
         }
