@@ -1,0 +1,8 @@
+{
+  "schema_version": 2,
+  "metrics": {
+    "clientes_ativos": {
+      "description": "Clientes com compra nos últimos 12 meses"
+    }
+  }
+}

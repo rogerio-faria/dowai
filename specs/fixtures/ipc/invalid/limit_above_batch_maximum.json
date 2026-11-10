@@ -1,0 +1,8 @@
+{
+  "protocol_version": 1,
+  "kind": "dataset",
+  "dataset": "warehouse",
+  "operation": "rows",
+  "offset": 0,
+  "limit": 20000
+}

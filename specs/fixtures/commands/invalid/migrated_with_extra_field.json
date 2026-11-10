@@ -1,0 +1,7 @@
+{
+  "status": "MIGRATED",
+  "input": "a.yml",
+  "output": "a.json",
+  "changes": [],
+  "secret": "x"
+}

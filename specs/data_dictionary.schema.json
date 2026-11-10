@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dowai.dev/schemas/data_dictionary.schema.json",
+  "title": "DOWAI semantic data dictionary (schema_version 2)",
+  "description": "Global and project dictionaries share this shape. Entries merge by full ID, and a local entry replaces the global one. Formulas are text for review; they are never executed by this schema. Dimensions, keys and relations are future work and are rejected for now.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "metrics"],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "metrics": {
+      "type": "object",
+      "propertyNames": { "pattern": "^[a-z][a-z0-9_]{0,127}$" },
+      "additionalProperties": { "$ref": "#/$defs/metric" }
+    }
+  },
+  "$defs": {
+    "metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["description"],
+      "properties": {
+        "description": { "type": "string", "minLength": 1, "maxLength": 2000 },
+        "synonyms": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1, "maxLength": 128 }
+        },
+        "formula": { "type": "string", "minLength": 1, "maxLength": 4000 },
+        "source_tables": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1, "maxLength": 256 }
+        },
+        "grain": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "description": "Columns that identify one row before aggregation."
+        },
+        "filters": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "maxLength": 1000 }
+        },
+        "notes": { "type": "string", "maxLength": 4000 }
+      }
+    }
+  }
+}

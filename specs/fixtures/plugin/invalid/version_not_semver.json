@@ -1,0 +1,20 @@
+{
+  "schema_version": 2,
+  "id": "email",
+  "version": "1.0",
+  "entrypoints": {
+    "send": "sender:send"
+  },
+  "permissions": {
+    "network": [
+      "mail_gateway"
+    ],
+    "filesystem": [],
+    "secrets": [
+      "mail_credentials"
+    ]
+  },
+  "timeout_seconds": 30,
+  "side_effects": true,
+  "idempotency_key_required": true
+}

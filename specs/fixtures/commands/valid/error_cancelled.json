@@ -1,0 +1,7 @@
+{
+  "schema_version": 2,
+  "status": "CANCELLED",
+  "error_code": "DOWAI_CANCELLED",
+  "message": "The run was cancelled",
+  "details": null
+}

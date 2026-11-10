@@ -1,0 +1,5 @@
+{
+  "protocol_version": 1,
+  "kind": "dataset_failed",
+  "code": "DOWAI_DATASET_LIMIT"
+}

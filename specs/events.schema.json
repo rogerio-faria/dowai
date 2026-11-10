@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dowai.dev/schemas/events.schema.json",
+  "title": "DOWAI AUDIT event (audit.jsonl, one JSON object per line, schema_version 1)",
+  "description": "Identifiers, names, hashes and DOWAI codes only. There is no field for variable values, SQL, credentials, free text or paths, and unknown fields are rejected so that such data cannot be added without a new schema version.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "timestamp", "event", "engine_version", "actor", "run_id"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$"
+    },
+    "event": {
+      "enum": [
+        "run.started",
+        "node.started",
+        "node.finished",
+        "variables.published",
+        "external.write",
+        "python.invocation",
+        "policy.denied",
+        "run.finished"
+      ]
+    },
+    "engine_version": { "type": "string", "minLength": 1, "maxLength": 64 },
+    "actor": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "run_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "session_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "invocation_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "parent_invocation_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "attempt_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "node_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "call_type": { "enum": ["static", "imperative", "dependency"] },
+    "project": { "type": "string", "maxLength": 256 },
+    "script_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "config_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "plan_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "mode": { "enum": ["automatic", "manual"] },
+    "source_profile": { "type": "string", "maxLength": 256 },
+    "target_profile": { "type": "string", "maxLength": 256 },
+    "relation": { "type": "string", "maxLength": 256 },
+    "variables": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1, "maxLength": 256 },
+      "description": "Variable names only, never values."
+    },
+    "rows": { "type": "integer", "minimum": 0 },
+    "result": { "type": "string", "maxLength": 256 },
+    "error_code": {
+      "type": "string",
+      "pattern": "^DOWAI_[A-Z0-9_]+$",
+      "maxLength": 64
+    }
+  }
+}

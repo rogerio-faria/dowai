@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "timestamp": "2026-11-10T12:00:01.000Z",
+  "event": "node.finished",
+  "engine_version": "0.1.0",
+  "actor": "admin",
+  "run_id": "11111111-1111-4111-8111-111111111111",
+  "node_id": "consumer.py",
+  "call_type": "static",
+  "rows": 0,
+  "error_code": "DOWAI_PYTHON_FAILED"
+}

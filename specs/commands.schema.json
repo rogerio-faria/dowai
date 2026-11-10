@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dowai.dev/schemas/commands.schema.json",
+  "title": "DOWAI command JSON envelopes (--json outputs)",
+  "description": "Envelopes printed by the CLI with --json for failures and for the configuration migration. Payloads of run, session and plan are covered by run.schema.json, session.schema.json and plan.schema.json.",
+  "oneOf": [
+    { "$ref": "#/$defs/errorEnvelope" },
+    { "$ref": "#/$defs/configMigrated" }
+  ],
+  "$defs": {
+    "errorEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "status", "error_code", "message", "details"],
+      "properties": {
+        "schema_version": { "const": 2 },
+        "status": { "enum": ["FAILED", "CANCELLED"] },
+        "error_code": { "type": "string", "pattern": "^DOWAI_[A-Z0-9_]+$", "maxLength": 64 },
+        "message": { "type": "string" },
+        "details": { "type": ["object", "null"] }
+      }
+    },
+    "configMigrated": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "input", "output", "changes"],
+      "properties": {
+        "status": { "const": "MIGRATED" },
+        "input": { "type": "string", "minLength": 1 },
+        "output": { "type": "string", "minLength": 1 },
+        "changes": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    }
+  }
+}

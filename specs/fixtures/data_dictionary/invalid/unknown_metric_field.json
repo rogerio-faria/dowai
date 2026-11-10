@@ -1,0 +1,25 @@
+{
+  "schema_version": 2,
+  "metrics": {
+    "faturamento_liquido": {
+      "description": "Faturamento excluindo impostos em vendas faturadas",
+      "synonyms": [
+        "receita_liquida",
+        "vendas_liquidas"
+      ],
+      "formula": "SUM(tab_vendas.valor_fat) - SUM(tab_vendas_fiscal.valor_impostos)",
+      "source_tables": [
+        "tab_vendas",
+        "tab_vendas_fiscal"
+      ],
+      "grain": [
+        "id_venda"
+      ],
+      "filters": [
+        "tab_vendas.status = 'FATURADA'"
+      ],
+      "notes": "Preservar uma linha por venda antes da agregação",
+      "owner": "finance"
+    }
+  }
+}

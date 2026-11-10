@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dowai.dev/schemas/plugin.schema.json",
+  "title": "DOWAI plugin manifest (schema_version 2)",
+  "description": "Manifest validated before a plugin is discovered or executed. Undeclared permissions are denied by the runtime; this schema only fixes the shape. Plugins with side effects must require an idempotency key.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "id",
+    "version",
+    "entrypoints",
+    "permissions",
+    "timeout_seconds",
+    "side_effects",
+    "idempotency_key_required"
+  ],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{1,63}$",
+      "description": "Namespace used by env.plugins.run('<id>.<method>')."
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?$"
+    },
+    "entrypoints": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": { "pattern": "^[a-z][a-z0-9_]{0,63}$" },
+      "additionalProperties": {
+        "type": "string",
+        "pattern": "^[A-Za-z_][A-Za-z0-9_.]*:[A-Za-z_][A-Za-z0-9_]*$",
+        "description": "module:function, resolved inside the plugin package."
+      }
+    },
+    "permissions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["network", "filesystem", "secrets"],
+      "properties": {
+        "network": { "$ref": "#/$defs/nameList" },
+        "filesystem": { "$ref": "#/$defs/nameList" },
+        "secrets": { "$ref": "#/$defs/nameList" }
+      }
+    },
+    "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 },
+    "side_effects": { "type": "boolean" },
+    "idempotency_key_required": { "type": "boolean" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "side_effects": { "const": true } }, "required": ["side_effects"] },
+      "then": { "properties": { "idempotency_key_required": { "const": true } } }
+    }
+  ],
+  "$defs": {
+    "nameList": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$" }
+    }
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "protocol_version": 1,
+  "kind": "call",
+  "target": "child.py",
+  "mode": "manual",
+  "variables": {
+    "stage": "ready"
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "protocol_version": 1,
+  "kind": "call_failed",
+  "invocation_id": "33333333-3333-4333-8333-333333333333",
+  "code": "DOWAI_PYTHON_FAILED",
+  "message": "model failed"
+}

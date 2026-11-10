@@ -1,0 +1,13 @@
+{
+  "protocol_version": 1,
+  "variables": {
+    "input": {
+      "batch": 7
+    }
+  },
+  "dependencies": [
+    "a.py",
+    "a.py"
+  ],
+  "mode": "automatic"
+}

@@ -1,0 +1,11 @@
+{
+  "protocol_version": 1,
+  "kind": "dataset_rows",
+  "columns": [
+    "id"
+  ],
+  "rows": [
+    1,
+    2
+  ]
+}

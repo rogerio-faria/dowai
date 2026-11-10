@@ -1,0 +1,5 @@
+{
+  "protocol_version": 1,
+  "kind": "dataset_failed",
+  "code": "relation public.secret does not exist"
+}

@@ -1,0 +1,170 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dowai.dev/schemas/ipc.schema.json",
+  "title": "DOWAI Python worker IPC, protocol_version 1 (newline-delimited JSON, one message per line)",
+  "description": "Every line exchanged between the host and a Python worker. The host sends one request, then answers each worker message with one reply line; the worker ends with one final message. Unknown fields are rejected on both sides.",
+  "oneOf": [
+    { "$ref": "#/$defs/hostRequest" },
+    { "$ref": "#/$defs/workerCall" },
+    { "$ref": "#/$defs/workerDataset" },
+    { "$ref": "#/$defs/workerFinal" },
+    { "$ref": "#/$defs/hostCallReply" },
+    { "$ref": "#/$defs/hostDatasetReply" }
+  ],
+  "$defs": {
+    "protocolVersion": { "const": 1 },
+    "mode": { "enum": ["automatic", "manual"] },
+    "errorCode": { "type": "string", "pattern": "^DOWAI_[A-Z0-9_]+$", "maxLength": 64 },
+    "nonEmptyString": { "type": "string", "minLength": 1, "maxLength": 256 },
+
+    "hostRequest": {
+      "description": "First line, host to worker.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol_version", "variables", "dependencies", "mode"],
+      "properties": {
+        "protocol_version": { "$ref": "#/$defs/protocolVersion" },
+        "variables": { "type": "object" },
+        "dependencies": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/nonEmptyString" }
+        },
+        "mode": { "$ref": "#/$defs/mode" }
+      }
+    },
+
+    "workerCall": {
+      "description": "Nested env.run request, worker to host. The host answers with hostCallReply.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol_version", "kind", "target", "mode", "variables"],
+      "properties": {
+        "protocol_version": { "$ref": "#/$defs/protocolVersion" },
+        "kind": { "const": "call" },
+        "target": { "$ref": "#/$defs/nonEmptyString" },
+        "mode": { "$ref": "#/$defs/mode" },
+        "variables": { "type": "object" }
+      }
+    },
+
+    "workerDataset": {
+      "description": "env.ref request, worker to host. Rows are read in batches of at most 10000.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol_version", "kind", "dataset", "operation"],
+      "properties": {
+        "protocol_version": { "$ref": "#/$defs/protocolVersion" },
+        "kind": { "const": "dataset" },
+        "dataset": { "$ref": "#/$defs/nonEmptyString" },
+        "operation": { "enum": ["schema", "rows"] },
+        "offset": { "type": "integer", "minimum": 0 },
+        "limit": { "type": "integer", "minimum": 1, "maximum": 10000 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "operation": { "const": "rows" } }, "required": ["operation"] },
+          "then": { "required": ["offset", "limit"] },
+          "else": { "not": { "anyOf": [{ "required": ["offset"] }, { "required": ["limit"] }] } }
+        }
+      ]
+    },
+
+    "workerFinal": {
+      "description": "Last line, worker to host. ok carries the variables of the model.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol_version", "kind"],
+      "properties": {
+        "protocol_version": { "$ref": "#/$defs/protocolVersion" },
+        "kind": { "enum": ["ok", "failed", "unsupported", "protocol"] },
+        "variables": { "type": "object" },
+        "code": { "$ref": "#/$defs/errorCode" },
+        "invocation_id": { "$ref": "#/$defs/nonEmptyString" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "ok" } }, "required": ["kind"] },
+          "then": { "required": ["variables"] },
+          "else": { "not": { "required": ["variables"] } }
+        }
+      ]
+    },
+
+    "hostCallReply": {
+      "description": "Answer to a workerCall: call_ok carries the merged overlay; call_failed carries a stable code and a static message.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol_version", "kind", "invocation_id"],
+      "properties": {
+        "protocol_version": { "$ref": "#/$defs/protocolVersion" },
+        "kind": { "enum": ["call_ok", "call_failed"] },
+        "invocation_id": { "$ref": "#/$defs/nonEmptyString" },
+        "variables": { "type": "object" },
+        "code": { "$ref": "#/$defs/errorCode" },
+        "message": { "type": "string", "maxLength": 512 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "call_ok" } }, "required": ["kind"] },
+          "then": { "required": ["variables"], "not": { "anyOf": [{ "required": ["code"] }, { "required": ["message"] }] } },
+          "else": { "required": ["code", "message"], "not": { "required": ["variables"] } }
+        }
+      ]
+    },
+
+    "hostDatasetReply": {
+      "description": "Answer to a workerDataset: exactly one of the three kinds.",
+      "oneOf": [
+        { "$ref": "#/$defs/datasetOk" },
+        { "$ref": "#/$defs/datasetRows" },
+        { "$ref": "#/$defs/datasetFailed" }
+      ]
+    },
+    "datasetOk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol_version", "kind", "columns"],
+      "properties": {
+        "protocol_version": { "$ref": "#/$defs/protocolVersion" },
+        "kind": { "const": "dataset_ok" },
+        "columns": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "type"],
+            "properties": {
+              "name": { "$ref": "#/$defs/nonEmptyString" },
+              "type": { "$ref": "#/$defs/nonEmptyString" }
+            }
+          }
+        }
+      }
+    },
+    "datasetRows": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol_version", "kind", "columns", "rows"],
+      "properties": {
+        "protocol_version": { "$ref": "#/$defs/protocolVersion" },
+        "kind": { "const": "dataset_rows" },
+        "columns": { "type": "array", "items": { "$ref": "#/$defs/nonEmptyString" } },
+        "rows": {
+          "type": "array",
+          "items": { "type": "array" }
+        }
+      }
+    },
+    "datasetFailed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol_version", "kind", "code"],
+      "properties": {
+        "protocol_version": { "$ref": "#/$defs/protocolVersion" },
+        "kind": { "const": "dataset_failed" },
+        "code": { "$ref": "#/$defs/errorCode" }
+      }
+    }
+  }
+}

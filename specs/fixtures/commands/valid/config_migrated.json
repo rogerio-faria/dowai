@@ -1,0 +1,8 @@
+{
+  "status": "MIGRATED",
+  "input": "/tmp/dowai.yml",
+  "output": "/tmp/dowai.json",
+  "changes": [
+    "schema_version added"
+  ]
+}

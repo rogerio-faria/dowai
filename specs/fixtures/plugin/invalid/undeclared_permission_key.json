@@ -1,0 +1,17 @@
+{
+  "schema_version": 2,
+  "id": "email",
+  "version": "1.0.0",
+  "entrypoints": {
+    "send": "sender:send"
+  },
+  "permissions": {
+    "network": [],
+    "filesystem": [],
+    "secrets": [],
+    "shell": true
+  },
+  "timeout_seconds": 30,
+  "side_effects": true,
+  "idempotency_key_required": true
+}
