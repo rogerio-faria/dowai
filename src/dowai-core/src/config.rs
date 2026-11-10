@@ -3,6 +3,7 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const SECTIONS: &[&str] = &["execution", "templates", "security", "ai", "sessions"];
@@ -163,6 +164,9 @@ pub fn resolve_effective_configuration(
         }
     }
 
+    if let Some(legacy_workspace) = find_ancestor_file(project_dir, "workspace.yaml") {
+        check_configuration_formats(&legacy_workspace.with_extension("json"))?;
+    }
     if let Some(workspace_path) = find_ancestor_file(project_dir, "workspace.json") {
         if let Some(layer) = read_config_layer(&workspace_path, "workspace")? {
             validate_layer(&layer, &workspace_path)?;
@@ -172,6 +176,7 @@ pub fn resolve_effective_configuration(
     }
 
     let project_manifest = project_dir.join("dowai_project.json");
+    check_configuration_formats(&project_manifest)?;
     if project_manifest.is_file() {
         crate::load_project(project_dir)?;
         let manifest = read_json_object(&project_manifest, "project")?;
@@ -258,7 +263,152 @@ fn configuration_defaults() -> Value {
     })
 }
 
+/// AC032: one configuration format per scope. The JSON file is the only format read; a YAML
+/// sibling is legacy. Both present is a conflict and is never merged; YAML alone is refused
+/// with a pointer to `dowai config migrate`.
+pub fn check_configuration_formats(json_path: &Path) -> Result<()> {
+    let yaml_path = json_path.with_extension("yaml");
+    match (json_path.is_file(), yaml_path.is_file()) {
+        (true, true) => Err(DowaiError::ConfigConflict(format!(
+            "{} and {} both exist. Keep one format per scope: configurations are never merged. Migrate the YAML with `dowai config migrate` and remove it.",
+            json_path.display(),
+            yaml_path.display()
+        ))),
+        (false, true) => Err(DowaiError::LegacyConfigFormat(format!(
+            "{} is a legacy YAML configuration and is not read. Run `dowai config migrate {} --output {}`.",
+            yaml_path.display(),
+            yaml_path.display(),
+            json_path.display()
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Outcome of `dowai config migrate`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationReport {
+    pub output: PathBuf,
+    pub changes: Vec<String>,
+}
+
+/// Converts a legacy YAML configuration into the native JSON format (plan 3.6). The input is
+/// never modified, an existing output is never replaced, literal secrets are refused without
+/// echoing them, and the written file must load as a native configuration.
+pub fn migrate_legacy_yaml(input: &Path, output: &Path) -> Result<MigrationReport> {
+    let input_is_yaml = matches!(
+        input.extension().and_then(|extension| extension.to_str()),
+        Some("yaml" | "yml")
+    );
+    if !input_is_yaml {
+        return Err(DowaiError::Config(
+            "The input must be a YAML configuration (.yaml or .yml)".to_owned(),
+        ));
+    }
+    if output.extension().and_then(|extension| extension.to_str()) != Some("json") {
+        return Err(DowaiError::Config(
+            "The output must be a JSON file (.json)".to_owned(),
+        ));
+    }
+    if !input.is_file() {
+        return Err(DowaiError::Config(format!(
+            "Input configuration not found: {}",
+            input.display()
+        )));
+    }
+    if output.exists() {
+        return Err(DowaiError::Config(format!(
+            "Output already exists and will not be replaced: {}",
+            output.display()
+        )));
+    }
+    let text = fs::read_to_string(input).map_err(|error| {
+        DowaiError::Config(format!("Cannot read legacy configuration: {error}"))
+    })?;
+    // The parser's own message can quote input text, so it is not forwarded.
+    let document: Value = noyalib::from_str(&text)
+        .map_err(|_| DowaiError::Config("Invalid legacy YAML configuration".to_owned()))?;
+    let mut object = document.as_object().cloned().ok_or_else(|| {
+        DowaiError::Config("Legacy configuration root must be a mapping".to_owned())
+    })?;
+    let mut changes = Vec::new();
+    match object.get("schema_version") {
+        None => {
+            object.insert("schema_version".to_owned(), json!(2));
+            changes.push("added schema_version: 2".to_owned());
+        }
+        Some(Value::Number(number)) if number.as_u64() == Some(2) => {}
+        Some(_) => {
+            return Err(DowaiError::Config(
+                "Legacy configuration schema_version is not supported; expected 2".to_owned(),
+            ))
+        }
+    }
+    reject_secret_literals(&Value::Object(object.clone()), "")?;
+    let mut rendered = serde_json::to_string_pretty(&Value::Object(object))
+        .map_err(|error| DowaiError::Config(error.to_string()))?;
+    rendered.push('\n');
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output)?;
+    let written = file
+        .write_all(rendered.as_bytes())
+        .and_then(|()| file.sync_all());
+    drop(file);
+    let verified = written
+        .map_err(DowaiError::from)
+        .and_then(|()| read_json_object(output, "migrated").map(|_| ()));
+    if let Err(error) = verified {
+        let _ = fs::remove_file(output);
+        return Err(error);
+    }
+    Ok(MigrationReport {
+        output: output.to_path_buf(),
+        changes,
+    })
+}
+
+/// Refuses literal secrets: a credential-like key with a non-empty string value that is not
+/// a `*_env` or `*_ref` reference. The value is never included in the error.
+fn reject_secret_literals(value: &Value, path: &str) -> Result<()> {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                let child_path = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                let lower = key.to_ascii_lowercase();
+                let credential_like = ["password", "secret", "token", "api_key", "apikey"]
+                    .iter()
+                    .any(|marker| lower.contains(marker));
+                let reference = lower.ends_with("_env") || lower.ends_with("_ref");
+                if credential_like
+                    && !reference
+                    && matches!(child, Value::String(text) if !text.is_empty())
+                {
+                    return Err(DowaiError::Config(format!(
+                        "Literal secret at '{child_path}' is not migrated; use a '*_env' reference or a secret manager"
+                    )));
+                }
+                reject_secret_literals(child, &child_path)?;
+            }
+            Ok(())
+        }
+        Value::Array(items) => {
+            for item in items {
+                reject_secret_literals(item, path)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 fn read_config_layer(path: &Path, label: &str) -> Result<Option<Map<String, Value>>> {
+    check_configuration_formats(path)?;
     if !path.exists() {
         return Ok(None);
     }

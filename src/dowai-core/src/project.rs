@@ -73,6 +73,7 @@ pub struct ValidationReport {
 
 pub fn load_project(project_root: &Path) -> Result<Project> {
     let path = project_root.join(PROJECT_FILE);
+    crate::check_configuration_formats(&path)?;
     let bytes = fs::read(&path)
         .map_err(|error| DowaiError::Config(format!("Cannot read {}: {error}", path.display())))?;
     let project: Project = serde_json::from_slice(&bytes)

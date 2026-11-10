@@ -11,8 +11,9 @@ mod templates;
 pub use audit::{default_audit_log_path, sha256_hex, AuditEvent, AuditLog, AUDIT_SCHEMA_VERSION};
 pub use cancel::CancellationToken;
 pub use config::{
-    admin_config_path, load_workspace_profile, resolve_effective_configuration, user_config_path,
-    ProfileTlsMode, WorkspaceProfile,
+    admin_config_path, check_configuration_formats, load_workspace_profile, migrate_legacy_yaml,
+    resolve_effective_configuration, user_config_path, MigrationReport, ProfileTlsMode,
+    WorkspaceProfile,
 };
 pub use error::{DowaiError, Result};
 pub use planner::{

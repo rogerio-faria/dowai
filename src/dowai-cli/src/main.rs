@@ -151,6 +151,16 @@ enum ConfigCommand {
         #[arg(long)]
         project_dir: Option<PathBuf>,
     },
+    /// Convert a legacy YAML configuration to native JSON (never overwrites; AC032).
+    Migrate {
+        /// Legacy YAML file; it is read and never modified.
+        path: PathBuf,
+        /// New JSON file to create; it must not exist.
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -406,6 +416,25 @@ fn dispatch(command: Command) -> Result<Option<Value>> {
                     Ok(None)
                 }
             }
+            ConfigCommand::Migrate { path, output, json } => {
+                let report = dowai_core::migrate_legacy_yaml(&path, &output)?;
+                let summary = serde_json::json!({
+                    "status": "MIGRATED",
+                    "input": path,
+                    "output": report.output,
+                    "changes": report.changes,
+                });
+                if json {
+                    Ok(Some(summary))
+                } else {
+                    println!("Migrated {} -> {}", path.display(), report.output.display());
+                    for change in &report.changes {
+                        println!("  {change}");
+                    }
+                    println!("The original file was not modified. Review the output, then remove the YAML.");
+                    Ok(None)
+                }
+            }
         },
         Command::Run(args) => {
             if args.full_refresh {
@@ -496,7 +525,7 @@ fn wants_json(command: &Command) -> bool {
             | SessionCommand::End { json, .. } => *json,
         },
         Command::Config { command } => match command {
-            ConfigCommand::Show { json, .. } => *json,
+            ConfigCommand::Show { json, .. } | ConfigCommand::Migrate { json, .. } => *json,
         },
         Command::Run(args) => args.json,
         Command::Logs { json, .. } => *json,

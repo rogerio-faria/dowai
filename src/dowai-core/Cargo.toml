@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+noyalib = "0.0.60"
 serde.workspace = true
 serde_json.workspace = true
 rusqlite.workspace = true

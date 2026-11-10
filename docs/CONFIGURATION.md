@@ -142,3 +142,23 @@ dowai config show --effective --project-dir .\projects\sales --json
 The output contains `effective`, `origins`, and `sources`. Only present
 configuration fields are returned; this command does not reveal connection
 profiles or secrets.
+
+## Legacy YAML (AC032)
+
+Each scope uses one format. The JSON file is the only one read.
+
+- A scope with both `<name>.json` and `<name>.yaml` (for example `dowai_project.json` and
+  `dowai_project.yaml`) fails with `DOWAI_CONFIG_CONFLICT`. Layers are never merged.
+- A scope with only the legacy YAML fails with `DOWAI_CONFIG_LEGACY_YAML` and points to the
+  migration command. The YAML is not read as a layer.
+
+Convert a legacy file with:
+
+```
+dowai config migrate <file.yaml> --output <file.json> [--json]
+```
+
+The command never modifies the input, never replaces an existing output, refuses literal
+credentials (`password`, `secret`, `token`, `api_key`, `apikey` with a value; use `*_env`
+references instead) without echoing them, and checks the written file as a native
+configuration. Parser errors do not quote the input.

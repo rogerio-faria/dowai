@@ -6,6 +6,10 @@ pub type Result<T> = std::result::Result<T, DowaiError>;
 #[derive(Debug)]
 pub enum DowaiError {
     Config(String),
+    /// Two configuration formats for one scope: never merged (AC032).
+    ConfigConflict(String),
+    /// A legacy YAML configuration without its JSON counterpart; not read (AC032).
+    LegacyConfigFormat(String),
     Path(String),
     Model(String),
     Template(String),
@@ -44,6 +48,8 @@ impl DowaiError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::Config(_) => "DOWAI_CONFIG_INVALID",
+            Self::ConfigConflict(_) => "DOWAI_CONFIG_CONFLICT",
+            Self::LegacyConfigFormat(_) => "DOWAI_CONFIG_LEGACY_YAML",
             Self::Path(_) => "DOWAI_POLICY_PATH",
             Self::Model(_) => "DOWAI_PLAN_INVALID",
             Self::Template(_) => "DOWAI_TEMPLATE_INVALID",
@@ -68,6 +74,8 @@ impl DowaiError {
     pub fn exit_code(&self) -> i32 {
         match self {
             Self::Config(_)
+            | Self::ConfigConflict(_)
+            | Self::LegacyConfigFormat(_)
             | Self::Model(_)
             | Self::Template(_)
             | Self::Cycle(_)
@@ -91,6 +99,8 @@ impl DowaiError {
     pub fn message(&self) -> String {
         match self {
             Self::Config(message)
+            | Self::ConfigConflict(message)
+            | Self::LegacyConfigFormat(message)
             | Self::Path(message)
             | Self::Model(message)
             | Self::Template(message)
