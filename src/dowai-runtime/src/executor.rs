@@ -66,6 +66,7 @@ impl<'a> Executor<'a> {
         mode: ExecutionMode,
         variables: Variables,
         root_invocation_id: &str,
+        on_start: &mut dyn FnMut(&str),
     ) -> Result<Variables> {
         self.record(
             "static",
@@ -73,6 +74,7 @@ impl<'a> Executor<'a> {
             &node.id,
             mode,
             |this, invocation_id| {
+                on_start(invocation_id);
                 this.execute_node(
                     &node.path,
                     &node.depends_on,

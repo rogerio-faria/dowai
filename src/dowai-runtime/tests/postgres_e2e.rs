@@ -197,6 +197,31 @@ fn run_executes_sources_and_refs_and_requires_approval_to_replace_relations() {
         .iter()
         .all(|entry| entry.kind == "sql" && entry.status == "SUCCEEDED"));
 
+    let audit = dowai_core::AuditLog::for_user_state(
+        dowai_core::default_audit_log_path().expect("isolated audit path"),
+    );
+    let audit_events = audit.read_all().expect("read audit trail");
+    let writes: Vec<_> = audit_events
+        .iter()
+        .filter(|event| event.event == "external.write" && event.run_id == result.run_id)
+        .collect();
+    assert_eq!(writes.len(), 2, "one external.write per SQL node");
+    assert!(writes
+        .iter()
+        .all(|event| event.target_profile.as_deref() == Some("warehouse")));
+    assert!(writes.iter().any(|event| event
+        .relation
+        .as_deref()
+        .is_some_and(|relation| relation.contains(&upstream_model))));
+    let audit_text =
+        fs::read_to_string(dowai_core::default_audit_log_path().expect("isolated audit path"))
+            .expect("audit file");
+    assert!(!audit_text.contains("SELECT"), "SQL must not be audited");
+    assert!(
+        !audit_text.contains("persisted"),
+        "variable values must not be audited"
+    );
+
     let session_store = SessionStore::for_user_state(
         default_session_store_path().expect("isolated local app data path"),
     );

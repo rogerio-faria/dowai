@@ -28,3 +28,6 @@
 - Add `dowai logs <run_id>` over the run journal with status-based level filters.
 - Add tests showing that CLI variables select SQL template branches without
   interpolating values (AC036), including a PostgreSQL case.
+- Add a separate audit trail (`audit.jsonl`) with run, node, variable-name,
+  external-write, policy-denial, and nested-invocation events, correlation IDs,
+  and SHA-256 hashes. It is independent of log levels and not disableable per project.

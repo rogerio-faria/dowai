@@ -1,6 +1,7 @@
+use auditor::Auditor;
 use dowai_core::{
     admin_config_path, current_time_ms, default_run_store_path, load_project,
-    load_workspace_profile, plan, read_planned_model, resolve_effective_configuration,
+    load_workspace_profile, plan, read_planned_model, resolve_effective_configuration, sha256_hex,
     source_relation_key, user_config_path, DowaiError, ExecutionMode, ExecutionPlan,
     Materialization, NewInvocation, NewRun, PlanNode, Result, RunStore, SessionStore,
     TemplateOptions, WorkspaceProfile,
@@ -16,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+mod auditor;
 mod executor;
 mod python_runtime;
 
@@ -86,6 +88,7 @@ pub struct PreparedPlan {
 /// Everything the run journal needs that is not part of a successful `RunResult`.
 /// Holds identifiers, statuses and timings only; never values or SQL.
 struct Trace {
+    audit: Auditor,
     root_invocation_id: String,
     execution_mode: Option<String>,
     /// Python invocations salvaged from the executor when the run fails.
@@ -97,6 +100,7 @@ struct Trace {
 impl Trace {
     fn node(
         &mut self,
+        invocation_id: String,
         node: &PlanNode,
         mode: ExecutionMode,
         status: &str,
@@ -104,7 +108,7 @@ impl Trace {
         error: Option<&DowaiError>,
     ) {
         self.extra.push(InvocationRecord {
-            invocation_id: Uuid::new_v4().to_string(),
+            invocation_id,
             parent_invocation_id: self.root_invocation_id.clone(),
             call_type: "static".to_owned(),
             target: node.id.clone(),
@@ -117,7 +121,14 @@ impl Trace {
 
     fn skip(&mut self, nodes: &[PlanNode], mode: ExecutionMode) {
         for node in nodes {
-            self.node(node, mode, "SKIPPED", Instant::now(), None);
+            self.node(
+                Uuid::new_v4().to_string(),
+                node,
+                mode,
+                "SKIPPED",
+                Instant::now(),
+                None,
+            );
         }
     }
 }
@@ -133,13 +144,23 @@ pub fn run_postgres(project_dir: &Path, request: RunRequest) -> Result<RunResult
     let run_id = Uuid::new_v4().to_string();
     let requested_session = request.session_id.clone();
     let requested_mode = request.mode;
+    let root_invocation_id = Uuid::new_v4().to_string();
     let mut trace = Trace {
-        root_invocation_id: Uuid::new_v4().to_string(),
+        audit: Auditor::new(
+            &run_id,
+            &root_invocation_id,
+            started_ms,
+            requested_session.clone(),
+            project_display_name(project_dir),
+        ),
+        root_invocation_id,
         execution_mode: requested_mode.map(|mode| mode.as_str().to_owned()),
         python: Vec::new(),
         extra: Vec::new(),
     };
     let outcome = execute_run(project_dir, request, &run_id, &mut trace);
+    finish_audit(&mut trace, &outcome);
+    let audit_failed = trace.audit.failed;
     let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let journal = journal_run(
         project_dir,
@@ -151,18 +172,112 @@ pub fn run_postgres(project_dir: &Path, request: RunRequest) -> Result<RunResult
         &outcome,
     );
     match (outcome, journal) {
-        (Ok(mut result), Err(_)) => {
-            result
-                .warnings
-                .push("The run journal could not be written".to_owned());
+        (Ok(mut result), journal) => {
+            if journal.is_err() {
+                result
+                    .warnings
+                    .push("The run journal could not be written".to_owned());
+            }
+            if audit_failed {
+                result
+                    .warnings
+                    .push("The audit trail could not be written".to_owned());
+            }
             Ok(result)
         }
-        (Err(error), Err(_)) => {
-            eprintln!("Warning: the run journal could not be written");
+        (Err(error), journal) => {
+            if journal.is_err() {
+                eprintln!("Warning: the run journal could not be written");
+            }
+            if audit_failed {
+                eprintln!("Warning: the audit trail could not be written");
+            }
             Err(error)
         }
-        (outcome, Ok(())) => outcome,
     }
+}
+
+/// Name of the project for audit/journal records: the manifest name, else the directory
+/// name. Never an absolute path.
+fn project_display_name(project_dir: &Path) -> Option<String> {
+    let root = project_dir.canonicalize().ok()?;
+    load_project(&root)
+        .map(|project| project.name)
+        .ok()
+        .or_else(|| {
+            root.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+}
+
+/// Closes the AUDIT stream of a run: policy denial, nested Python invocations
+/// (emitted after the fact, from the executor history), then `run.finished`.
+fn finish_audit(trace: &mut Trace, outcome: &Result<RunResult>) {
+    trace.audit.ensure_started();
+    let (nested, error) = match outcome {
+        Ok(result) => (result.invocations.clone(), None),
+        Err(error) => (trace.python.clone(), Some(error)),
+    };
+    if let Some(error) = error {
+        if error.code().starts_with("DOWAI_POLICY_") {
+            trace.audit.policy_denied(error.code());
+        }
+    }
+    for record in nested.iter().filter(|record| record.call_type != "static") {
+        trace.audit.python_invocation(
+            &record.invocation_id,
+            &record.parent_invocation_id,
+            &record.call_type,
+            &record.target,
+            &record.status,
+            record.error_code.as_deref(),
+        );
+    }
+    if let Ok(result) = outcome {
+        trace.audit.session_id = Some(result.session_id.clone());
+    }
+    trace.audit.run_finished(error);
+}
+
+/// SHA-256 of a planned model file's content (never the content itself).
+fn model_hash(root: &Path, node: &PlanNode) -> Option<String> {
+    read_planned_model(root, &node.path)
+        .ok()
+        .map(|content| sha256_hex(content.as_bytes()))
+}
+
+/// Runs one Python node, emitting `node.started` / `node.finished` around it.
+fn run_python_node(
+    executor: &mut executor::Executor<'_>,
+    audit: &mut Auditor,
+    root: &Path,
+    node: &PlanNode,
+    mode: ExecutionMode,
+    variables: BTreeMap<String, Value>,
+    root_invocation_id: &str,
+) -> Result<BTreeMap<String, Value>> {
+    let hash = model_hash(root, node);
+    let mut started_id: Option<String> = None;
+    let outcome = executor.run_static(node, mode, variables, root_invocation_id, &mut |id| {
+        audit.node_started(id, &node.id, hash.clone());
+        started_id = Some(id.to_owned());
+    });
+    let invocation_id = match started_id {
+        Some(id) => id,
+        None => {
+            // Rejected before it started (invocation budget): still audit the attempt.
+            let id = Uuid::new_v4().to_string();
+            audit.node_started(&id, &node.id, hash);
+            id
+        }
+    };
+    audit.node_finished(&invocation_id, &node.id, outcome.as_ref().err());
+    outcome
+}
+
+/// Names of the variables in the session after a run; values are never audited.
+fn variable_names(variables: &BTreeMap<String, Value>) -> Vec<String> {
+    variables.keys().cloned().collect()
 }
 
 fn journal_run(
@@ -252,7 +367,15 @@ fn execute_run(
     let configuration = effective_configuration(&root)?;
     let mode = resolve_execution_mode(&configuration, request.mode)?;
     trace.execution_mode = Some(mode.as_str().to_owned());
+    trace.audit.mode = Some(mode.as_str().to_owned());
+    trace.audit.config_hash = serde_json::to_vec(&configuration)
+        .ok()
+        .map(|bytes| sha256_hex(&bytes));
     let execution_plan = plan(&root, &request.targets, mode)?;
+    trace.audit.plan_hash = serde_json::to_vec(&execution_plan)
+        .ok()
+        .map(|bytes| sha256_hex(&bytes));
+    trace.audit.ensure_started();
     if execution_plan.nodes.is_empty() {
         return Err(DowaiError::Model(
             "The execution plan contains no models".to_owned(),
@@ -320,7 +443,15 @@ fn execute_run(
         )?;
         let mut completed_nodes = Vec::with_capacity(execution_plan.nodes.len());
         for (index, node) in execution_plan.nodes.iter().enumerate() {
-            match executor.run_static(node, mode, variables, &run_invocation_id) {
+            match run_python_node(
+                &mut executor,
+                &mut trace.audit,
+                &root,
+                node,
+                mode,
+                variables,
+                &run_invocation_id,
+            ) {
                 Ok(next) => variables = next,
                 Err(error) => {
                     trace.python = executor.invocations;
@@ -341,7 +472,9 @@ fn execute_run(
             Some(session) => session,
             None => store.create(&root, SESSION_TTL)?,
         };
+        trace.audit.session_id = Some(session.session_id.clone());
         store.commit_variables(&session.session_id, &variables)?;
+        trace.audit.variables_published(variable_names(&variables));
         return Ok(RunResult {
             schema_version: 2,
             session_id: session.session_id,
@@ -360,6 +493,7 @@ fn execute_run(
     let (profile_name, profile) = profile.ok_or_else(|| {
         DowaiError::Config("PostgreSQL profile resolution is required for SQL models".to_owned())
     })?;
+    trace.audit.profile = Some(profile_name.clone());
     let template_options = template_options(&configuration)?;
 
     if mixed {
@@ -389,7 +523,15 @@ fn execute_run(
         let mut completed_nodes = Vec::with_capacity(execution_plan.nodes.len());
         for (index, node) in execution_plan.nodes.iter().enumerate() {
             if is_python_path(&node.path) {
-                match executor.run_static(node, mode, variables, &run_invocation_id) {
+                match run_python_node(
+                    &mut executor,
+                    &mut trace.audit,
+                    &root,
+                    node,
+                    mode,
+                    variables,
+                    &run_invocation_id,
+                ) {
                     Ok(next) => variables = next,
                     Err(error) => {
                         trace.python = std::mem::take(&mut executor.invocations);
@@ -406,6 +548,10 @@ fn execute_run(
                 continue;
             }
             let node_started = Instant::now();
+            let sql_invocation_id = Uuid::new_v4().to_string();
+            trace
+                .audit
+                .node_started(&sql_invocation_id, &node.id, model_hash(&root, node));
             let step = (|| {
                 let (prepared, next_variables) =
                     render_sql_node(&root, node, &variables, &template_options, &relations)?;
@@ -431,7 +577,20 @@ fn execute_run(
             })();
             match step {
                 Ok((prepared, next_variables)) => {
-                    trace.node(node, mode, "SUCCEEDED", node_started, None);
+                    trace
+                        .audit
+                        .external_write(&sql_invocation_id, &node.id, &prepared.relation);
+                    trace
+                        .audit
+                        .node_finished(&sql_invocation_id, &node.id, None);
+                    trace.node(
+                        sql_invocation_id,
+                        node,
+                        mode,
+                        "SUCCEEDED",
+                        node_started,
+                        None,
+                    );
                     variables = next_variables;
                     completed_nodes.push(RunNodeResult {
                         id: prepared.id,
@@ -445,7 +604,17 @@ fn execute_run(
                     });
                 }
                 Err(error) => {
-                    trace.node(node, mode, "FAILED", node_started, Some(&error));
+                    trace
+                        .audit
+                        .node_finished(&sql_invocation_id, &node.id, Some(&error));
+                    trace.node(
+                        sql_invocation_id,
+                        node,
+                        mode,
+                        "FAILED",
+                        node_started,
+                        Some(&error),
+                    );
                     trace.python = std::mem::take(&mut executor.invocations);
                     trace.skip(&execution_plan.nodes[index + 1..], mode);
                     return Err(error);
@@ -456,7 +625,9 @@ fn execute_run(
             Some(session) => session,
             None => store.create(&root, SESSION_TTL)?,
         };
+        trace.audit.session_id = Some(session.session_id.clone());
         store.commit_variables(&session.session_id, &variables)?;
+        trace.audit.variables_published(variable_names(&variables));
         return Ok(RunResult {
             schema_version: 2,
             session_id: session.session_id,
@@ -496,15 +667,44 @@ fn execute_run(
         let node_started = Instant::now();
         // `prepared.nodes` mirrors `execution_plan.nodes` one to one.
         let plan_node = &execution_plan.nodes[index];
+        let sql_invocation_id = Uuid::new_v4().to_string();
+        trace.audit.node_started(
+            &sql_invocation_id,
+            &plan_node.id,
+            model_hash(&root, plan_node),
+        );
         if let Err(error) = adapter
             .materialize(&node.relation, materialization, &node.sql, allow_replace)
             .map_err(map_execution_error)
         {
-            trace.node(plan_node, mode, "FAILED", node_started, Some(&error));
+            trace
+                .audit
+                .node_finished(&sql_invocation_id, &plan_node.id, Some(&error));
+            trace.node(
+                sql_invocation_id,
+                plan_node,
+                mode,
+                "FAILED",
+                node_started,
+                Some(&error),
+            );
             trace.skip(&execution_plan.nodes[index + 1..], mode);
             return Err(error);
         }
-        trace.node(plan_node, mode, "SUCCEEDED", node_started, None);
+        trace
+            .audit
+            .external_write(&sql_invocation_id, &plan_node.id, &node.relation);
+        trace
+            .audit
+            .node_finished(&sql_invocation_id, &plan_node.id, None);
+        trace.node(
+            sql_invocation_id,
+            plan_node,
+            mode,
+            "SUCCEEDED",
+            node_started,
+            None,
+        );
         completed_nodes.push(RunNodeResult {
             id: node.id.clone(),
             relation: node.relation.clone(),
@@ -521,7 +721,11 @@ fn execute_run(
         Some(session) => session,
         None => store.create(&root, SESSION_TTL)?,
     };
+    trace.audit.session_id = Some(session.session_id.clone());
     store.commit_variables(&session.session_id, &prepared.variables)?;
+    trace
+        .audit
+        .variables_published(variable_names(&prepared.variables));
     Ok(RunResult {
         schema_version: 2,
         session_id: session.session_id,

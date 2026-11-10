@@ -420,7 +420,7 @@ fn clamp_duration(duration_ms: u64) -> i64 {
 }
 
 /// Bounded identifier text: no control characters, at most 256 characters.
-fn bounded(text: &str) -> String {
+pub(crate) fn bounded(text: &str) -> String {
     text.chars()
         .filter(|character| !character.is_control())
         .take(MAX_TARGET_CHARS)
@@ -428,7 +428,7 @@ fn bounded(text: &str) -> String {
 }
 
 /// Only stable `DOWAI_[A-Z0-9_]+` codes are persisted; anything else becomes `DOWAI_UNKNOWN`.
-fn sanitize_code(code: Option<&str>) -> Option<String> {
+pub(crate) fn sanitize_code(code: Option<&str>) -> Option<String> {
     code.map(|code| {
         let valid = code.len() <= 64
             && code.starts_with("DOWAI_")

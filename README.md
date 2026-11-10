@@ -96,6 +96,12 @@ Every PostgreSQL run, including a failed one, is recorded in a local run journal
 and invocation tree. Variable values, rendered SQL, error messages and paths are
 never stored.
 
+An audit trail is kept separately in `audit.jsonl` in the same state directory.
+It records run, node, variable-name, external-write, policy-denial and
+nested-invocation events with correlation IDs and SHA-256 hashes of the model,
+effective configuration and plan. It is append-only by convention, not immutable,
+and it cannot be disabled by project configuration.
+
 `--json` keeps machine-readable output on stdout. Errors use stable
 `DOWAI_*` codes and the exit codes documented in the master plan.
 The implemented configuration layers and limits are documented in
