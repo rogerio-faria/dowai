@@ -18,7 +18,7 @@ This sequence follows the milestone gates in [plano_mestre.md](../plano_mestre.m
    a configurable timeout, process-tree termination, variable APIs, and
    explicit unsupported-operation errors. Imperative `env.run()` between Python
    models is implemented (invocation tree, variable overlay, cycle and depth
-   limits, `env.manual()`). Mixed SQL/Python execution, nested SQL, datasets,
+   limits, `env.manual()`). Nested SQL, datasets,
    dependency management/authorization, SDK parity, cancellation, a persistent
    invocation journal, richer error context, and execution isolation remain
    outstanding.

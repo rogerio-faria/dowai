@@ -19,8 +19,10 @@ remote TLS and production credentials have not been verified.
 using table/view materialization and static `ref()` dependencies. It atomically
 replaces same-named relations in a per-model transaction. Python execution
 currently supports Python-only plans, project virtual environments, versioned
-JSON IPC, session-variable operations, and `None` model returns. Mixed
-SQL/Python plans, Python datasets and dependency installation, MySQL,
+JSON IPC, session-variable operations, `None` model returns, and nested
+`env.run()` between Python models. Mixed SQL/Python plans run in topological
+or manual order, sharing the session variables; SQL effects already applied are
+not reverted if a later node fails. Python datasets and dependency installation, MySQL,
 cross-database writes, plugins, OpenLineage, AI, and release packages remain
 unavailable. See
 [docs/STATUS.md](docs/STATUS.md).
@@ -156,7 +158,7 @@ terminated on timeout. The worker receives a minimal environment allowlist,
 not arbitrary host variables. This is **not a security sandbox**. Python code
 can access the operating system, and models must be trusted; detached Unix
 subprocesses can escape their process group. `env.ref()`, `env.source()`,
-`env.run()`, datasets, non-`None` results, mixed SQL/Python plans, and package
+`env.run()` of `.sql` files, datasets, non-`None` results, and package
 installation fail explicitly as unsupported.
 
 ## Development

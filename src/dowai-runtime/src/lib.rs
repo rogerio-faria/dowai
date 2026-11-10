@@ -101,18 +101,9 @@ pub fn run_postgres(project_dir: &Path, request: RunRequest) -> Result<RunResult
     let python_nodes = execution_plan
         .nodes
         .iter()
-        .filter(|node| {
-            Path::new(&node.path)
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("py"))
-        })
+        .filter(|node| is_python_path(&node.path))
         .count();
-    if python_nodes > 0 && python_nodes < execution_plan.nodes.len() {
-        return Err(DowaiError::NotImplemented(
-            "Mixed Python and SQL execution is not available yet".to_owned(),
-        ));
-    }
+    let mixed = python_nodes > 0 && python_nodes < execution_plan.nodes.len();
 
     enforce_external_write_policy(&configuration)?;
     let python_only = python_nodes == execution_plan.nodes.len();
@@ -155,23 +146,7 @@ pub fn run_postgres(project_dir: &Path, request: RunRequest) -> Result<RunResult
     store.validate_variables(&variables)?;
 
     if python_only {
-        let project = load_project(&root)?;
-        let python = project.python.as_ref().ok_or_else(|| {
-            DowaiError::Config(
-                "Configure python.interpreter with the project's virtual environment".to_owned(),
-            )
-        })?;
-        python_runtime::validate_python_runtime(python)?;
-        if !is_project_path(&root, &python.interpreter) {
-            return Err(DowaiError::Path(
-                "Python interpreter path must be inside the project directory".to_owned(),
-            ));
-        }
-        if !python.interpreter.is_file() {
-            return Err(DowaiError::Path(
-                "Configured Python interpreter is not a file".to_owned(),
-            ));
-        }
+        let (project, python) = python_settings(&root)?;
         let interpreter = &python.interpreter;
         let models_dir = root.join(&project.models_dir);
         let run_invocation_id = Uuid::new_v4().to_string();
@@ -218,6 +193,95 @@ pub fn run_postgres(project_dir: &Path, request: RunRequest) -> Result<RunResult
         DowaiError::Config("PostgreSQL profile resolution is required for SQL models".to_owned())
     })?;
     let template_options = template_options(&configuration)?;
+
+    if mixed {
+        // Mixed SQL + Python run. Nodes execute strictly in plan order; each one sees
+        // the variables accumulated by the nodes before it (SQL `def_var`, Python
+        // `env.setVar`). SQL is rendered lazily, right before its node runs, so it
+        // observes variables set by earlier Python nodes.
+        //
+        // Limitation: SQL relations already materialized are NOT rolled back when a
+        // later node fails. Only session variables are all-or-nothing (published
+        // after every node succeeded); this is not a distributed transaction.
+        let (project, python) = python_settings(&root)?;
+        let models_dir = root.join(&project.models_dir);
+        let relations = build_relations(&root, &execution_plan)?;
+        let allow_replace = replacement_approval(&configuration, request.confirm_destructive)?;
+        let run_invocation_id = Uuid::new_v4().to_string();
+        let mut executor = executor::Executor::new(
+            &root,
+            &models_dir,
+            &python.interpreter,
+            Duration::from_secs(python.timeout_seconds),
+            &configuration,
+            &store,
+        )?;
+        let mut adapter = PostgresAdapter::connect(&postgres_profile(profile))
+            .map_err(|error| DowaiError::Connection(error.to_string()))?;
+        let mut completed_nodes = Vec::with_capacity(execution_plan.nodes.len());
+        for node in &execution_plan.nodes {
+            if is_python_path(&node.path) {
+                variables = executor.run_static(node, mode, variables, &run_invocation_id)?;
+                completed_nodes.push(RunNodeResult {
+                    id: node.id.clone(),
+                    relation: node.id.clone(),
+                    materialization: "none".to_owned(),
+                    status: "SUCCEEDED".to_owned(),
+                });
+                continue;
+            }
+            let (prepared, next_variables) =
+                render_sql_node(&root, node, &variables, &template_options, &relations)?;
+            if prepared.sql.trim().is_empty() {
+                return Err(DowaiError::Template(format!(
+                    "{} renders to an empty SQL statement",
+                    prepared.id
+                )));
+            }
+            store.validate_variables(&next_variables)?;
+            adapter
+                .materialize(
+                    &prepared.relation,
+                    match prepared.materialization {
+                        Materialization::Table => PostgresMaterialization::Table,
+                        Materialization::View => PostgresMaterialization::View,
+                    },
+                    &prepared.sql,
+                    allow_replace,
+                )
+                .map_err(map_execution_error)?;
+            variables = next_variables;
+            completed_nodes.push(RunNodeResult {
+                id: prepared.id,
+                relation: prepared.relation,
+                materialization: match prepared.materialization {
+                    Materialization::Table => "table",
+                    Materialization::View => "view",
+                }
+                .to_owned(),
+                status: "SUCCEEDED".to_owned(),
+            });
+        }
+        let session = match prior_session {
+            Some(session) => session,
+            None => store.create(&root, SESSION_TTL)?,
+        };
+        store.commit_variables(&session.session_id, &variables)?;
+        return Ok(RunResult {
+            schema_version: 2,
+            session_id: session.session_id,
+            run_id: Uuid::new_v4().to_string(),
+            invocation_id: run_invocation_id,
+            status: "SUCCEEDED".to_owned(),
+            execution_mode: execution_plan.execution_mode,
+            duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            profile: profile_name,
+            nodes: completed_nodes,
+            invocations: executor.invocations,
+            warnings: execution_plan.warnings,
+        });
+    }
+
     let prepared = prepare_postgres_plan(&root, &execution_plan, &variables, &template_options)?;
     if let Some(node) = prepared
         .nodes
@@ -272,6 +336,28 @@ pub fn run_postgres(project_dir: &Path, request: RunRequest) -> Result<RunResult
         invocations: Vec::new(),
         warnings: execution_plan.warnings,
     })
+}
+
+/// Load and validate the project's supervised Python runtime settings.
+fn python_settings(root: &Path) -> Result<(dowai_core::Project, dowai_core::ProjectPython)> {
+    let mut project = load_project(root)?;
+    let python = project.python.take().ok_or_else(|| {
+        DowaiError::Config(
+            "Configure python.interpreter with the project's virtual environment".to_owned(),
+        )
+    })?;
+    python_runtime::validate_python_runtime(&python)?;
+    if !is_project_path(root, &python.interpreter) {
+        return Err(DowaiError::Path(
+            "Python interpreter path must be inside the project directory".to_owned(),
+        ));
+    }
+    if !python.interpreter.is_file() {
+        return Err(DowaiError::Path(
+            "Configured Python interpreter is not a file".to_owned(),
+        ));
+    }
+    Ok((project, python))
 }
 
 #[cfg(windows)]
@@ -331,12 +417,10 @@ pub fn check_postgres_connection(
     Ok(profile_name)
 }
 
-pub fn prepare_postgres_plan(
+fn build_relations(
     project_dir: &Path,
     execution_plan: &ExecutionPlan,
-    variables: &BTreeMap<String, Value>,
-    template_options: &TemplateOptions,
-) -> Result<PreparedPlan> {
+) -> Result<BTreeMap<String, String>> {
     let mut relation_ids = BTreeSet::new();
     for node in &execution_plan.nodes {
         relation_ids.insert(node.id.clone());
@@ -387,34 +471,65 @@ pub fn prepare_postgres_plan(
             relations.insert(stem, quoted);
         }
     }
+    Ok(relations)
+}
 
-    let mut current_variables = variables.clone();
-    let mut prepared_nodes = Vec::with_capacity(execution_plan.nodes.len());
-    for node in &execution_plan.nodes {
-        if Path::new(&node.path)
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("py"))
-        {
-            continue;
-        }
-        let source = read_planned_model(project_dir, &node.path)?;
-        let rendered =
-            dowai_core::render_sql_model(&source, &current_variables, template_options, &relations)
-                .map_err(|error| {
-                    if error.code() == "DOWAI_NOT_IMPLEMENTED" {
-                        error
-                    } else {
-                        DowaiError::Template(format!("{}: {}", node.path, error.message()))
-                    }
-                })?;
-        current_variables = rendered.variables;
-        prepared_nodes.push(PreparedNode {
+fn is_python_path(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("py"))
+}
+
+fn render_sql_node(
+    project_dir: &Path,
+    node: &dowai_core::PlanNode,
+    variables: &BTreeMap<String, Value>,
+    template_options: &TemplateOptions,
+    relations: &BTreeMap<String, String>,
+) -> Result<(PreparedNode, BTreeMap<String, Value>)> {
+    let source = read_planned_model(project_dir, &node.path)?;
+    let rendered = dowai_core::render_sql_model(&source, variables, template_options, relations)
+        .map_err(|error| {
+            if error.code() == "DOWAI_NOT_IMPLEMENTED" {
+                error
+            } else {
+                DowaiError::Template(format!("{}: {}", node.path, error.message()))
+            }
+        })?;
+    Ok((
+        PreparedNode {
             id: node.id.clone(),
             relation: model_stem(&node.id)?,
             materialization: rendered.materialization,
             sql: rendered.sql,
-        });
+        },
+        rendered.variables,
+    ))
+}
+
+pub fn prepare_postgres_plan(
+    project_dir: &Path,
+    execution_plan: &ExecutionPlan,
+    variables: &BTreeMap<String, Value>,
+    template_options: &TemplateOptions,
+) -> Result<PreparedPlan> {
+    let relations = build_relations(project_dir, execution_plan)?;
+    let mut current_variables = variables.clone();
+    let mut prepared_nodes = Vec::with_capacity(execution_plan.nodes.len());
+    for node in &execution_plan.nodes {
+        if is_python_path(&node.path) {
+            continue;
+        }
+        let (prepared, next_variables) = render_sql_node(
+            project_dir,
+            node,
+            &current_variables,
+            template_options,
+            &relations,
+        )?;
+        current_variables = next_variables;
+        prepared_nodes.push(prepared);
     }
     Ok(PreparedPlan {
         nodes: prepared_nodes,

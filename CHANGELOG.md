@@ -19,3 +19,7 @@
   returns `DOWAI_NOT_IMPLEMENTED`.
 - Add the GitHub Actions workflow (`.github/workflows/ci.yml`) referenced by the
   status document.
+- Run mixed SQL and Python models in one plan: nodes execute in planned order,
+  SQL `def_var` values reach later Python models, Python `setVar` values reach
+  later SQL templates, and variables are published only after the whole run
+  succeeds. Requires a configured PostgreSQL profile for mixed plans.

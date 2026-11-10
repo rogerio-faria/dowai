@@ -201,8 +201,10 @@ fn supervised_python_dag_persists_variables_and_does_not_commit_failed_runs() {
             confirm_destructive: false,
         },
     )
-    .expect_err("mixed SQL/Python plans must remain explicitly unsupported");
-    assert_eq!(mixed.code(), "DOWAI_NOT_IMPLEMENTED");
+    .expect_err("mixed SQL/Python plans need a PostgreSQL profile; none is configured here");
+    // Mixed execution is supported (see mixed_sql_python_e2e.rs); without a profile the
+    // run is rejected as a configuration error before any node executes.
+    assert_eq!(mixed.code(), "DOWAI_CONFIG_INVALID");
 
     workspace.write_model(
         "failure.py",
