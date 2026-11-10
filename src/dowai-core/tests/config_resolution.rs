@@ -348,3 +348,29 @@ fn workspace_profiles_reject_literal_passwords_and_unknown_fields() {
     assert_eq!(error.code(), "DOWAI_CONFIG_INVALID");
     assert!(!error.message().contains("do-not-accept"));
 }
+
+#[test]
+fn conflict_policy_defaults_to_error_and_rejects_any_other_value() {
+    let tree = TestConfigTree::new();
+    let project = tree.path().join("project");
+    fs::create_dir_all(&project).expect("create project");
+    tree.write_json(
+        "project/dowai_project.json",
+        &json!({ "schema_version": 2, "name": "p", "config": {} }),
+    );
+    let result = resolve(&project, None, None).expect("defaults");
+    assert_eq!(result["effective"]["sessions"]["conflict_policy"], "error");
+
+    for rejected in [json!("last_writer_wins"), json!("merge"), json!(true)] {
+        tree.write_json(
+            "project/dowai_project.json",
+            &json!({
+                "schema_version": 2,
+                "name": "p",
+                "config": { "sessions": { "conflict_policy": rejected } }
+            }),
+        );
+        let error = resolve(&project, None, None).expect_err("policy must be rejected");
+        assert_eq!(error.code(), "DOWAI_CONFIG_INVALID");
+    }
+}

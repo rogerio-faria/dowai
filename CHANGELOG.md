@@ -34,3 +34,7 @@
 - Cancel `dowai run` with Ctrl+C or SIGTERM (exit 130, status CANCELLED,
   `DOWAI_CANCELLED`). Python process trees and in-flight PostgreSQL statements
   are cancelled, and no variables are published.
+- Detect concurrent writes to the same session variable: a run whose base revision
+  changed fails with `DOWAI_SESSION_CONFLICT` and publishes nothing (no
+  last-writer-wins). Session revisions are monotonic per session; the session
+  store moves to schema version 1 with an automatic, idempotent migration.

@@ -4,7 +4,7 @@ use dowai_core::{
     load_workspace_profile, plan, read_planned_model, resolve_effective_configuration, sha256_hex,
     source_relation_key, user_config_path, CancellationToken, DowaiError, ExecutionMode,
     ExecutionPlan, Materialization, NewInvocation, NewRun, PlanNode, Result, RunStore,
-    SessionStore, TemplateOptions, WorkspaceProfile,
+    SessionStore, TemplateOptions, VariableOrigin, VersionedSnapshot, WorkspaceProfile,
 };
 use dowai_postgres::{
     quote_identifier, AdapterError, Materialization as PostgresMaterialization, PgProfile,
@@ -288,6 +288,28 @@ fn run_python_node(
     outcome
 }
 
+/// Publishes only what the run changed, atomically, against the run's base revisions.
+/// A key changed by another run since the snapshot yields `DOWAI_SESSION_CONFLICT`.
+fn publish_variables(
+    store: &SessionStore,
+    session_id: &str,
+    base: &VersionedSnapshot,
+    variables: &BTreeMap<String, Value>,
+    run_id: &str,
+    invocation_id: &str,
+) -> Result<()> {
+    let changes: BTreeMap<String, Value> = variables
+        .iter()
+        .filter(|(key, value)| base.values.get(*key) != Some(*value))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    let origin = VariableOrigin {
+        run_id: run_id.to_owned(),
+        invocation_id: invocation_id.to_owned(),
+    };
+    store.commit_variables(session_id, &changes, &base.revisions, &origin)
+}
+
 /// Names of the variables in the session after a run; values are never audited.
 fn variable_names(variables: &BTreeMap<String, Value>) -> Vec<String> {
     variables.keys().cloned().collect()
@@ -440,10 +462,13 @@ fn execute_run(
         }
         None => None,
     };
-    let mut variables = match prior_session.as_ref() {
-        Some(session) => store.snapshot(&session.session_id)?,
-        None => BTreeMap::new(),
+    // Versioned snapshot taken once at run start: its revisions are the base against which
+    // publication detects concurrent writes (AC040).
+    let base = match prior_session.as_ref() {
+        Some(session) => store.snapshot_versioned(&session.session_id)?,
+        None => VersionedSnapshot::default(),
     };
+    let mut variables = base.values.clone();
     variables.extend(request.variables);
     store.validate_variables(&variables)?;
 
@@ -498,7 +523,14 @@ fn execute_run(
             None => store.create(&root, SESSION_TTL)?,
         };
         trace.audit.session_id = Some(session.session_id.clone());
-        store.commit_variables(&session.session_id, &variables)?;
+        publish_variables(
+            &store,
+            &session.session_id,
+            &base,
+            &variables,
+            run_id,
+            &trace.root_invocation_id,
+        )?;
         trace.audit.variables_published(variable_names(&variables));
         return Ok(RunResult {
             schema_version: 2,
@@ -658,7 +690,14 @@ fn execute_run(
             None => store.create(&root, SESSION_TTL)?,
         };
         trace.audit.session_id = Some(session.session_id.clone());
-        store.commit_variables(&session.session_id, &variables)?;
+        publish_variables(
+            &store,
+            &session.session_id,
+            &base,
+            &variables,
+            run_id,
+            &trace.root_invocation_id,
+        )?;
         trace.audit.variables_published(variable_names(&variables));
         return Ok(RunResult {
             schema_version: 2,
@@ -764,7 +803,14 @@ fn execute_run(
         None => store.create(&root, SESSION_TTL)?,
     };
     trace.audit.session_id = Some(session.session_id.clone());
-    store.commit_variables(&session.session_id, &prepared.variables)?;
+    publish_variables(
+        &store,
+        &session.session_id,
+        &base,
+        &prepared.variables,
+        run_id,
+        &trace.root_invocation_id,
+    )?;
     trace
         .audit
         .variables_published(variable_names(&prepared.variables));

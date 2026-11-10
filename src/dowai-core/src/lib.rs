@@ -27,7 +27,10 @@ pub use runs::{
     InvocationEntry, LogLevel, NewInvocation, NewRun, RunDetail, RunStore, RunSummary,
     RUN_SCHEMA_VERSION,
 };
-pub use sessions::{default_session_store_path, SessionLimits, SessionMetadata, SessionStore};
+pub use sessions::{
+    default_session_store_path, SessionLimits, SessionMetadata, SessionStore, VariableOrigin,
+    VersionedSnapshot,
+};
 pub use templates::{
     render_sql_model, render_template, source_relation_key, Materialization, RenderedSqlModel,
     TemplateOptions, TemplateRender,

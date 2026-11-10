@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const SECTIONS: &[&str] = &["execution", "templates", "security", "ai"];
+const SECTIONS: &[&str] = &["execution", "templates", "security", "ai", "sessions"];
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -250,6 +250,9 @@ fn configuration_defaults() -> Value {
         "ai": {
             "enabled": false,
             "allow_data_rows": false
+        },
+        "sessions": {
+            "conflict_policy": "error"
         }
     })
 }
@@ -366,6 +369,8 @@ fn validate_setting(section: &str, setting: &str, value: &Value, path: &Path) ->
         | ("ai", "enabled" | "allow_data_rows") => value.is_boolean(),
         ("execution", "max_call_depth" | "max_invocations_per_run")
         | ("templates", "max_nesting_depth") => value.as_u64().is_some_and(|number| number > 0),
+        // AC040: the only policy is "error"; last-writer-wins is deliberately not offered.
+        ("sessions", "conflict_policy") => value.as_str() == Some("error"),
         ("security", "allowed_paths" | "allowed_hosts" | "allowed_profiles") => value
             .as_array()
             .is_some_and(|values| values.iter().all(Value::is_string)),

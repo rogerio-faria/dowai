@@ -11,6 +11,8 @@ pub enum DowaiError {
     Template(String),
     Cycle(String),
     Session(String),
+    /// Concurrent writes to the same session variable (AC040, `conflict_policy = "error"`).
+    SessionConflict(String),
     State(String),
     Connection(String),
     Execution(String),
@@ -42,6 +44,7 @@ impl DowaiError {
             Self::Template(_) => "DOWAI_TEMPLATE_INVALID",
             Self::Cycle(_) => "DOWAI_PLAN_CYCLE",
             Self::Session(_) => "DOWAI_SESSION_INVALID",
+            Self::SessionConflict(_) => "DOWAI_SESSION_CONFLICT",
             Self::State(_) => "DOWAI_STATE_ERROR",
             Self::Connection(_) => "DOWAI_CONNECTION_FAILED",
             Self::Execution(_) => "DOWAI_EXECUTION_FAILED",
@@ -69,6 +72,8 @@ impl DowaiError {
             Self::Policy(_) => 5,
             Self::Connection(_) => 4,
             Self::Execution(_) => 3,
+            // A run that lost a write race is a failed run execution (plan 6.4: exit 3).
+            Self::SessionConflict(_) => 3,
             Self::PythonFailure(_) | Self::PythonTimeout(_) | Self::PythonProtocol(_) => 3,
             Self::NotImplemented(_) => 6,
             Self::Cancelled(_) => 130,
@@ -84,6 +89,7 @@ impl DowaiError {
             | Self::Template(message)
             | Self::Cycle(message)
             | Self::Session(message)
+            | Self::SessionConflict(message)
             | Self::State(message)
             | Self::Connection(message)
             | Self::Execution(message)
