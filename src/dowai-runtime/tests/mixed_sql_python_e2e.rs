@@ -567,3 +567,66 @@ fn ac002_python_ref_refuses_a_python_model_with_stable_code() {
     let variables = fx.variables(&result.session_id);
     assert_eq!(variables["ref_code"], json!("DOWAI_DATASET_NOT_SQL"));
 }
+
+/// AC002 (B-09.2): `iter_rows` reads a SQL predecessor in batches. Covers batch boundaries,
+/// exact `numeric` text, booleans, NULLs and the worker-side batch-size validation.
+#[test]
+#[ignore = "opt-in E2E; requires a dedicated disposable PostgreSQL database"]
+fn ac002_iter_rows_reads_batches_with_exact_types() {
+    let fx = Fixture::new("ac002-rows");
+    let (sql, py) = (fx.name("upstream"), fx.name("reader"));
+    let _cleanup = TableCleanup(vec![sql.clone()]);
+    fx.write_model(
+        &format!("{sql}.sql"),
+        "select g::int4 as id, ('v' || g)::text as label, (g * 1.5)::numeric(10,2) as amount, (g % 2 = 0) as even, null::text as empty from generate_series(1, 25) as g",
+    );
+    fx.write_model(
+        &format!("{py}.py"),
+        &format!(
+            "def model(env):\n    env.depends_on('{sql}')\n    rows = list(env.ref('{sql}').iter_rows(batch_size=10))\n    env.setVar('row_count', len(rows))\n    env.setVar('id_sum', sum(r['id'] for r in rows))\n    first = rows[0]\n    env.setVar('first_label', first['label'])\n    env.setVar('first_amount', first['amount'])\n    env.setVar('first_even', first['even'])\n    env.setVar('first_empty_is_null', first['empty'] is None)\n    try:\n        env.ref('{sql}').iter_rows(batch_size=0)\n    except ValueError:\n        env.setVar('bad_batch_refused', True)\n    return None\n"
+        ),
+    );
+
+    let result = fx
+        .run(&[&format!("{py}.py")], None, None)
+        .expect("mixed run");
+
+    assert_eq!(result.status, "SUCCEEDED");
+    let variables = fx.variables(&result.session_id);
+    assert_eq!(variables["row_count"], json!(25));
+    assert_eq!(variables["id_sum"], json!(325));
+    assert_eq!(variables["first_label"], json!("v1"));
+    assert_eq!(variables["first_amount"], json!("1.50"));
+    assert_eq!(variables["first_even"], json!(false));
+    assert_eq!(variables["first_empty_is_null"], json!(true));
+    assert_eq!(variables["bad_batch_refused"], json!(true));
+}
+
+/// AC002 (B-09.2): views have no physical order (`ctid`), so `iter_rows` refuses them with a
+/// stable code instead of returning an unordered or partial read. `schema` still works.
+#[test]
+#[ignore = "opt-in E2E; requires a dedicated disposable PostgreSQL database"]
+fn ac002_iter_rows_refuses_view_predecessor_with_stable_code() {
+    let fx = Fixture::new("ac002-view");
+    let (sql, py) = (fx.name("view_upstream"), fx.name("reader"));
+    let _cleanup = TableCleanup(vec![sql.clone()]);
+    fx.write_model(
+        &format!("{sql}.sql"),
+        "{{ config(materialized='view') }}\nselect 1::int4 as id",
+    );
+    fx.write_model(
+        &format!("{py}.py"),
+        &format!(
+            "def model(env):\n    env.depends_on('{sql}')\n    env.setVar('schema_ok', len(env.ref('{sql}').schema()) == 1)\n    try:\n        list(env.ref('{sql}').iter_rows())\n    except Exception as error:\n        env.setVar('view_code', error.code)\n    return None\n"
+        ),
+    );
+
+    let result = fx
+        .run(&[&format!("{py}.py")], None, None)
+        .expect("mixed run");
+
+    assert_eq!(result.status, "SUCCEEDED");
+    let variables = fx.variables(&result.session_id);
+    assert_eq!(variables["schema_ok"], json!(true));
+    assert_eq!(variables["view_code"], json!("DOWAI_DATASET_UNAVAILABLE"));
+}

@@ -4,13 +4,14 @@
 //! invocation history linked by `parent_invocation_id`.
 
 use crate::python_runtime::{
-    self, ChildCall, ChildOutcome, DatasetColumn, HostReply, HostRequest, ModelInvocation,
+    self, ChildCall, ChildOutcome, DatasetAnswer, DatasetColumn, HostReply, HostRequest,
+    ModelInvocation,
 };
 use crate::{resolve_execution_mode, resolve_python_model_path, InvocationRecord};
 use dowai_core::{
     plan, CancellationToken, DowaiError, ExecutionMode, PlanNode, Result, SessionStore,
 };
-use dowai_postgres::{PgProfile, PostgresAdapter};
+use dowai_postgres::{DatasetCell, PgProfile, PostgresAdapter};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -24,7 +25,11 @@ pub(crate) const DATASET_NOT_SQL: &str = "DOWAI_DATASET_NOT_SQL";
 pub(crate) const DATASET_UNDECLARED: &str = "DOWAI_DATASET_UNDECLARED";
 pub(crate) const DATASET_LIMIT: &str = "DOWAI_DATASET_LIMIT";
 /// Dataset requests served per run; a model cannot probe the database without bound.
-const MAX_DATASET_REQUESTS: usize = 256;
+const MAX_DATASET_REQUESTS: usize = 10_000;
+/// Rows served per run through `iter_rows` (AC002): a bounded read, not a data export.
+const MAX_DATASET_ROWS: u64 = 5_000_000;
+/// Rows per batch (`iter_rows`), enforced on the host as well as in the worker.
+const MAX_BATCH_ROWS: u32 = 10_000;
 
 fn dataset_error(code: &'static str, message: &str) -> DowaiError {
     DowaiError::DatasetAccess {
@@ -43,7 +48,10 @@ pub(crate) struct DatasetSource {
     /// Quoted relations written by SQL models of the plan.
     sql_relations: BTreeSet<String>,
     adapter: Option<PostgresAdapter>,
+    columns: BTreeMap<String, Vec<(String, String)>>,
+    /// Requests served (any operation), bounded by `MAX_DATASET_REQUESTS`.
     requests: usize,
+    rows_served: u64,
 }
 
 impl DatasetSource {
@@ -57,18 +65,15 @@ impl DatasetSource {
             relations,
             sql_relations,
             adapter: None,
+            columns: BTreeMap::new(),
             requests: 0,
+            rows_served: 0,
         }
     }
 
-    fn describe(&mut self, dataset: &str, depends_on: &[String]) -> Result<Vec<DatasetColumn>> {
-        if self.requests >= MAX_DATASET_REQUESTS {
-            return Err(dataset_error(
-                DATASET_LIMIT,
-                "Dataset request limit reached for this run",
-            ));
-        }
-        self.requests += 1;
+    /// Authorize a dataset name for the model that asks: a SQL relation of the plan that the
+    /// model declares as a dependency. Returns the quoted relation.
+    fn authorize(&self, dataset: &str, depends_on: &[String]) -> Result<String> {
         let relation =
             self.relations.get(dataset).cloned().ok_or_else(|| {
                 dataset_error(DATASET_UNAVAILABLE, "Dataset is not part of the plan")
@@ -88,22 +93,98 @@ impl DatasetSource {
                 "Dataset was not declared as a dependency of this model",
             ));
         }
+        Ok(relation)
+    }
+
+    fn adapter(&mut self) -> Result<&mut PostgresAdapter> {
         if self.adapter.is_none() {
             let adapter = PostgresAdapter::connect(&self.profile).map_err(|_| {
                 dataset_error(DATASET_UNAVAILABLE, "Dataset source connection failed")
             })?;
             self.adapter = Some(adapter);
         }
-        let adapter = self.adapter.as_mut().ok_or_else(|| {
-            dataset_error(DATASET_UNAVAILABLE, "Dataset source connection failed")
-        })?;
-        let columns = adapter
-            .describe_relation(&relation)
+        self.adapter
+            .as_mut()
+            .ok_or_else(|| dataset_error(DATASET_UNAVAILABLE, "Dataset source connection failed"))
+    }
+
+    /// Columns of a relation, described once per run.
+    fn columns(&mut self, relation: &str) -> Result<Vec<(String, String)>> {
+        if let Some(columns) = self.columns.get(relation) {
+            return Ok(columns.clone());
+        }
+        let columns = self
+            .adapter()?
+            .describe_relation(relation)
             .map_err(|_| dataset_error(DATASET_UNAVAILABLE, "Dataset could not be described"))?;
-        Ok(columns
+        self.columns.insert(relation.to_owned(), columns.clone());
+        Ok(columns)
+    }
+
+    fn schema(&mut self, dataset: &str, depends_on: &[String]) -> Result<DatasetAnswer> {
+        let relation = self.authorize(dataset, depends_on)?;
+        let columns = self.columns(&relation)?;
+        Ok(DatasetAnswer::Columns(
+            columns
+                .into_iter()
+                .map(|(name, data_type)| DatasetColumn { name, data_type })
+                .collect(),
+        ))
+    }
+
+    fn rows(
+        &mut self,
+        dataset: &str,
+        depends_on: &[String],
+        offset: Option<u64>,
+        limit: Option<u32>,
+    ) -> Result<DatasetAnswer> {
+        let (Some(offset), Some(limit)) = (offset, limit) else {
+            return Err(dataset_error(
+                DATASET_UNAVAILABLE,
+                "Dataset batch is incomplete",
+            ));
+        };
+        if limit == 0 || limit > MAX_BATCH_ROWS {
+            return Err(dataset_error(
+                DATASET_LIMIT,
+                "Dataset batch size is outside the allowed range",
+            ));
+        }
+        if self.rows_served + u64::from(limit) > MAX_DATASET_ROWS {
+            return Err(dataset_error(
+                DATASET_LIMIT,
+                "Dataset row limit reached for this run",
+            ));
+        }
+        let relation = self.authorize(dataset, depends_on)?;
+        let columns = self.columns(&relation)?;
+        let rows = self
+            .adapter()?
+            .read_rows(&relation, &columns, offset, limit)
+            .map_err(|_| dataset_error(DATASET_UNAVAILABLE, "Dataset rows could not be read"))?;
+        self.rows_served += rows.len() as u64;
+        let rows = rows
             .into_iter()
-            .map(|(name, data_type)| DatasetColumn { name, data_type })
-            .collect())
+            .map(|row| row.into_iter().map(cell_to_json).collect())
+            .collect();
+        Ok(DatasetAnswer::Rows {
+            columns: columns.into_iter().map(|(name, _)| name).collect(),
+            rows,
+        })
+    }
+}
+
+/// JSON form of one cell. Non-finite floats travel as text, since JSON has no NaN.
+fn cell_to_json(cell: DatasetCell) -> Value {
+    match cell {
+        DatasetCell::Null => Value::Null,
+        DatasetCell::Bool(value) => Value::Bool(value),
+        DatasetCell::Int(value) => Value::from(value),
+        DatasetCell::Float(value) => serde_json::Number::from_f64(value)
+            .map(Value::Number)
+            .unwrap_or_else(|| Value::String(value.to_string())),
+        DatasetCell::Text(value) => Value::String(value),
     }
 }
 
@@ -331,9 +412,14 @@ impl<'a> Executor<'a> {
             HostRequest::Call(call) => {
                 HostReply::Call(self.handle_call(call, parent_invocation_id, deadline))
             }
-            HostRequest::Dataset { dataset, operation } => {
-                HostReply::Dataset(self.dataset_request(&dataset, &operation, depends_on))
-            }
+            HostRequest::Dataset {
+                dataset,
+                operation,
+                offset,
+                limit,
+            } => HostReply::Dataset(
+                self.dataset_request(&dataset, &operation, offset, limit, depends_on),
+            ),
         }
     }
 
@@ -341,27 +427,30 @@ impl<'a> Executor<'a> {
         &mut self,
         dataset: &str,
         operation: &str,
+        offset: Option<u64>,
+        limit: Option<u32>,
         depends_on: &[String],
-    ) -> Result<Vec<DatasetColumn>> {
+    ) -> Result<DatasetAnswer> {
         self.cancel.check()?;
-        match self.datasets.as_mut() {
-            // Every request counts, including unknown operations (bounded per run).
-            Some(source) if source.requests < MAX_DATASET_REQUESTS => {
-                if operation != "schema" {
-                    source.requests += 1;
-                    return Err(DowaiError::NotImplemented(
-                        "This dataset operation is not available yet".to_owned(),
-                    ));
-                }
-                source.describe(dataset, depends_on)
-            }
-            Some(_) => Err(dataset_error(
-                DATASET_LIMIT,
-                "Dataset request limit reached for this run",
-            )),
-            None => Err(dataset_error(
+        let source = self.datasets.as_mut().ok_or_else(|| {
+            dataset_error(
                 DATASET_UNAVAILABLE,
                 "Datasets are only available in runs that include SQL models",
+            )
+        })?;
+        if source.requests >= MAX_DATASET_REQUESTS {
+            return Err(dataset_error(
+                DATASET_LIMIT,
+                "Dataset request limit reached for this run",
+            ));
+        }
+        // Every request counts, including unknown operations (bounded per run).
+        source.requests += 1;
+        match operation {
+            "schema" => source.schema(dataset, depends_on),
+            "rows" => source.rows(dataset, depends_on, offset, limit),
+            _ => Err(DowaiError::NotImplemented(
+                "This dataset operation is not available yet".to_owned(),
             )),
         }
     }

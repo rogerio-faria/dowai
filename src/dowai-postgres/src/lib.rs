@@ -220,6 +220,51 @@ impl PostgresAdapter {
             .collect())
     }
 
+    /// Reads one batch of rows of a relation, in physical order (`ORDER BY ctid`).
+    /// `columns` are (name, type) pairs from [`PostgresAdapter::describe_relation`]; types
+    /// outside the direct set are read as text (exact, e.g. `numeric`, dates, UUID).
+    /// `relation` must be built from identifiers quoted by [`quote_identifier`]. The batch is
+    /// one autocommit statement: it holds no transaction open between batches.
+    pub fn read_rows(
+        &mut self,
+        relation: &str,
+        columns: &[(String, String)],
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<Vec<DatasetCell>>, AdapterError> {
+        let mut select = Vec::with_capacity(columns.len());
+        for (name, data_type) in columns {
+            let identifier = quote_identifier(name)?;
+            if DIRECT_TYPES.contains(&data_type.as_str()) {
+                select.push(identifier);
+            } else {
+                select.push(format!("{identifier}::text"));
+            }
+        }
+        if select.is_empty() {
+            return Err(AdapterError::QueryFailed);
+        }
+        let offset = i64::try_from(offset).map_err(|_| AdapterError::QueryFailed)?;
+        let limit = i64::from(limit);
+        let sql = format!(
+            "SELECT {} FROM {relation} ORDER BY ctid OFFSET $1 LIMIT $2",
+            select.join(", ")
+        );
+        let rows = self
+            .client
+            .query(&sql, &[&offset, &limit])
+            .map_err(|_| AdapterError::QueryFailed)?;
+        rows.iter()
+            .map(|row| {
+                columns
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (_, data_type))| decode_cell(row, index, data_type))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect()
+    }
+
     pub fn test_connection(&mut self) -> Result<(), AdapterError> {
         self.client
             .query_one("SELECT 1", &[])
@@ -512,3 +557,50 @@ fn is_local_host(host: &str) -> bool {
 
 #[cfg(test)]
 mod tests;
+
+/// Types read directly; every other type is cast to text in the SELECT list.
+const DIRECT_TYPES: &[&str] = &[
+    "bool", "int2", "int4", "int8", "float4", "float8", "text", "varchar", "bpchar", "name",
+];
+
+/// One decoded value of a dataset batch.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DatasetCell {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Text(String),
+}
+
+fn decode_cell(row: &Row, index: usize, data_type: &str) -> Result<DatasetCell, AdapterError> {
+    let decoded = if !DIRECT_TYPES.contains(&data_type) {
+        row.try_get::<_, Option<String>>(index)
+            .map(|value| value.map_or(DatasetCell::Null, DatasetCell::Text))
+    } else {
+        match data_type {
+            "bool" => row
+                .try_get::<_, Option<bool>>(index)
+                .map(|value| value.map_or(DatasetCell::Null, DatasetCell::Bool)),
+            "int2" => row
+                .try_get::<_, Option<i16>>(index)
+                .map(|value| value.map_or(DatasetCell::Null, |v| DatasetCell::Int(i64::from(v)))),
+            "int4" => row
+                .try_get::<_, Option<i32>>(index)
+                .map(|value| value.map_or(DatasetCell::Null, |v| DatasetCell::Int(i64::from(v)))),
+            "int8" => row
+                .try_get::<_, Option<i64>>(index)
+                .map(|value| value.map_or(DatasetCell::Null, DatasetCell::Int)),
+            "float4" => row
+                .try_get::<_, Option<f32>>(index)
+                .map(|value| value.map_or(DatasetCell::Null, |v| DatasetCell::Float(f64::from(v)))),
+            "float8" => row
+                .try_get::<_, Option<f64>>(index)
+                .map(|value| value.map_or(DatasetCell::Null, DatasetCell::Float)),
+            _ => row
+                .try_get::<_, Option<String>>(index)
+                .map(|value| value.map_or(DatasetCell::Null, DatasetCell::Text)),
+        }
+    };
+    decoded.map_err(|_| AdapterError::QueryFailed)
+}

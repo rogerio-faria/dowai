@@ -174,13 +174,15 @@ def main():
                 )
             raise RuntimeError("invalid nested call reply")
 
-        def _dataset_request(self, name, operation):
+        def _dataset_request(self, name, operation, **fields):
             if not isinstance(name, str) or name not in self._dependencies:
                 raise ExecutionError(
                     "DOWAI_DATASET_UNDECLARED",
                     "dataset was not declared as a dependency of this model",
                 )
-            respond({"protocol_version": 1, "kind": "dataset", "dataset": name, "operation": operation})
+            message = {"protocol_version": 1, "kind": "dataset", "dataset": name, "operation": operation}
+            message.update(fields)
+            respond(message)
             line = _in.readline()
             if not line:
                 raise RuntimeError("the DOWAI host closed the dataset channel")
@@ -189,6 +191,13 @@ def main():
                 raise RuntimeError("invalid dataset reply")
             if reply.get("kind") == "dataset_ok" and isinstance(reply.get("columns"), list):
                 return [dict(column) for column in reply["columns"]]
+            if (
+                reply.get("kind") == "dataset_rows"
+                and isinstance(reply.get("columns"), list)
+                and isinstance(reply.get("rows"), list)
+            ):
+                names = reply["columns"]
+                return [dict(zip(names, row)) for row in reply["rows"]]
             if reply.get("kind") == "dataset_failed":
                 raise ExecutionError(
                     str(reply.get("code") or "DOWAI_DATASET_UNAVAILABLE"),
@@ -219,6 +228,23 @@ def main():
 
         def schema(self):
             return self._environment._dataset_request(self._name, "schema")
+
+        def iter_rows(self, batch_size=1000):
+            if isinstance(batch_size, bool) or not isinstance(batch_size, int) or not 1 <= batch_size <= 10000:
+                raise ValueError("batch_size must be an integer between 1 and 10000")
+            return self._iterate_rows(batch_size)
+
+        def _iterate_rows(self, batch_size):
+            offset = 0
+            while True:
+                batch = self._environment._dataset_request(
+                    self._name, "rows", offset=offset, limit=batch_size
+                )
+                for row in batch:
+                    yield row
+                if len(batch) < batch_size:
+                    return
+                offset += batch_size
 
     dependencies = set(request.get("dependencies", []))
     for dependency in list(dependencies):
@@ -282,6 +308,10 @@ struct WorkerMessage {
     dataset: Option<String>,
     #[serde(default)]
     operation: Option<String>,
+    #[serde(default)]
+    offset: Option<u64>,
+    #[serde(default)]
+    limit: Option<u32>,
 }
 
 /// One column of a dataset, as the worker sees it.
@@ -295,13 +325,35 @@ pub(crate) struct DatasetColumn {
 /// A request from the worker: a nested call or a dataset operation.
 pub(crate) enum HostRequest {
     Call(ChildCall),
-    Dataset { dataset: String, operation: String },
+    Dataset {
+        dataset: String,
+        operation: String,
+        offset: Option<u64>,
+        limit: Option<u32>,
+    },
+}
+
+/// Successful answer of a dataset operation.
+pub(crate) enum DatasetAnswer {
+    Columns(Vec<DatasetColumn>),
+    Rows {
+        columns: Vec<String>,
+        rows: Vec<Vec<Value>>,
+    },
 }
 
 /// The host's answer to a [`HostRequest`]; the variant matches the request.
 pub(crate) enum HostReply {
     Call(ChildOutcome),
-    Dataset(Result<Vec<DatasetColumn>>),
+    Dataset(Result<DatasetAnswer>),
+}
+
+#[derive(Serialize)]
+struct DatasetRowsReply<'a> {
+    protocol_version: u32,
+    kind: &'a str,
+    columns: &'a [String],
+    rows: &'a [Vec<Value>],
 }
 
 #[derive(Serialize)]
@@ -618,28 +670,46 @@ impl Supervision {
                 let (Some(dataset), Some(operation)) = (message.dataset, message.operation) else {
                     return Err(protocol_error());
                 };
-                let HostReply::Dataset(result) =
-                    on_request(HostRequest::Dataset { dataset, operation })
-                else {
+                let HostReply::Dataset(result) = on_request(HostRequest::Dataset {
+                    dataset,
+                    operation,
+                    offset: message.offset,
+                    limit: message.limit,
+                }) else {
                     return Err(protocol_error());
                 };
-                let reply = match &result {
-                    Ok(columns) => DatasetReply {
+                let mut bytes = match &result {
+                    Ok(DatasetAnswer::Columns(columns)) => serde_json::to_vec(&DatasetReply {
                         protocol_version: IPC_PROTOCOL_VERSION,
                         kind: "dataset_ok",
                         columns: Some(columns),
                         code: None,
-                    },
-                    Err(error) => DatasetReply {
+                    }),
+                    Ok(DatasetAnswer::Rows { columns, rows }) => {
+                        serde_json::to_vec(&DatasetRowsReply {
+                            protocol_version: IPC_PROTOCOL_VERSION,
+                            kind: "dataset_rows",
+                            columns,
+                            rows,
+                        })
+                    }
+                    Err(error) => serde_json::to_vec(&DatasetReply {
                         protocol_version: IPC_PROTOCOL_VERSION,
                         kind: "dataset_failed",
                         columns: None,
                         code: Some(error.code()),
-                    },
-                };
-                let mut bytes = serde_json::to_vec(&reply).map_err(|_| protocol_error())?;
+                    }),
+                }
+                .map_err(|_| protocol_error())?;
+                // A batch that does not fit the protocol is refused, not truncated.
                 if bytes.len() > MAX_IPC_BYTES {
-                    return Err(protocol_error());
+                    bytes = serde_json::to_vec(&DatasetReply {
+                        protocol_version: IPC_PROTOCOL_VERSION,
+                        kind: "dataset_failed",
+                        columns: None,
+                        code: Some(crate::executor::DATASET_LIMIT),
+                    })
+                    .map_err(|_| protocol_error())?;
                 }
                 bytes.push(b'\n');
                 self.replies.send(bytes).map_err(|_| protocol_error())?;
