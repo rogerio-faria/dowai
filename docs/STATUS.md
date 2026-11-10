@@ -33,7 +33,7 @@ adapter smoke tests and runtime E2E pass against a PostgreSQL 16.15 cluster
 running on loopback (ephemeral, user-owned, TLS disabled, scram-sha-256). This does
 not verify remote TLS, production credentials, or PostgreSQL 17. Windows and
 hosted CI runs have not been executed from this workspace. No installer has been
-verified. Evidence log: `_gestao/projetos/dowai/EVIDENCIAS.md` (outside the repository).
+verified. Evidence log: `_gestao/projetos/dowai/EVIDENCIAS.md` (management folder, not tracked by Git).
 
 The opt-in PostgreSQL tests require a dedicated disposable database and these
 environment variables: `DOWAI_TEST_PG_HOST`, `DOWAI_TEST_PG_PORT`,
