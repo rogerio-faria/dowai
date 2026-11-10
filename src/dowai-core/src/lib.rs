@@ -25,7 +25,7 @@ pub use project::{
 };
 pub use runs::{
     current_time_ms, default_run_store_path, filter_invocations, invocation_depths,
-    InvocationEntry, LogLevel, NewInvocation, NewRun, RunDetail, RunStore, RunSummary,
+    InvocationEntry, LogLevel, NewInvocation, NewRun, RetrySource, RunDetail, RunStore, RunSummary,
     RUN_SCHEMA_VERSION,
 };
 pub use sessions::{

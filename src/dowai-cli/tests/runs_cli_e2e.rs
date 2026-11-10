@@ -57,6 +57,9 @@ impl State {
                         finished_at_ms: started + 40,
                         duration_ms: 40,
                         error_code: code.map(str::to_owned),
+                        requested_targets: Some(vec!["model.py".to_owned()]),
+                        profile: None,
+                        variable_count: Some(0),
                     },
                     &[NewInvocation {
                         invocation_id: format!("inv-{id}"),

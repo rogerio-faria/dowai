@@ -54,6 +54,9 @@ impl State {
                     finished_at_ms: 1_700_000_000_040,
                     duration_ms: 40,
                     error_code: Some("DOWAI_SQL_FAILED".to_owned()),
+                    requested_targets: Some(vec!["root.sql".to_owned()]),
+                    profile: None,
+                    variable_count: Some(0),
                 },
                 &[
                     invocation("i1", None, "root.sql", "SUCCEEDED", None),

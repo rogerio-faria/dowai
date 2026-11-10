@@ -36,6 +36,11 @@ pub enum DowaiError {
         code: &'static str,
         message: String,
     },
+    /// `dowai retry` refusals, each with its own stable code (B-05c).
+    Retry {
+        code: &'static str,
+        message: String,
+    },
     Io(std::io::Error),
 }
 
@@ -67,6 +72,7 @@ impl DowaiError {
             Self::Validation { .. } => "DOWAI_CONFIG_INVALID",
             Self::NotImplemented(_) => "DOWAI_NOT_IMPLEMENTED",
             Self::DatasetAccess { code, .. } => code,
+            Self::Retry { code, .. } => code,
             Self::Io(_) => "DOWAI_IO_ERROR",
         }
     }
@@ -91,6 +97,7 @@ impl DowaiError {
             Self::PythonFailure(_) | Self::PythonTimeout(_) | Self::PythonProtocol(_) => 3,
             Self::NotImplemented(_) => 6,
             Self::DatasetAccess { .. } => 3,
+            Self::Retry { .. } => 2,
             Self::Cancelled(_) => 130,
             Self::Io(_) => 2,
         }
@@ -116,7 +123,8 @@ impl DowaiError {
             | Self::Policy(message)
             | Self::Cancelled(message)
             | Self::NotImplemented(message)
-            | Self::DatasetAccess { message, .. } => message.clone(),
+            | Self::DatasetAccess { message, .. }
+            | Self::Retry { message, .. } => message.clone(),
             Self::Validation { message, .. } => message.clone(),
             Self::Io(error) => error.to_string(),
         }

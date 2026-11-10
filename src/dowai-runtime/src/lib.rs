@@ -153,10 +153,133 @@ pub fn run_postgres_with_cancel(
     request: RunRequest,
     cancel: &CancellationToken,
 ) -> Result<RunResult> {
+    run_selected(project_dir, request, None, cancel)
+}
+
+/// Options of `dowai retry` (B-05c). Variables are not in the journal, so they are passed
+/// again whenever the original run used any.
+#[derive(Clone, Debug, Default)]
+pub struct RetryRequest {
+    /// Re-executes only the models that finished `FAILED`. Their predecessors are not run.
+    pub failed_only: bool,
+    pub variables: BTreeMap<String, Value>,
+    pub confirm_destructive: bool,
+}
+
+/// Re-executes a journaled run as a new run (B-05c). Allowed for runs that ended `FAILED` or
+/// `CANCELLED` (including timeouts, which are `FAILED`). A run that succeeded, or that was
+/// recorded before retry support, is refused. Refusals carry stable `DOWAI_RUN_*` or
+/// `DOWAI_RETRY_*` codes and never start a run.
+pub fn retry_run_with_cancel(
+    project_dir: &Path,
+    run_id: &str,
+    request: RetryRequest,
+    cancel: &CancellationToken,
+) -> Result<RunResult> {
+    let path = default_run_store_path()
+        .ok_or_else(|| DowaiError::State("No user state directory is available".to_owned()))?;
+    let source = RunStore::for_user_state(path).retry_source(run_id)?;
+    if source.status == "SUCCEEDED" {
+        return Err(DowaiError::Retry {
+            code: "DOWAI_RUN_NOT_RETRYABLE",
+            message: "The run succeeded; there is nothing to retry".to_owned(),
+        });
+    }
+    let targets = source
+        .requested_targets
+        .clone()
+        .ok_or_else(|| DowaiError::Retry {
+            code: "DOWAI_RUN_NOT_RETRYABLE",
+            message: "The run was recorded before retry support; run it again with dowai run"
+                .to_owned(),
+        })?;
+    let root = project_dir.canonicalize().map_err(|error| {
+        DowaiError::Path(format!(
+            "Project directory is unavailable: {} ({error})",
+            project_dir.display()
+        ))
+    })?;
+    if load_project(&root)?.name != source.project {
+        return Err(DowaiError::Retry {
+            code: "DOWAI_RETRY_PROJECT_MISMATCH",
+            message: "The run belongs to a different project".to_owned(),
+        });
+    }
+    let original_variables = source.variable_count.unwrap_or(0);
+    if original_variables > 0 && request.variables.is_empty() {
+        return Err(DowaiError::Retry {
+            code: "DOWAI_RETRY_VARIABLES_REQUIRED",
+            message: format!(
+                "The original run received {original_variables} variable(s); their values are not stored. Pass them again with --vars"
+            ),
+        });
+    }
+    let mode = match source.execution_mode.as_deref() {
+        Some("manual") => Some(ExecutionMode::Manual),
+        Some("automatic") => Some(ExecutionMode::Automatic),
+        _ => None,
+    };
+    let selection = if request.failed_only {
+        if source.failed_nodes.is_empty() {
+            return Err(DowaiError::Retry {
+                code: "DOWAI_RETRY_NO_FAILED_NODES",
+                message: "The original run has no FAILED model; retry without --failed-only"
+                    .to_owned(),
+            });
+        }
+        // Python variables are published only when a whole run succeeds (D-013). A Python
+        // predecessor that succeeded in the original run therefore left nothing behind: a
+        // selective retry would silently miss its variables.
+        let configuration = effective_configuration(&root)?;
+        let resolved_mode = resolve_execution_mode(&configuration, mode)?;
+        let execution_plan = plan(&root, &targets, resolved_mode)?;
+        if let Some(node) = uncommitted_python_predecessor(
+            &execution_plan,
+            &source.failed_nodes,
+            &source.succeeded_nodes,
+        ) {
+            return Err(DowaiError::Retry {
+                code: "DOWAI_RETRY_UNCOMMITTED_VARIABLES",
+                message: format!(
+                    "Python model {node} finished in the original run, but its variables were not committed; retry without --failed-only"
+                ),
+            });
+        }
+        Some(source.failed_nodes.clone())
+    } else {
+        None
+    };
+    run_selected(
+        project_dir,
+        RunRequest {
+            targets,
+            mode,
+            profile: source.profile.clone(),
+            session_id: source.session_id.clone(),
+            variables: request.variables,
+            confirm_destructive: request.confirm_destructive,
+        },
+        selection,
+        cancel,
+    )
+}
+
+/// Runs `request`, keeping only the plan nodes named in `selection` when given.
+fn run_selected(
+    project_dir: &Path,
+    request: RunRequest,
+    selection: Option<Vec<String>>,
+    cancel: &CancellationToken,
+) -> Result<RunResult> {
     let started_ms = current_time_ms();
     let started = Instant::now();
     let run_id = Uuid::new_v4().to_string();
-    let requested_session = request.session_id.clone();
+    let journal_request = JournalRequest {
+        session: request.session_id.clone(),
+        targets: request.targets.clone(),
+        profile: request.profile.clone(),
+        variable_count: u32::try_from(request.variables.len()).ok(),
+    };
     let requested_mode = request.mode;
     let root_invocation_id = Uuid::new_v4().to_string();
     let mut trace = Trace {
@@ -164,7 +287,7 @@ pub fn run_postgres_with_cancel(
             &run_id,
             &root_invocation_id,
             started_ms,
-            requested_session.clone(),
+            journal_request.session.clone(),
             project_display_name(project_dir),
         ),
         root_invocation_id,
@@ -172,7 +295,14 @@ pub fn run_postgres_with_cancel(
         python: Vec::new(),
         extra: Vec::new(),
     };
-    let outcome = execute_run(project_dir, request, &run_id, &mut trace, cancel);
+    let outcome = execute_run(
+        project_dir,
+        request,
+        &run_id,
+        &mut trace,
+        cancel,
+        selection.as_deref(),
+    );
     finish_audit(&mut trace, &outcome);
     let audit_failed = trace.audit.failed;
     let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -181,7 +311,7 @@ pub fn run_postgres_with_cancel(
         &run_id,
         started_ms,
         duration_ms,
-        requested_session,
+        &journal_request,
         &trace,
         &outcome,
     );
@@ -316,12 +446,20 @@ fn variable_names(variables: &BTreeMap<String, Value>) -> Vec<String> {
     variables.keys().cloned().collect()
 }
 
+/// The request facts the journal keeps for `dowai retry`. Never variable values.
+struct JournalRequest {
+    session: Option<String>,
+    targets: Vec<String>,
+    profile: Option<String>,
+    variable_count: Option<u32>,
+}
+
 fn journal_run(
     project_dir: &Path,
     run_id: &str,
     started_ms: i64,
     duration_ms: u64,
-    requested_session: Option<String>,
+    request: &JournalRequest,
     trace: &Trace,
     outcome: &Result<RunResult>,
 ) -> Result<()> {
@@ -350,7 +488,7 @@ fn journal_run(
                 "FAILED"
             },
             Some(error.code().to_owned()),
-            requested_session,
+            request.session.clone(),
             trace.execution_mode.clone(),
             trace.python.as_slice(),
         ),
@@ -386,9 +524,58 @@ fn journal_run(
             finished_at_ms: current_time_ms(),
             duration_ms,
             error_code,
+            requested_targets: Some(request.targets.clone()),
+            profile: request.profile.clone(),
+            variable_count: request.variable_count,
         },
         &invocations,
     )
+}
+
+/// First Python node that the failed models depend on, directly or not, and that finished
+/// `SUCCEEDED` in the original run.
+fn uncommitted_python_predecessor(
+    execution_plan: &ExecutionPlan,
+    failed: &[String],
+    succeeded: &[String],
+) -> Option<String> {
+    let depends_on: BTreeMap<&str, &[String]> = execution_plan
+        .nodes
+        .iter()
+        .map(|node| (node.id.as_str(), node.depends_on.as_slice()))
+        .collect();
+    let mut ancestors = BTreeSet::new();
+    let mut pending: Vec<&str> = failed.iter().map(String::as_str).collect();
+    while let Some(id) = pending.pop() {
+        for dependency in depends_on.get(id).copied().unwrap_or(&[]) {
+            if ancestors.insert(dependency.as_str()) {
+                pending.push(dependency.as_str());
+            }
+        }
+    }
+    ancestors
+        .into_iter()
+        .find(|id| is_python_path(id) && succeeded.iter().any(|node| node == id))
+        .map(str::to_owned)
+}
+
+/// Keeps only the selected nodes of `plan`. Predecessors outside the selection are not run;
+/// their relations and session variables come from the earlier, committed runs.
+fn restrict_plan(mut plan: ExecutionPlan, selection: Option<&[String]>) -> Result<ExecutionPlan> {
+    let Some(selection) = selection else {
+        return Ok(plan);
+    };
+    if let Some(missing) = selection
+        .iter()
+        .find(|id| !plan.nodes.iter().any(|node| &node.id == *id))
+    {
+        return Err(DowaiError::Retry {
+            code: "DOWAI_RETRY_PLAN_CHANGED",
+            message: format!("Failed model {missing} is no longer part of the plan"),
+        });
+    }
+    plan.nodes.retain(|node| selection.contains(&node.id));
+    Ok(plan)
 }
 
 fn execute_run(
@@ -397,6 +584,7 @@ fn execute_run(
     run_id: &str,
     trace: &mut Trace,
     cancel: &CancellationToken,
+    selection: Option<&[String]>,
 ) -> Result<RunResult> {
     cancel.check()?;
     let started = Instant::now();
@@ -413,7 +601,7 @@ fn execute_run(
     trace.audit.config_hash = serde_json::to_vec(&configuration)
         .ok()
         .map(|bytes| sha256_hex(&bytes));
-    let execution_plan = plan(&root, &request.targets, mode)?;
+    let execution_plan = restrict_plan(plan(&root, &request.targets, mode)?, selection)?;
     trace.audit.plan_hash = serde_json::to_vec(&execution_plan)
         .ok()
         .map(|bytes| sha256_hex(&bytes));

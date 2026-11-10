@@ -8,8 +8,9 @@
 //! a distributed transaction; only session variables are all-or-nothing.
 
 use dowai_core::{create_project, default_session_store_path, ExecutionMode, SessionStore};
+use dowai_core::{default_run_store_path, RunStore};
 use dowai_postgres::{quote_identifier, PgProfile, PostgresAdapter, TlsMode};
-use dowai_runtime::{run_postgres, RunRequest, RunResult};
+use dowai_runtime::{retry_run_with_cancel, run_postgres, RetryRequest, RunRequest, RunResult};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -547,7 +548,7 @@ fn ac002_python_ref_refuses_a_python_model_with_stable_code() {
     let fx = Fixture::new("ac002-not-sql");
     let (sql, py_dep, py) = (fx.name("filler"), fx.name("helper"), fx.name("reader"));
     let _cleanup = TableCleanup(vec![sql.clone()]);
-    fx.write_model(&format!("{sql}.sql"), "select 1 as id");
+    fx.write_model(&format!("{sql}.sql"), "select 1 as v");
     fx.write_model(
         &format!("{py_dep}.py"),
         "def model(env):\n    return None\n",
@@ -629,4 +630,54 @@ fn ac002_iter_rows_refuses_view_predecessor_with_stable_code() {
     let variables = fx.variables(&result.session_id);
     assert_eq!(variables["schema_ok"], json!(true));
     assert_eq!(variables["view_code"], json!("DOWAI_DATASET_UNAVAILABLE"));
+}
+
+/// B-05c: `--failed-only` re-runs the failed Python model and not the committed SQL
+/// predecessor. The SQL relation stays as it was, and the retry commits the Python model.
+#[test]
+#[ignore = "opt-in E2E; requires a dedicated disposable PostgreSQL database"]
+fn retry_failed_only_skips_committed_sql_predecessor() {
+    let fx = Fixture::new("retry");
+    let (sql, py) = (fx.name("warehouse"), fx.name("consumer"));
+    let _cleanup = TableCleanup(vec![sql.clone()]);
+    let marker = fx.root.join("consumer-first-attempt-done");
+    fx.write_model(&format!("{sql}.sql"), "select 1 as v");
+    fx.write_model(
+        &format!("{py}.py"),
+        &format!(
+            "import pathlib\ndef model(env):\n    env.depends_on('{sql}')\n    marker = pathlib.Path({:?})\n    if not marker.exists():\n        marker.write_text('x')\n        raise RuntimeError('first attempt fails')\n    env.setVar('consumer_ok', True)\n",
+            marker.to_string_lossy()
+        ),
+    );
+
+    let failure = fx
+        .run(&[&format!("{py}.py")], None, None)
+        .expect_err("first attempt must fail");
+    assert_eq!(failure.code(), "DOWAI_PYTHON_FAILED");
+    assert!(fx.table_exists(&sql), "the SQL predecessor committed");
+    let failed_id = RunStore::for_user_state(default_run_store_path().expect("journal path"))
+        .list(1)
+        .expect("list runs")[0]
+        .run_id
+        .clone();
+
+    let retried = retry_run_with_cancel(
+        &fx.project,
+        &failed_id,
+        RetryRequest {
+            failed_only: true,
+            variables: BTreeMap::new(),
+            confirm_destructive: false,
+        },
+        &dowai_core::CancellationToken::new(),
+    )
+    .expect("selective retry");
+
+    assert_eq!(retried.status, "SUCCEEDED");
+    assert_eq!(ids(&retried), [format!("{py}.py")]);
+    assert_eq!(fx.column(&sql), [1]);
+    assert_eq!(
+        fx.variables(&retried.session_id)["consumer_ok"],
+        json!(true)
+    );
 }

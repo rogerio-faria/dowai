@@ -15,7 +15,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 /// Current `PRAGMA user_version` of the run journal database.
-pub const RUN_SCHEMA_VERSION: i64 = 1;
+pub const RUN_SCHEMA_VERSION: i64 = 2;
 pub const MAX_LIST_LIMIT: usize = 1_000;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_TARGET_CHARS: usize = 256;
@@ -31,6 +31,30 @@ pub struct NewRun {
     pub finished_at_ms: i64,
     pub duration_ms: u64,
     pub error_code: Option<String>,
+    /// Targets exactly as requested (paths or `all`). Needed by `dowai retry` (B-05c).
+    /// `None` only for runs recorded before schema 2.
+    pub requested_targets: Option<Vec<String>>,
+    /// Requested profile name, if any (an identifier, never a credential).
+    pub profile: Option<String>,
+    /// Number of variables passed to the run. Values are never stored (D-013).
+    pub variable_count: Option<u32>,
+}
+
+/// What `dowai retry` needs from a journaled run. Holds no variable values.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetrySource {
+    pub run_id: String,
+    pub status: String,
+    pub project: String,
+    pub session_id: Option<String>,
+    pub execution_mode: Option<String>,
+    pub requested_targets: Option<Vec<String>>,
+    pub profile: Option<String>,
+    pub variable_count: Option<u32>,
+    /// Plan nodes whose invocation finished `FAILED` in the original run.
+    pub failed_nodes: Vec<String>,
+    /// Plan nodes whose invocation finished `SUCCEEDED` in the original run.
+    pub succeeded_nodes: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -215,8 +239,9 @@ impl RunStore {
         transaction
             .execute(
                 "INSERT INTO runs (run_id, session_id, project, status, execution_mode,
-                   started_at_ms, finished_at_ms, started_at, finished_at, duration_ms, error_code)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                   started_at_ms, finished_at_ms, started_at, finished_at, duration_ms, error_code,
+                   requested_targets, profile, variable_count)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     run.run_id,
                     run.session_id,
@@ -229,6 +254,9 @@ impl RunStore {
                     utc_iso(run.finished_at_ms),
                     clamp_duration(run.duration_ms),
                     sanitize_code(run.error_code.as_deref()),
+                    targets_json(run.requested_targets.as_deref())?,
+                    run.profile.as_deref().map(bounded),
+                    run.variable_count.map(i64::from),
                 ],
             )
             .map_err(state_error)?;
@@ -314,6 +342,70 @@ impl RunStore {
         Ok(RunDetail { run, invocations })
     }
 
+    /// Reads what a retry needs from one run. Refuses unknown runs with a stable code.
+    pub fn retry_source(&self, run_id: &str) -> Result<RetrySource> {
+        let connection = self.connect()?;
+        let row = connection
+            .query_row(
+                "SELECT status, project, session_id, execution_mode, requested_targets, profile,
+                   variable_count
+                 FROM runs WHERE run_id = ?1",
+                [run_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(state_error)?
+            .ok_or_else(|| DowaiError::Retry {
+                code: "DOWAI_RUN_NOT_FOUND",
+                message: "No run with this identifier is in the journal".to_owned(),
+            })?;
+        let nodes_with_status = |status: &str| -> Result<Vec<String>> {
+            let mut statement = connection
+                .prepare(
+                    "SELECT DISTINCT target FROM invocations
+                     WHERE run_id = ?1 AND call_type = 'static' AND status = ?2 ORDER BY seq",
+                )
+                .map_err(state_error)?;
+            let nodes = statement
+                .query_map(params![run_id, status], |row| row.get::<_, String>(0))
+                .map_err(state_error)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(state_error)?;
+            Ok(nodes)
+        };
+        let failed_nodes = nodes_with_status("FAILED")?;
+        let succeeded_nodes = nodes_with_status("SUCCEEDED")?;
+        let requested_targets =
+            match row.4 {
+                Some(text) => Some(serde_json::from_str::<Vec<String>>(&text).map_err(|_| {
+                    DowaiError::State("Run journal targets are unreadable".to_owned())
+                })?),
+                None => None,
+            };
+        Ok(RetrySource {
+            run_id: run_id.to_owned(),
+            status: row.0,
+            project: row.1,
+            session_id: row.2,
+            execution_mode: row.3,
+            requested_targets,
+            profile: row.5,
+            variable_count: row.6.and_then(|count| u32::try_from(count).ok()),
+            failed_nodes,
+            succeeded_nodes,
+        })
+    }
+
     fn connect(&self) -> Result<Connection> {
         let parent = self
             .path
@@ -334,13 +426,16 @@ impl RunStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        let connection = Connection::open(&self.path).map_err(state_error)?;
+        let mut connection = Connection::open(&self.path).map_err(state_error)?;
         connection.busy_timeout(BUSY_TIMEOUT).map_err(state_error)?;
         connection
             .execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")
             .map_err(state_error)?;
+        if user_version(&connection)? == 0 {
+            connection.execute_batch(SCHEMA_V1).map_err(state_error)?;
+        }
         match user_version(&connection)? {
-            0 => connection.execute_batch(SCHEMA_V1).map_err(state_error)?,
+            1 => migrate_v1_to_v2(&mut connection)?,
             RUN_SCHEMA_VERSION => {}
             other => {
                 return Err(DowaiError::State(format!(
@@ -351,6 +446,41 @@ impl RunStore {
         set_private_file_permissions(&self.path)?;
         Ok(connection)
     }
+}
+
+/// Schema 2 adds the request columns used by `dowai retry`. Runs recorded before it keep
+/// NULL there, and retry refuses them. The check runs inside the transaction so that two
+/// processes opening an old journal at once cannot add the columns twice.
+fn migrate_v1_to_v2(connection: &mut Connection) -> Result<()> {
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(state_error)?;
+    if user_version(&transaction)? == 1 {
+        transaction
+            .execute_batch(
+                "ALTER TABLE runs ADD COLUMN requested_targets TEXT;
+                 ALTER TABLE runs ADD COLUMN profile TEXT;
+                 ALTER TABLE runs ADD COLUMN variable_count INTEGER
+                   CHECK (variable_count IS NULL OR variable_count >= 0);",
+            )
+            .map_err(state_error)?;
+        transaction
+            .execute_batch("PRAGMA user_version = 2;")
+            .map_err(state_error)?;
+    }
+    transaction.commit().map_err(state_error)
+}
+
+/// JSON array of the requested targets; `None` stays NULL.
+fn targets_json(targets: Option<&[String]>) -> Result<Option<String>> {
+    targets
+        .map(|targets| {
+            let bounded_targets: Vec<String> =
+                targets.iter().map(|target| bounded(target)).collect();
+            serde_json::to_string(&bounded_targets)
+                .map_err(|error| DowaiError::State(format!("Run journal encoding failed: {error}")))
+        })
+        .transpose()
 }
 
 const RUN_COLUMNS: &str = "run_id, session_id, project, status, execution_mode, started_at, \
@@ -517,6 +647,9 @@ mod tests {
             finished_at_ms: started + 25,
             duration_ms: 25,
             error_code: None,
+            requested_targets: Some(vec!["model.py".to_owned()]),
+            profile: None,
+            variable_count: Some(0),
         }
     }
 
@@ -544,7 +677,7 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("user_version");
-        assert_eq!(version, 1);
+        assert_eq!(version, RUN_SCHEMA_VERSION);
     }
 
     #[test]
@@ -782,5 +915,84 @@ mod tests {
         all.push(entry("d", Some("c"), "d.sql", "FAILED"));
         all.push(entry("e", Some("ghost"), "e.sql", "FAILED"));
         assert_eq!(invocation_depths(&all), [0, 1, 1, 2, 0]);
+    }
+
+    fn failed_invocation(id: &str, target: &str, status: &str, call_type: &str) -> NewInvocation {
+        NewInvocation {
+            target: target.to_owned(),
+            call_type: call_type.to_owned(),
+            ..invocation(id, None, status)
+        }
+    }
+
+    #[test]
+    fn retry_source_returns_request_facts_and_failed_plan_nodes_only() {
+        let fixture = Fixture::new();
+        let id = "22222222-2222-4222-8222-222222222222";
+        let mut record = run(id, 1_700_000_000_000, "FAILED");
+        record.requested_targets = Some(vec!["consumer.py".to_owned(), "all".to_owned()]);
+        record.profile = Some("warehouse".to_owned());
+        record.variable_count = Some(2);
+        fixture
+            .store
+            .record(
+                &record,
+                &[
+                    failed_invocation("a", "upstream.py", "SUCCEEDED", "static"),
+                    failed_invocation("b", "consumer.py", "FAILED", "static"),
+                    failed_invocation("c", "helper.py", "FAILED", "dependency"),
+                    failed_invocation("d", "late.py", "SKIPPED", "static"),
+                ],
+            )
+            .expect("record");
+        let source = fixture.store.retry_source(id).expect("retry source");
+        assert_eq!(source.status, "FAILED");
+        assert_eq!(source.project, "fixture");
+        assert_eq!(
+            source.requested_targets,
+            Some(vec!["consumer.py".to_owned(), "all".to_owned()])
+        );
+        assert_eq!(source.profile.as_deref(), Some("warehouse"));
+        assert_eq!(source.variable_count, Some(2));
+        assert_eq!(source.execution_mode.as_deref(), Some("automatic"));
+        assert_eq!(source.failed_nodes, ["consumer.py"]);
+    }
+
+    #[test]
+    fn unknown_run_for_retry_has_a_stable_code() {
+        let fixture = Fixture::new();
+        fixture.store.schema_version().expect("create");
+        let error = fixture
+            .store
+            .retry_source("missing")
+            .expect_err("unknown run");
+        assert_eq!(error.code(), "DOWAI_RUN_NOT_FOUND");
+    }
+
+    #[test]
+    fn schema_one_journal_migrates_and_its_runs_are_not_retryable_by_targets() {
+        let fixture = Fixture::new();
+        fs::create_dir_all(fixture.dir.join("state")).expect("state dir");
+        let connection = Connection::open(fixture.db()).expect("open");
+        connection.execute_batch(SCHEMA_V1).expect("schema one");
+        connection
+            .execute(
+                "INSERT INTO runs (run_id, project, status, started_at_ms, finished_at_ms,
+                   started_at, finished_at, duration_ms)
+                 VALUES ('old-run', 'fixture', 'FAILED', 1, 2, 'a', 'b', 1)",
+                [],
+            )
+            .expect("legacy run");
+        drop(connection);
+
+        assert_eq!(
+            fixture.store.schema_version().expect("migrate"),
+            RUN_SCHEMA_VERSION
+        );
+        let source = fixture.store.retry_source("old-run").expect("source");
+        assert_eq!(source.status, "FAILED");
+        assert_eq!(source.requested_targets, None);
+        assert_eq!(source.variable_count, None);
+        assert_eq!(fixture.store.list(5).expect("list").len(), 1);
     }
 }

@@ -7,7 +7,8 @@ use dowai_core::{
     SessionStore, TemplateOptions,
 };
 use dowai_runtime::{
-    check_postgres_connection, prepare_postgres_plan, run_postgres_with_cancel, RunRequest,
+    check_postgres_connection, prepare_postgres_plan, retry_run_with_cancel,
+    run_postgres_with_cancel, RetryRequest, RunRequest, RunResult,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -44,6 +45,9 @@ enum Command {
         command: ConfigCommand,
     },
     Run(RunArgs),
+    /// Run again a FAILED or CANCELLED run as a new run (B-05c). Variables are required
+    /// again when the original run used any; their values are not stored.
+    Retry(RetryArgs),
     /// Show the invocation tree of one run from the journal (no free-form messages).
     ///
     /// Levels: ERROR = FAILED; WARN = FAILED and SKIPPED; INFO (default), DEBUG and
@@ -161,6 +165,21 @@ enum ConfigCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Debug, Args)]
+struct RetryArgs {
+    run_id: String,
+    /// Re-executes only the models that finished FAILED, without their predecessors.
+    #[arg(long)]
+    failed_only: bool,
+    /// Required again when the original run used variables (values are not journaled).
+    #[arg(long)]
+    vars: Option<String>,
+    #[arg(long, help = "Confirm replacement of existing PostgreSQL relations")]
+    yes: bool,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -436,6 +455,22 @@ fn dispatch(command: Command) -> Result<Option<Value>> {
                 }
             }
         },
+        Command::Retry(args) => {
+            let project_dir = find_project_root(&std::env::current_dir()?)?;
+            let variables = parse_vars(args.vars.as_deref())?;
+            let cancel = install_cancel_handler()?;
+            let result = retry_run_with_cancel(
+                &project_dir,
+                &args.run_id,
+                RetryRequest {
+                    failed_only: args.failed_only,
+                    variables,
+                    confirm_destructive: args.yes,
+                },
+                &cancel,
+            )?;
+            run_result_output(result, args.json)
+        }
         Command::Run(args) => {
             if args.full_refresh {
                 return Err(DowaiError::NotImplemented(
@@ -445,11 +480,7 @@ fn dispatch(command: Command) -> Result<Option<Value>> {
             let project_dir = find_project_root(&std::env::current_dir()?)?;
             // SIGINT/SIGTERM (Ctrl+C on Windows) only flip the token; the runtime stops
             // the Python process tree and cancels any running SQL, then reports exit 130.
-            let cancel = CancellationToken::new();
-            let signal_token = cancel.clone();
-            ctrlc::set_handler(move || signal_token.cancel()).map_err(|_| {
-                DowaiError::State("Could not install the cancellation signal handler".to_owned())
-            })?;
+            let cancel = install_cancel_handler()?;
             let result = run_postgres_with_cancel(
                 &project_dir,
                 RunRequest {
@@ -466,28 +497,42 @@ fn dispatch(command: Command) -> Result<Option<Value>> {
                 },
                 &cancel,
             )?;
-            if args.json {
-                Ok(Some(
-                    serde_json::to_value(result)
-                        .map_err(|error| DowaiError::Model(error.to_string()))?,
-                ))
-            } else {
-                println!(
-                    "Run {} succeeded (session {}).",
-                    result.run_id, result.session_id
-                );
-                for node in result.nodes {
-                    println!(
-                        "  {} -> {} ({})",
-                        node.id, node.relation, node.materialization
-                    );
-                }
-                for warning in result.warnings {
-                    eprintln!("Warning: {warning}");
-                }
-                Ok(None)
-            }
+            run_result_output(result, args.json)
         }
+    }
+}
+
+/// Cancellation token wired to SIGINT/SIGTERM (Ctrl+C on Windows).
+fn install_cancel_handler() -> Result<CancellationToken> {
+    let cancel = CancellationToken::new();
+    let signal_token = cancel.clone();
+    ctrlc::set_handler(move || signal_token.cancel()).map_err(|_| {
+        DowaiError::State("Could not install the cancellation signal handler".to_owned())
+    })?;
+    Ok(cancel)
+}
+
+/// Output shared by `dowai run` and `dowai retry`.
+fn run_result_output(result: RunResult, json: bool) -> Result<Option<Value>> {
+    if json {
+        Ok(Some(
+            serde_json::to_value(result).map_err(|error| DowaiError::Model(error.to_string()))?,
+        ))
+    } else {
+        println!(
+            "Run {} succeeded (session {}).",
+            result.run_id, result.session_id
+        );
+        for node in result.nodes {
+            println!(
+                "  {} -> {} ({})",
+                node.id, node.relation, node.materialization
+            );
+        }
+        for warning in result.warnings {
+            eprintln!("Warning: {warning}");
+        }
+        Ok(None)
     }
 }
 
@@ -528,6 +573,7 @@ fn wants_json(command: &Command) -> bool {
             ConfigCommand::Show { json, .. } | ConfigCommand::Migrate { json, .. } => *json,
         },
         Command::Run(args) => args.json,
+        Command::Retry(args) => args.json,
         Command::Logs { json, .. } => *json,
         Command::Runs { command } => match command {
             RunsCommand::List { json, .. } | RunsCommand::Show { json, .. } => *json,

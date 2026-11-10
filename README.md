@@ -88,6 +88,7 @@ static `source()` macros; source relations are not executable plan nodes. See
 - `dowai runs list [--limit N] [--json]` (N from 1 to 1000, default 20)
 - `dowai runs show <run_id> [--json]`
 - `dowai logs <run_id> [--node NODE] [--level ERROR|WARN|INFO|DEBUG|TRACE] [--json]`
+- `dowai retry <run_id> [--failed-only] [--vars JSON] [--yes] [--json]` re-runs a FAILED or CANCELLED run (timeouts are FAILED) as a new run. Variables are not journaled, so `--vars` is required again when the original run used any. `--failed-only` re-runs only the models that failed, without their predecessors; it is refused when a failed model depends on a Python model that succeeded in the original run, because that model's variables were never committed.
   (levels filter invocation status: ERROR = failed; WARN = failed or skipped;
   INFO/DEBUG/TRACE = all recorded invocations; no free-text messages are shown)
 
