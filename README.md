@@ -85,6 +85,13 @@ static `source()` macros; source relations are not executable plan nodes. See
 - `dowai config show --effective [--json]`
 - `dowai doctor [--check-connections] [--json]`
 - `dowai run <model|all> [--profile NAME] [--session ID] [--vars JSON] [--yes] [--json]`
+- `dowai runs list [--limit N] [--json]` (N from 1 to 1000, default 20)
+- `dowai runs show <run_id> [--json]`
+
+Every PostgreSQL run, including a failed one, is recorded in a local run journal
+(`runs.sqlite3`, next to the session store) with status, timings, error codes
+and invocation tree. Variable values, rendered SQL, error messages and paths are
+never stored.
 
 `--json` keeps machine-readable output on stdout. Errors use stable
 `DOWAI_*` codes and the exit codes documented in the master plan.

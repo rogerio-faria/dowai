@@ -23,3 +23,5 @@
   SQL `def_var` values reach later Python models, Python `setVar` values reach
   later SQL templates, and variables are published only after the whole run
   succeeds. Requires a configured PostgreSQL profile for mixed plans.
+- Record every run outcome in a local run journal and add `dowai runs list` and
+  `dowai runs show`. Failed runs keep their invocation history.

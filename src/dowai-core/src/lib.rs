@@ -2,6 +2,7 @@ mod config;
 mod error;
 mod planner;
 mod project;
+mod runs;
 mod sessions;
 mod templates;
 
@@ -16,6 +17,10 @@ pub use planner::{
 pub use project::{
     create_project, load_project, validate_project, validate_project_with_configuration, Project,
     ProjectPython, ProjectSource, ValidationReport,
+};
+pub use runs::{
+    current_time_ms, default_run_store_path, InvocationEntry, NewInvocation, NewRun, RunDetail,
+    RunStore, RunSummary, RUN_SCHEMA_VERSION,
 };
 pub use sessions::{default_session_store_path, SessionLimits, SessionMetadata, SessionStore};
 pub use templates::{

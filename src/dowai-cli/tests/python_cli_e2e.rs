@@ -113,4 +113,17 @@ fn cli_runs_python_models_without_a_database_profile() {
     assert_eq!(result["profile"], json!("python"));
     assert_eq!(result["nodes"][0]["id"], json!("model.py"));
     assert!(result["session_id"].as_str().is_some());
+
+    let run_id = result["run_id"].as_str().expect("run id");
+    let shown = Command::new(env!("CARGO_BIN_EXE_dowai"))
+        .args(["runs", "show", run_id, "--json"])
+        .current_dir(&project)
+        .env("XDG_STATE_HOME", &state)
+        .env("LOCALAPPDATA", &state)
+        .output()
+        .expect("show journaled run");
+    assert!(shown.status.success(), "run must be journaled");
+    let shown: Value = serde_json::from_slice(&shown.stdout).expect("JSON");
+    assert_eq!(shown["run"]["status"], json!("SUCCEEDED"));
+    assert_eq!(shown["run"]["invocations"][0]["target"], json!("model.py"));
 }

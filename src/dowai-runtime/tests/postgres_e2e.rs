@@ -1,4 +1,6 @@
-use dowai_core::{create_project, default_session_store_path, SessionStore};
+use dowai_core::{
+    create_project, default_run_store_path, default_session_store_path, RunStore, SessionStore,
+};
 use dowai_postgres::{quote_identifier, PgProfile, PostgresAdapter, TlsMode};
 use dowai_runtime::{run_postgres, RunRequest};
 use serde_json::{json, Value};
@@ -82,6 +84,8 @@ fn run_executes_sources_and_refs_and_requires_approval_to_replace_relations() {
     let appdata = workspace.root.join("appdata");
     let _local_appdata = EnvironmentRestore::set("LOCALAPPDATA", &appdata);
     let _appdata_restore = EnvironmentRestore::set("APPDATA", &appdata);
+    let _xdg_state = EnvironmentRestore::set("XDG_STATE_HOME", &appdata.join("state"));
+    let _xdg_config = EnvironmentRestore::set("XDG_CONFIG_HOME", &appdata.join("config"));
 
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -183,6 +187,16 @@ fn run_executes_sources_and_refs_and_requires_approval_to_replace_relations() {
     assert_ne!(result.invocation_id, result.run_id);
     assert_eq!(result.nodes.len(), 2);
 
+    let journal = RunStore::for_user_state(default_run_store_path().expect("isolated journal"))
+        .get(&result.run_id)
+        .expect("successful SQL run is journaled");
+    assert_eq!(journal.run.status, "SUCCEEDED");
+    assert_eq!(journal.invocations.len(), 2);
+    assert!(journal
+        .invocations
+        .iter()
+        .all(|entry| entry.kind == "sql" && entry.status == "SUCCEEDED"));
+
     let session_store = SessionStore::for_user_state(
         default_session_store_path().expect("isolated local app data path"),
     );
@@ -202,6 +216,11 @@ fn run_executes_sources_and_refs_and_requires_approval_to_replace_relations() {
     let approval_error = run_postgres(&workspace.project, blocked_request)
         .expect_err("replacing existing model relations must require approval");
     assert_eq!(approval_error.code(), "DOWAI_POLICY_DENIED");
+    let denied = RunStore::for_user_state(default_run_store_path().expect("isolated journal"))
+        .list(1)
+        .expect("list journal");
+    assert_eq!(denied[0].status, "FAILED");
+    assert_eq!(denied[0].error_code.as_deref(), Some("DOWAI_POLICY_DENIED"));
     let unchanged_rows = adapter
         .query(&format!("SELECT value FROM {report_relation}"), &[])
         .expect("denied replacement must preserve the existing relation");

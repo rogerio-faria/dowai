@@ -1,8 +1,9 @@
 use dowai_core::{
-    admin_config_path, load_project, load_workspace_profile, plan, read_planned_model,
-    resolve_effective_configuration, source_relation_key, user_config_path, DowaiError,
-    ExecutionMode, ExecutionPlan, Materialization, Result, SessionStore, TemplateOptions,
-    WorkspaceProfile,
+    admin_config_path, current_time_ms, default_run_store_path, load_project,
+    load_workspace_profile, plan, read_planned_model, resolve_effective_configuration,
+    source_relation_key, user_config_path, DowaiError, ExecutionMode, ExecutionPlan,
+    Materialization, NewInvocation, NewRun, PlanNode, Result, RunStore, SessionStore,
+    TemplateOptions, WorkspaceProfile,
 };
 use dowai_postgres::{
     quote_identifier, AdapterError, Materialization as PostgresMaterialization, PgProfile,
@@ -82,7 +83,165 @@ pub struct PreparedPlan {
     pub variables: BTreeMap<String, Value>,
 }
 
+/// Everything the run journal needs that is not part of a successful `RunResult`.
+/// Holds identifiers, statuses and timings only; never values or SQL.
+struct Trace {
+    root_invocation_id: String,
+    execution_mode: Option<String>,
+    /// Python invocations salvaged from the executor when the run fails.
+    python: Vec<InvocationRecord>,
+    /// SQL node records and `SKIPPED` records for nodes never started.
+    extra: Vec<InvocationRecord>,
+}
+
+impl Trace {
+    fn node(
+        &mut self,
+        node: &PlanNode,
+        mode: ExecutionMode,
+        status: &str,
+        started: Instant,
+        error: Option<&DowaiError>,
+    ) {
+        self.extra.push(InvocationRecord {
+            invocation_id: Uuid::new_v4().to_string(),
+            parent_invocation_id: self.root_invocation_id.clone(),
+            call_type: "static".to_owned(),
+            target: node.id.clone(),
+            mode: mode.as_str().to_owned(),
+            status: status.to_owned(),
+            duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            error_code: error.map(|error| error.code().to_owned()),
+        });
+    }
+
+    fn skip(&mut self, nodes: &[PlanNode], mode: ExecutionMode) {
+        for node in nodes {
+            self.node(node, mode, "SKIPPED", Instant::now(), None);
+        }
+    }
+}
+
+/// Runs the plan and records the outcome in the persistent journal (D-011).
+///
+/// Journal policy: a failed journal write never replaces the run outcome. On success
+/// a warning is appended to `RunResult.warnings`; on failure the original error is
+/// returned unchanged and a sanitized warning goes to stderr.
 pub fn run_postgres(project_dir: &Path, request: RunRequest) -> Result<RunResult> {
+    let started_ms = current_time_ms();
+    let started = Instant::now();
+    let run_id = Uuid::new_v4().to_string();
+    let requested_session = request.session_id.clone();
+    let requested_mode = request.mode;
+    let mut trace = Trace {
+        root_invocation_id: Uuid::new_v4().to_string(),
+        execution_mode: requested_mode.map(|mode| mode.as_str().to_owned()),
+        python: Vec::new(),
+        extra: Vec::new(),
+    };
+    let outcome = execute_run(project_dir, request, &run_id, &mut trace);
+    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let journal = journal_run(
+        project_dir,
+        &run_id,
+        started_ms,
+        duration_ms,
+        requested_session,
+        &trace,
+        &outcome,
+    );
+    match (outcome, journal) {
+        (Ok(mut result), Err(_)) => {
+            result
+                .warnings
+                .push("The run journal could not be written".to_owned());
+            Ok(result)
+        }
+        (Err(error), Err(_)) => {
+            eprintln!("Warning: the run journal could not be written");
+            Err(error)
+        }
+        (outcome, Ok(())) => outcome,
+    }
+}
+
+fn journal_run(
+    project_dir: &Path,
+    run_id: &str,
+    started_ms: i64,
+    duration_ms: u64,
+    requested_session: Option<String>,
+    trace: &Trace,
+    outcome: &Result<RunResult>,
+) -> Result<()> {
+    let root = project_dir.canonicalize()?;
+    let project = load_project(&root)
+        .map(|project| project.name)
+        .unwrap_or_else(|_| {
+            root.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        });
+    let path = default_run_store_path()
+        .ok_or_else(|| DowaiError::State("No user state directory is available".to_owned()))?;
+    let (status, error_code, session_id, mode, python) = match outcome {
+        Ok(result) => (
+            "SUCCEEDED",
+            None,
+            Some(result.session_id.clone()),
+            Some(result.execution_mode.clone()),
+            result.invocations.as_slice(),
+        ),
+        Err(error) => (
+            "FAILED",
+            Some(error.code().to_owned()),
+            requested_session,
+            trace.execution_mode.clone(),
+            trace.python.as_slice(),
+        ),
+    };
+    let invocations: Vec<NewInvocation> = python
+        .iter()
+        .chain(trace.extra.iter())
+        .map(|record| NewInvocation {
+            invocation_id: record.invocation_id.clone(),
+            parent_invocation_id: Some(record.parent_invocation_id.clone())
+                .filter(|parent| *parent != trace.root_invocation_id),
+            kind: if record.call_type == "imperative" || is_python_path(&record.target) {
+                "python"
+            } else {
+                "sql"
+            }
+            .to_owned(),
+            target: record.target.clone(),
+            call_type: record.call_type.clone(),
+            status: record.status.clone(),
+            error_code: record.error_code.clone(),
+            duration_ms: record.duration_ms,
+        })
+        .collect();
+    RunStore::for_user_state(path).record(
+        &NewRun {
+            run_id: run_id.to_owned(),
+            session_id,
+            project,
+            status: status.to_owned(),
+            execution_mode: mode,
+            started_at_ms: started_ms,
+            finished_at_ms: current_time_ms(),
+            duration_ms,
+            error_code,
+        },
+        &invocations,
+    )
+}
+
+fn execute_run(
+    project_dir: &Path,
+    request: RunRequest,
+    run_id: &str,
+    trace: &mut Trace,
+) -> Result<RunResult> {
     let started = Instant::now();
     let root = project_dir.canonicalize().map_err(|error| {
         DowaiError::Path(format!(
@@ -92,6 +251,7 @@ pub fn run_postgres(project_dir: &Path, request: RunRequest) -> Result<RunResult
     })?;
     let configuration = effective_configuration(&root)?;
     let mode = resolve_execution_mode(&configuration, request.mode)?;
+    trace.execution_mode = Some(mode.as_str().to_owned());
     let execution_plan = plan(&root, &request.targets, mode)?;
     if execution_plan.nodes.is_empty() {
         return Err(DowaiError::Model(
@@ -149,7 +309,7 @@ pub fn run_postgres(project_dir: &Path, request: RunRequest) -> Result<RunResult
         let (project, python) = python_settings(&root)?;
         let interpreter = &python.interpreter;
         let models_dir = root.join(&project.models_dir);
-        let run_invocation_id = Uuid::new_v4().to_string();
+        let run_invocation_id = trace.root_invocation_id.clone();
         let mut executor = executor::Executor::new(
             &root,
             &models_dir,
@@ -159,8 +319,15 @@ pub fn run_postgres(project_dir: &Path, request: RunRequest) -> Result<RunResult
             &store,
         )?;
         let mut completed_nodes = Vec::with_capacity(execution_plan.nodes.len());
-        for node in &execution_plan.nodes {
-            variables = executor.run_static(node, mode, variables, &run_invocation_id)?;
+        for (index, node) in execution_plan.nodes.iter().enumerate() {
+            match executor.run_static(node, mode, variables, &run_invocation_id) {
+                Ok(next) => variables = next,
+                Err(error) => {
+                    trace.python = executor.invocations;
+                    trace.skip(&execution_plan.nodes[index + 1..], mode);
+                    return Err(error);
+                }
+            }
             completed_nodes.push(RunNodeResult {
                 id: node.id.clone(),
                 relation: node.id.clone(),
@@ -169,6 +336,7 @@ pub fn run_postgres(project_dir: &Path, request: RunRequest) -> Result<RunResult
             });
         }
         let invocations = executor.invocations;
+        trace.python = invocations.clone();
         let session = match prior_session {
             Some(session) => session,
             None => store.create(&root, SESSION_TTL)?,
@@ -177,7 +345,7 @@ pub fn run_postgres(project_dir: &Path, request: RunRequest) -> Result<RunResult
         return Ok(RunResult {
             schema_version: 2,
             session_id: session.session_id,
-            run_id: Uuid::new_v4().to_string(),
+            run_id: run_id.to_owned(),
             invocation_id: run_invocation_id,
             status: "SUCCEEDED".to_owned(),
             execution_mode: execution_plan.execution_mode,
@@ -207,7 +375,7 @@ pub fn run_postgres(project_dir: &Path, request: RunRequest) -> Result<RunResult
         let models_dir = root.join(&project.models_dir);
         let relations = build_relations(&root, &execution_plan)?;
         let allow_replace = replacement_approval(&configuration, request.confirm_destructive)?;
-        let run_invocation_id = Uuid::new_v4().to_string();
+        let run_invocation_id = trace.root_invocation_id.clone();
         let mut executor = executor::Executor::new(
             &root,
             &models_dir,
@@ -219,9 +387,16 @@ pub fn run_postgres(project_dir: &Path, request: RunRequest) -> Result<RunResult
         let mut adapter = PostgresAdapter::connect(&postgres_profile(profile))
             .map_err(|error| DowaiError::Connection(error.to_string()))?;
         let mut completed_nodes = Vec::with_capacity(execution_plan.nodes.len());
-        for node in &execution_plan.nodes {
+        for (index, node) in execution_plan.nodes.iter().enumerate() {
             if is_python_path(&node.path) {
-                variables = executor.run_static(node, mode, variables, &run_invocation_id)?;
+                match executor.run_static(node, mode, variables, &run_invocation_id) {
+                    Ok(next) => variables = next,
+                    Err(error) => {
+                        trace.python = std::mem::take(&mut executor.invocations);
+                        trace.skip(&execution_plan.nodes[index + 1..], mode);
+                        return Err(error);
+                    }
+                }
                 completed_nodes.push(RunNodeResult {
                     id: node.id.clone(),
                     relation: node.id.clone(),
@@ -230,37 +405,52 @@ pub fn run_postgres(project_dir: &Path, request: RunRequest) -> Result<RunResult
                 });
                 continue;
             }
-            let (prepared, next_variables) =
-                render_sql_node(&root, node, &variables, &template_options, &relations)?;
-            if prepared.sql.trim().is_empty() {
-                return Err(DowaiError::Template(format!(
-                    "{} renders to an empty SQL statement",
-                    prepared.id
-                )));
-            }
-            store.validate_variables(&next_variables)?;
-            adapter
-                .materialize(
-                    &prepared.relation,
-                    match prepared.materialization {
-                        Materialization::Table => PostgresMaterialization::Table,
-                        Materialization::View => PostgresMaterialization::View,
-                    },
-                    &prepared.sql,
-                    allow_replace,
-                )
-                .map_err(map_execution_error)?;
-            variables = next_variables;
-            completed_nodes.push(RunNodeResult {
-                id: prepared.id,
-                relation: prepared.relation,
-                materialization: match prepared.materialization {
-                    Materialization::Table => "table",
-                    Materialization::View => "view",
+            let node_started = Instant::now();
+            let step = (|| {
+                let (prepared, next_variables) =
+                    render_sql_node(&root, node, &variables, &template_options, &relations)?;
+                if prepared.sql.trim().is_empty() {
+                    return Err(DowaiError::Template(format!(
+                        "{} renders to an empty SQL statement",
+                        prepared.id
+                    )));
                 }
-                .to_owned(),
-                status: "SUCCEEDED".to_owned(),
-            });
+                store.validate_variables(&next_variables)?;
+                adapter
+                    .materialize(
+                        &prepared.relation,
+                        match prepared.materialization {
+                            Materialization::Table => PostgresMaterialization::Table,
+                            Materialization::View => PostgresMaterialization::View,
+                        },
+                        &prepared.sql,
+                        allow_replace,
+                    )
+                    .map_err(map_execution_error)?;
+                Ok((prepared, next_variables))
+            })();
+            match step {
+                Ok((prepared, next_variables)) => {
+                    trace.node(node, mode, "SUCCEEDED", node_started, None);
+                    variables = next_variables;
+                    completed_nodes.push(RunNodeResult {
+                        id: prepared.id,
+                        relation: prepared.relation,
+                        materialization: match prepared.materialization {
+                            Materialization::Table => "table",
+                            Materialization::View => "view",
+                        }
+                        .to_owned(),
+                        status: "SUCCEEDED".to_owned(),
+                    });
+                }
+                Err(error) => {
+                    trace.node(node, mode, "FAILED", node_started, Some(&error));
+                    trace.python = std::mem::take(&mut executor.invocations);
+                    trace.skip(&execution_plan.nodes[index + 1..], mode);
+                    return Err(error);
+                }
+            }
         }
         let session = match prior_session {
             Some(session) => session,
@@ -270,7 +460,7 @@ pub fn run_postgres(project_dir: &Path, request: RunRequest) -> Result<RunResult
         return Ok(RunResult {
             schema_version: 2,
             session_id: session.session_id,
-            run_id: Uuid::new_v4().to_string(),
+            run_id: run_id.to_owned(),
             invocation_id: run_invocation_id,
             status: "SUCCEEDED".to_owned(),
             execution_mode: execution_plan.execution_mode,
@@ -298,14 +488,23 @@ pub fn run_postgres(project_dir: &Path, request: RunRequest) -> Result<RunResult
         .map_err(|error| DowaiError::Connection(error.to_string()))?;
     let allow_replace = replacement_approval(&configuration, request.confirm_destructive)?;
     let mut completed_nodes = Vec::with_capacity(prepared.nodes.len());
-    for node in &prepared.nodes {
+    for (index, node) in prepared.nodes.iter().enumerate() {
         let materialization = match node.materialization {
             Materialization::Table => PostgresMaterialization::Table,
             Materialization::View => PostgresMaterialization::View,
         };
-        adapter
+        let node_started = Instant::now();
+        // `prepared.nodes` mirrors `execution_plan.nodes` one to one.
+        let plan_node = &execution_plan.nodes[index];
+        if let Err(error) = adapter
             .materialize(&node.relation, materialization, &node.sql, allow_replace)
-            .map_err(map_execution_error)?;
+            .map_err(map_execution_error)
+        {
+            trace.node(plan_node, mode, "FAILED", node_started, Some(&error));
+            trace.skip(&execution_plan.nodes[index + 1..], mode);
+            return Err(error);
+        }
+        trace.node(plan_node, mode, "SUCCEEDED", node_started, None);
         completed_nodes.push(RunNodeResult {
             id: node.id.clone(),
             relation: node.relation.clone(),
@@ -326,8 +525,8 @@ pub fn run_postgres(project_dir: &Path, request: RunRequest) -> Result<RunResult
     Ok(RunResult {
         schema_version: 2,
         session_id: session.session_id,
-        run_id: Uuid::new_v4().to_string(),
-        invocation_id: Uuid::new_v4().to_string(),
+        run_id: run_id.to_owned(),
+        invocation_id: trace.root_invocation_id.clone(),
         status: "SUCCEEDED".to_owned(),
         execution_mode: execution_plan.execution_mode,
         duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -733,6 +932,15 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
+            // The run journal writes to the user state directory; point it at a
+            // process-private directory once so unit tests never touch the real one.
+            static ISOLATED_STATE: std::sync::Once = std::sync::Once::new();
+            ISOLATED_STATE.call_once(|| {
+                let state = std::env::temp_dir()
+                    .join(format!("dowai-runtime-unit-state-{}", std::process::id()));
+                std::env::set_var("XDG_STATE_HOME", &state);
+                std::env::set_var("LOCALAPPDATA", &state);
+            });
             let nonce = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("clock is after Unix epoch")

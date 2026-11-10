@@ -1,8 +1,9 @@
 use clap::{Args, Parser, Subcommand};
 use dowai_core::{
-    admin_config_path, create_project, default_session_store_path, plan,
+    admin_config_path, create_project, default_run_store_path, default_session_store_path, plan,
     resolve_effective_configuration, user_config_path, validate_project_with_configuration,
-    DowaiError, ExecutionMode, Result, SessionMetadata, SessionStore, TemplateOptions,
+    DowaiError, ExecutionMode, Result, RunDetail, RunStore, RunSummary, SessionMetadata,
+    SessionStore, TemplateOptions,
 };
 use dowai_runtime::{check_postgres_connection, prepare_postgres_plan, run_postgres, RunRequest};
 use serde_json::{json, Value};
@@ -12,6 +13,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 const DEFAULT_SESSION_TTL_SECONDS: u64 = 86_400;
+const DEFAULT_RUNS_LIMIT: usize = 20;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -39,6 +41,27 @@ enum Command {
         command: ConfigCommand,
     },
     Run(RunArgs),
+    Runs {
+        #[command(subcommand)]
+        command: RunsCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RunsCommand {
+    /// List recent runs, newest first.
+    List {
+        #[arg(long, default_value_t = DEFAULT_RUNS_LIMIT)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one run with its invocations.
+    Show {
+        run_id: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -313,6 +336,12 @@ fn dispatch(command: Command) -> Result<Option<Value>> {
             })?;
             dispatch_session(command, &SessionStore::for_user_state(path))
         }
+        Command::Runs { command } => {
+            let path = default_run_store_path().ok_or_else(|| {
+                DowaiError::State("No user state directory is available".to_owned())
+            })?;
+            dispatch_runs(command, &RunStore::for_user_state(path))
+        }
         Command::Config { command } => match command {
             ConfigCommand::Show {
                 effective,
@@ -428,6 +457,94 @@ fn wants_json(command: &Command) -> bool {
             ConfigCommand::Show { json, .. } => *json,
         },
         Command::Run(args) => args.json,
+        Command::Runs { command } => match command {
+            RunsCommand::List { json, .. } | RunsCommand::Show { json, .. } => *json,
+        },
+    }
+}
+
+fn dispatch_runs(command: RunsCommand, store: &RunStore) -> Result<Option<Value>> {
+    match command {
+        RunsCommand::List { limit, json } => {
+            let runs = store.list(limit)?;
+            if json {
+                return Ok(Some(json!({
+                    "schema_version": 2,
+                    "limit": limit,
+                    "runs": runs
+                })));
+            }
+            if runs.is_empty() {
+                println!("No runs recorded.");
+            }
+            for run in &runs {
+                print_run_line(run);
+            }
+            Ok(None)
+        }
+        RunsCommand::Show { run_id, json } => {
+            validate_run_id(&run_id)?;
+            let detail = store.get(&run_id)?;
+            if json {
+                return Ok(Some(json!({ "schema_version": 2, "run": detail })));
+            }
+            print_run_detail(&detail);
+            Ok(None)
+        }
+    }
+}
+
+fn print_run_line(run: &RunSummary) {
+    println!(
+        "{}  {}  {}  {} ms  {}{}",
+        run.run_id,
+        run.status,
+        run.started_at,
+        run.duration_ms,
+        run.project,
+        run.error_code
+            .as_deref()
+            .map(|code| format!("  {code}"))
+            .unwrap_or_default()
+    );
+}
+
+fn print_run_detail(detail: &RunDetail) {
+    print_run_line(&detail.run);
+    println!(
+        "Mode: {}  Session: {}",
+        detail.run.execution_mode.as_deref().unwrap_or("-"),
+        detail.run.session_id.as_deref().unwrap_or("-")
+    );
+    println!("Invocations: {}", detail.invocations.len());
+    for entry in &detail.invocations {
+        println!(
+            "  {} {} {} {} {} ms{}",
+            entry.status,
+            entry.kind,
+            entry.call_type,
+            entry.target,
+            entry.duration_ms,
+            entry
+                .error_code
+                .as_deref()
+                .map(|code| format!("  {code}"))
+                .unwrap_or_default()
+        );
+    }
+}
+
+/// Run ids are UUIDs (8-4-4-4-12 hexadecimal digits).
+fn validate_run_id(run_id: &str) -> Result<()> {
+    let groups: Vec<&str> = run_id.split('-').collect();
+    let valid = groups.len() == 5
+        && [8, 4, 4, 4, 12].iter().zip(&groups).all(|(length, group)| {
+            group.len() == *length && group.bytes().all(|byte| byte.is_ascii_hexdigit())
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(DowaiError::Config("Run id must be a UUID".to_owned()))
     }
 }
 
