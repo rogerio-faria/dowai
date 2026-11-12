@@ -337,3 +337,56 @@ fn supports_identifier_names_and_json_scalar_comparisons() {
     assert_eq!(rendered.sql, "n");
     assert_eq!(rendered.variables.get("flag"), Some(&Value::Bool(false)));
 }
+
+#[test]
+fn every_dowai_alias_form_matches_its_standard_form() {
+    // D16 (ADR 0004): each alias form renders exactly like the standard form.
+    let variables = BTreeMap::from([("mode".to_owned(), json!("delta"))]);
+    let cases = [
+        (
+            "{% if var('mode') == 'full' %}A{% elif var('mode') == 'delta' %}B{% else %}C{% endif %}",
+            "{{ if var('mode') == 'full' }}A{{ elif var('mode') == 'delta' }}B{{ else }}C{{ endif }}",
+            "B",
+        ),
+        (
+            "{% def_var('limit', 10) %}{% if var('limit', 0) == 10 %}ok{% endif %}",
+            "{{ def_var('limit', 10) }}{{ if var('limit', 0) == 10 }}ok{{ endif }}",
+            "ok",
+        ),
+    ];
+    for (standard, alias, expected) in cases {
+        let standard = render_template(standard, &variables, &TemplateOptions::default())
+            .expect("standard form should render");
+        let alias = render_template(alias, &variables, &TemplateOptions::default())
+            .expect("alias form should render");
+        assert_eq!(standard.sql, alias.sql);
+        assert_eq!(standard.sql, expected);
+    }
+}
+
+#[test]
+fn dbt_constructs_outside_the_supported_subset_are_rejected() {
+    for source in [
+        "{% macro helper() %}x{% endmacro %}",
+        "{% for item in var('items') %}x{% endfor %}",
+        "{{ env_var('HOME') }}",
+        "{{ ref('a', 'b') }}",
+    ] {
+        let error = render(source).expect_err("unsupported dbt construct must fail");
+        assert_eq!(error.code(), "DOWAI_TEMPLATE_INVALID", "source: {source}");
+    }
+    for source in [
+        "{{ config(materialized='incremental') }}select 1",
+        "{{ config(materialized='table', unique_key='id') }}select 1",
+        "{{ config(materialized='ephemeral') }}select 1",
+    ] {
+        let error = render_sql_model(
+            source,
+            &BTreeMap::new(),
+            &TemplateOptions::default(),
+            &BTreeMap::new(),
+        )
+        .expect_err("unsupported config must fail");
+        assert_eq!(error.code(), "DOWAI_TEMPLATE_INVALID", "source: {source}");
+    }
+}
