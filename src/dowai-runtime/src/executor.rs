@@ -7,6 +7,7 @@ use crate::python_runtime::{
     self, ChildCall, ChildOutcome, DatasetAnswer, DatasetColumn, HostReply, HostRequest,
     ModelInvocation,
 };
+use crate::resources;
 use crate::{resolve_execution_mode, resolve_python_model_path, InvocationRecord};
 use dowai_core::state::NodeStatus;
 use dowai_core::{
@@ -372,6 +373,9 @@ impl<'a> Executor<'a> {
             deadline = deadline.min(cap);
         }
         let (root, interpreter) = (self.root, self.interpreter);
+        // ENT-038: limites do worker resolvidos antes de iniciá-lo; `require` recusa aqui,
+        // sem executar código do usuário.
+        let limits = resources::worker_limits(self.configuration)?;
         let cancel = self.cancel.clone();
         self.stack.push(model_id.to_owned());
         let result = python_runtime::execute_model(
@@ -383,6 +387,7 @@ impl<'a> Executor<'a> {
                 dependencies: depends_on,
                 mode: mode.as_str(),
                 cancel: &cancel,
+                memory_bytes: limits.memory_bytes,
             },
             &variables,
             &mut |request| self.handle_request(request, invocation_id, deadline, depends_on),

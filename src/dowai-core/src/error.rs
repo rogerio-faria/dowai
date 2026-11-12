@@ -45,6 +45,8 @@ pub enum DowaiError {
     PythonTimeout(String),
     PythonProtocol(String),
     Policy(String),
+    /// A resource limit that the platform cannot enforce, under `python.resource_enforcement = require` (ENT-038, D06).
+    ResourceUnsupported(String),
     /// The run was cancelled by the user (Ctrl+C, SIGTERM) or through the API.
     Cancelled(String),
     Validation {
@@ -90,6 +92,7 @@ impl DowaiError {
             Self::PythonTimeout(_) => "DOWAI_PYTHON_TIMEOUT",
             Self::PythonProtocol(_) => "DOWAI_PYTHON_PROTOCOL",
             Self::Policy(_) => "DOWAI_POLICY_DENIED",
+            Self::ResourceUnsupported(_) => "DOWAI_RESOURCE_UNSUPPORTED",
             Self::Cancelled(_) => "DOWAI_CANCELLED",
             Self::Validation { .. } => "DOWAI_CONFIG_INVALID",
             Self::NotImplemented(_) => "DOWAI_NOT_IMPLEMENTED",
@@ -123,6 +126,7 @@ impl DowaiError {
             | Self::PythonTimeout(_)
             | Self::PythonProtocol(_)
             | Self::ModelChanged(_)
+            | Self::ResourceUnsupported(_)
             | Self::DatasetAccess { .. } => ec::EXECUTION_FAILED,
             Self::NotImplemented(_) => ec::NOT_IMPLEMENTED,
             Self::Cancelled(_) => ec::CANCELLED,
@@ -148,6 +152,7 @@ impl DowaiError {
             | Self::PythonTimeout(message)
             | Self::PythonProtocol(message)
             | Self::Policy(message)
+            | Self::ResourceUnsupported(message)
             | Self::Cancelled(message)
             | Self::NotImplemented(message)
             | Self::DatasetAccess { message, .. }

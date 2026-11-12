@@ -401,6 +401,8 @@ pub(crate) struct ModelInvocation<'a> {
     pub dependencies: &'a [String],
     pub mode: &'a str,
     pub cancel: &'a CancellationToken,
+    /// `RLIMIT_AS` do worker (ENT-038, D06); `None` quando o limite não se aplica.
+    pub memory_bytes: Option<u64>,
 }
 
 type RequestHandler<'a> = dyn FnMut(HostRequest) -> HostReply + 'a;
@@ -434,6 +436,7 @@ pub(crate) fn execute_model(
         .stderr(Stdio::null());
     apply_worker_environment(&mut command);
     configure_process_group(&mut command);
+    configure_memory_limit(&mut command, invocation.memory_bytes);
     let mut child = command
         .spawn()
         .map_err(|_| python_failure("Could not start the configured project interpreter"))?;
@@ -802,6 +805,44 @@ fn apply_worker_environment(command: &mut Command) {
     }
     command.env("PYTHONDONTWRITEBYTECODE", "1");
 }
+
+/// Aplica `RLIMIT_AS` ao worker antes do `exec` (Linux, ENT-038). O limite é gravado como
+/// soft e hard, sem ultrapassar o hard limit herdado, porque reduzir o hard é irreversível.
+#[cfg(unix)]
+fn configure_memory_limit(command: &mut Command, memory_bytes: Option<u64>) {
+    use std::os::unix::process::CommandExt;
+    let Some(requested) = memory_bytes else {
+        return;
+    };
+    // SAFETY: the closure runs between fork and exec and only calls getrlimit/setrlimit,
+    // which are async-signal-safe and allocate nothing.
+    unsafe {
+        command.pre_exec(move || {
+            let mut current = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::getrlimit(libc::RLIMIT_AS, &mut current) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let mut target = requested as libc::rlim_t;
+            if current.rlim_max != libc::RLIM_INFINITY && target > current.rlim_max {
+                target = current.rlim_max;
+            }
+            let limit = libc::rlimit {
+                rlim_cur: target,
+                rlim_max: target,
+            };
+            if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn configure_memory_limit(_command: &mut Command, _memory_bytes: Option<u64>) {}
 
 #[cfg(unix)]
 fn configure_process_group(command: &mut Command) {

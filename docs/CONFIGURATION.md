@@ -179,12 +179,12 @@ Unidades e limites aparecem na tabela. Limites mínimos e máximos são inclusiv
 
 | Parâmetro | Default | Tipo e validação | Unidade | Teto administrativo | Estado |
 |---|---|---|---|---|---|
-| `runtime.max_parallel_nodes` | `4` | inteiro 1–256 | nós | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
-| `runtime.max_worker_processes` | `4` | inteiro 1–64 | processos | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
-| `runtime.max_threads` | `8` | inteiro 1–256 | threads | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
-| `runtime.max_cpu_percent` | `100` | inteiro 1–100 | % de CPU | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
-| `runtime.max_memory_mb` | `2048` | inteiro 64–1048576 | MiB | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
-| `runtime.max_inflight_bytes` | `134217728` | inteiro 1–1099511627776 | bytes | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `runtime.max_parallel_nodes` | `4` | inteiro 1–256 | nós | não pode exceder o teto administrativo | validado; aplicado pelo scheduler: nós em sequência, concorrência efetiva 1 (ENT-038, D-060); aviso em `warnings` quando há nós independentes e o limite é maior que 1 |
+| `runtime.max_worker_processes` | `4` | inteiro 1–64 | processos | não pode exceder o teto administrativo | um worker Python por vez (ENT-038, D-060); aviso junto de `max_parallel_nodes` |
+| `runtime.max_threads` | `8` | inteiro 1–256 | threads | não pode exceder o teto administrativo | validado; **sem enforcement nem aviso ainda** (pendente ENT-104) |
+| `runtime.max_cpu_percent` | `100` | inteiro 1–100 | % de CPU | não pode exceder o teto administrativo | `not_enforced` em todas as plataformas nesta versão (D06); abaixo de 100 gera aviso e, com `require`, recusa o worker |
+| `runtime.max_memory_mb` | `2048` | inteiro 64–1048576 | MiB | não pode exceder o teto administrativo | Linux: `RLIMIT_AS` por worker Python (memória **virtual**, estado `partial`); fora do Linux `not_enforced` até ENT-093. Bibliotecas que reservam muita memória virtual podem precisar de valor maior |
+| `runtime.max_inflight_bytes` | `134217728` | inteiro 1–1099511627776 | bytes | não pode exceder o teto administrativo | validado; **sem enforcement nem aviso ainda** (pendente ENT-104) |
 | `runtime.queue_capacity` | `1000` | inteiro 1–1000000 | itens | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
 | `runtime.shutdown_grace_seconds` | `10` | inteiro 0–600 | s | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
 
@@ -305,7 +305,7 @@ Unidades e limites aparecem na tabela. Limites mínimos e máximos são inclusiv
 | `python.install_tool` | `"uv"` | enum: `uv` | — | — | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
 | `python.venv_path` | `".venv"` | texto não vazio | caminho relativo ao projeto | — | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
 | `python.max_threads` | `4` | inteiro 1–256 | threads | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
-| `python.resource_enforcement` | `"best_effort"` | enum: `best_effort`, `require` | — | — | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `python.resource_enforcement` | `"best_effort"` | enum: `best_effort`, `require` | — | — | `best_effort`: limites reportados em `warnings`. `require`: worker com limite solicitado e `not_enforced` não inicia, com `DOWAI_RESOURCE_UNSUPPORTED` (ENT-038) |
 
 ### `state`
 

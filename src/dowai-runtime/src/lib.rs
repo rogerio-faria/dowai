@@ -22,6 +22,7 @@ use uuid::Uuid;
 mod auditor;
 mod executor;
 mod python_runtime;
+mod resources;
 mod retry;
 
 #[derive(Clone, Debug)]
@@ -656,7 +657,7 @@ fn execute_run(
     trace.audit.config_hash = serde_json::to_vec(&configuration)
         .ok()
         .map(|bytes| sha256_hex(&bytes));
-    let execution_plan = restrict_plan(plan(&root, &request.targets, mode)?, selection)?;
+    let mut execution_plan = restrict_plan(plan(&root, &request.targets, mode)?, selection)?;
     trace.audit.plan_hash = serde_json::to_vec(&execution_plan)
         .ok()
         .map(|bytes| sha256_hex(&bytes));
@@ -666,6 +667,11 @@ fn execute_run(
             "The execution plan contains no models".to_owned(),
         ));
     }
+    // ENT-038: limites não aplicados ou parciais são reportados no resultado do run.
+    execution_plan.warnings.extend(resources::run_warnings(
+        &configuration,
+        &execution_plan.nodes,
+    )?);
     let python_nodes = execution_plan
         .nodes
         .iter()
