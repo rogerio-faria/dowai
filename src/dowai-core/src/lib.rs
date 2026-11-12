@@ -8,6 +8,7 @@ mod outbox;
 pub mod package_policy;
 mod planner;
 pub mod plugin_manifest;
+pub mod plugin_registry;
 mod project;
 mod python_ast;
 mod runs;
@@ -33,6 +34,10 @@ pub use outbox::{
 pub use planner::{
     plan, read_planned_model, validate_plan_templates, verify_planned_model, ExecutionMode,
     ExecutionPlan, PlanNode,
+};
+pub use plugin_registry::{
+    discover, find_plugins, plugin_json, plugin_list_json, plugin_roots_from, resolve_call,
+    PluginCatalog, PluginScope,
 };
 pub use project::{
     create_project, load_project, validate_project, validate_project_with_configuration,

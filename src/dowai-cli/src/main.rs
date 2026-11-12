@@ -1,12 +1,12 @@
 use clap::{Args, Parser, Subcommand};
 use dowai_core::{
     admin_config_path, check_compatibility, create_project, default_run_store_path,
-    default_session_store_path, filter_invocations, invocation_depths, plan,
-    resolve_effective_configuration, session_ttl_from_config, user_config_path,
-    validate_project_with_configuration, CancellationToken, CompatibilityReport,
-    CompatibilityStatus, DowaiError, ExecutionMode, InvocationEntry, LogLevel, Result,
-    RevisionSnapshot, RunDetail, RunStore, RunSummary, SessionMetadata, SessionStore,
-    TemplateOptions,
+    default_session_store_path, discover, filter_invocations, find_plugins, invocation_depths,
+    plan, plugin_json, plugin_list_json, plugin_roots_from, resolve_effective_configuration,
+    session_ttl_from_config, user_config_path, validate_project_with_configuration,
+    CancellationToken, CompatibilityReport, CompatibilityStatus, DowaiError, ExecutionMode,
+    InvocationEntry, LogLevel, PluginCatalog, PluginScope, Result, RevisionSnapshot, RunDetail,
+    RunStore, RunSummary, SessionMetadata, SessionStore, TemplateOptions,
 };
 use dowai_runtime::{
     check_postgres_connection, check_python_runtime, check_python_sdk, declared_default_profile,
@@ -73,12 +73,35 @@ enum Command {
         #[command(subcommand)]
         command: CompatibilityCommand,
     },
+    /// List and inspect plugins of the project and of the workspace (ENT-053). Only manifests
+    /// are read; no plugin code is imported or executed.
+    Plugins {
+        #[command(subcommand)]
+        command: PluginsCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 enum CompatibilityCommand {
     Check {
         project_path: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PluginsCommand {
+    /// List plugins; `--scope` selects project, global or all (default).
+    List {
+        #[arg(long, default_value = "all")]
+        scope: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the manifest data of every plugin with this ID, with its origin.
+    Info {
+        id: String,
         #[arg(long)]
         json: bool,
     },
@@ -541,6 +564,7 @@ fn dispatch(command: Command) -> Result<Option<Value>> {
                 }
             }
         },
+        Command::Plugins { command } => dispatch_plugins(command),
         Command::Config { command } => match command {
             ConfigCommand::Show {
                 effective,
@@ -740,6 +764,83 @@ fn wants_json(command: &Command) -> bool {
         Command::Compatibility { command } => match command {
             CompatibilityCommand::Check { json, .. } => *json,
         },
+        Command::Plugins { command } => match command {
+            PluginsCommand::List { json, .. } | PluginsCommand::Info { json, .. } => *json,
+        },
+    }
+}
+
+/// `plugins list|info` (ENT-053). Descoberta só lê manifestos; falha de escopo, ID duplicado no
+/// mesmo nível ou ID inexistente são erros; manifesto inválido aparece em `rejected`.
+fn dispatch_plugins(command: PluginsCommand) -> Result<Option<Value>> {
+    let roots = plugin_roots_from(&std::env::current_dir()?);
+    match command {
+        PluginsCommand::List { scope, json } => {
+            let scope = PluginScope::parse(&scope)?;
+            let catalog = discover(&roots, scope)?;
+            if json {
+                return Ok(Some(plugin_list_json(scope, &catalog)));
+            }
+            print_plugin_list(&catalog);
+            Ok(None)
+        }
+        PluginsCommand::Info { id, json } => {
+            let catalog = discover(&roots, PluginScope::All)?;
+            let found = find_plugins(&catalog, &id);
+            if found.is_empty() {
+                return Err(DowaiError::Config(format!("plugin não encontrado: {id}")));
+            }
+            if json {
+                return Ok(Some(json!({
+                    "schema_version": dowai_core::plugin_registry::PLUGIN_LIST_SCHEMA_VERSION,
+                    "plugins": found.iter().map(|plugin| plugin_json(plugin)).collect::<Vec<_>>(),
+                })));
+            }
+            for plugin in found {
+                let manifest = &plugin.manifest;
+                println!(
+                    "{} {} [{}]",
+                    manifest.id,
+                    manifest.version,
+                    plugin.origin.as_str()
+                );
+                println!("  manifest: {}", manifest.manifest_path.display());
+                println!("  sha256: {}", manifest.manifest_sha256);
+                for (method, target) in &manifest.entrypoints {
+                    println!("  method: {method} -> {target}");
+                }
+            }
+            Ok(None)
+        }
+    }
+}
+
+fn print_plugin_list(catalog: &PluginCatalog) {
+    if catalog.plugins.is_empty() && catalog.rejected.is_empty() {
+        println!("No plugins found.");
+    }
+    for plugin in &catalog.plugins {
+        let methods: Vec<&str> = plugin
+            .manifest
+            .entrypoints
+            .keys()
+            .map(String::as_str)
+            .collect();
+        println!(
+            "{} {} [{}] methods: {}",
+            plugin.manifest.id,
+            plugin.manifest.version,
+            plugin.origin.as_str(),
+            methods.join(", ")
+        );
+    }
+    for rejected in &catalog.rejected {
+        println!(
+            "REJECTED [{}] {}: {}",
+            rejected.origin.as_str(),
+            rejected.path.display(),
+            rejected.message
+        );
     }
 }
 
