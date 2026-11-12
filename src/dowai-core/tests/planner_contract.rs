@@ -695,3 +695,44 @@ fn python_syntax_errors_fail_planning_with_a_stable_code() {
 
     assert_eq!(error.code(), "DOWAI_PLAN_INVALID");
 }
+
+#[test]
+fn missing_ref_in_unselected_branch_fails_planning() {
+    let project = TestProject::new();
+    project.write_model("a.sql", "select 1 as id");
+    project.write_model(
+        "consumer.sql",
+        "{% if var('enabled') %}select * from {{ ref('a') }}{% else %}select * from {{ ref('missing') }}{% endif %}",
+    );
+
+    let error = plan(
+        project.path(),
+        &["consumer.sql".into()],
+        ExecutionMode::Automatic,
+    )
+    .expect_err("a missing ref in an unselected branch must not be omitted");
+
+    assert_eq!(error.code(), "DOWAI_PLAN_INVALID");
+}
+
+#[test]
+fn dynamic_refs_in_either_conditional_branch_fail_planning() {
+    let bodies = [
+        "{% if var('enabled') %}select * from {{ ref(model_name) }}{% else %}select 1{% endif %}",
+        "{% if var('enabled') %}select 1{% else %}select * from {{ ref(model_name) }}{% endif %}",
+        "{% if var('enabled') %}select 1{% elif var('other') %}select * from {{ ref(model_name) }}{% endif %}",
+    ];
+    for body in bodies {
+        let project = TestProject::new();
+        project.write_model("consumer.sql", body);
+
+        let error = plan(
+            project.path(),
+            &["consumer.sql".into()],
+            ExecutionMode::Automatic,
+        )
+        .expect_err("a dynamic ref in any branch must fail planning");
+
+        assert_eq!(error.code(), "DOWAI_PLAN_INVALID", "body: {body}");
+    }
+}

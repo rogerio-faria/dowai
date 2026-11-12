@@ -391,3 +391,23 @@ fn dbt_constructs_outside_the_supported_subset_are_rejected() {
         assert_eq!(error.code(), "DOWAI_TEMPLATE_INVALID", "source: {source}");
     }
 }
+
+#[test]
+fn dynamic_source_arguments_in_any_branch_fail_rendering() {
+    let options = TemplateOptions::default();
+    let mut sources = BTreeMap::new();
+    sources.insert(
+        source_relation_key("sales", "orders"),
+        "\"staging\".\"orders\"".to_owned(),
+    );
+
+    let error = render_sql_model(
+        "{% if var('enabled') %}select 1{% else %}select * from {{ source(src_name, 'orders') }}{% endif %}",
+        &BTreeMap::new(),
+        &options,
+        &sources,
+    )
+    .expect_err("a dynamic source in an unselected branch must not be omitted");
+
+    assert_eq!(error.code(), "DOWAI_TEMPLATE_INVALID");
+}
