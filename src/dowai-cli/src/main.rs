@@ -12,7 +12,8 @@ use dowai_core::{
 use dowai_runtime::{
     check_postgres_connection, check_python_runtime, check_python_sdk, declared_default_profile,
     execute_plugin, prepare_postgres_plan, retry_run_detailed_with_cancel,
-    run_postgres_detailed_with_cancel, PluginExecution, RetryRequest, RunRequest, RunResult,
+    run_postgres_detailed_with_cancel, PluginExecution, PluginPolicy, RetryRequest, RunRequest,
+    RunResult, DEFAULT_MAX_OUTPUT_BYTES,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -883,6 +884,7 @@ fn dispatch_plugins(command: PluginsCommand) -> Result<Option<Value>> {
                 idempotency_key: idempotency_key.as_deref(),
                 store: store.as_ref(),
                 audit: audit.as_ref(),
+                policy: &plugins_execution_policy()?,
             })?;
             if json {
                 return Ok(Some(result));
@@ -913,6 +915,27 @@ fn plugins_allow_local_override() -> Result<bool> {
             .as_bool()
             .unwrap_or(false),
     )
+}
+
+/// Política de permissões e limites de saída da configuração efetiva (ENT-056).
+fn plugins_execution_policy() -> Result<PluginPolicy> {
+    let config_root = find_config_root(&std::env::current_dir()?);
+    let configuration = resolve_effective_configuration(
+        &config_root,
+        user_config_path().as_deref(),
+        admin_config_path().as_deref(),
+    )?;
+    let plugins = &configuration["effective"]["plugins"];
+    let flag = |key: &str| plugins[key].as_bool().unwrap_or(false);
+    Ok(PluginPolicy {
+        allow_network: flag("allow_network"),
+        allow_filesystem: flag("allow_filesystem"),
+        allow_secrets: flag("allow_secrets"),
+        max_output_bytes: plugins["max_output_bytes"]
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(DEFAULT_MAX_OUTPUT_BYTES),
+    })
 }
 
 /// `--input` as a JSON text; absent means an empty object. The executor requires an object.

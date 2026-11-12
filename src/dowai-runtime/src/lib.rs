@@ -10,7 +10,7 @@ use dowai_postgres::{
     quote_identifier, AdapterError, Materialization as PostgresMaterialization, PgProfile,
     PostgresAdapter, TlsMode,
 };
-pub use plugin_exec::{execute_plugin, PluginExecution};
+pub use plugin_exec::{execute_plugin, PluginExecution, PluginPolicy, DEFAULT_MAX_OUTPUT_BYTES};
 use retry::{run_with_retry, wait_unless_cancelled, RetryPolicy};
 use serde::Serialize;
 use serde_json::Value;

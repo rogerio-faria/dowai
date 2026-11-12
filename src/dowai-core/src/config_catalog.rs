@@ -417,6 +417,22 @@ pub static PARAMETERS: &[Parameter] = &[
     ),
     p(
         "plugins",
+        "allow_secrets",
+        BoolKind,
+        Bool(false),
+        "",
+        DenyIfAdminFalse,
+    ),
+    p(
+        "plugins",
+        "max_output_bytes",
+        int(1024, 67_108_864),
+        Int(1_048_576),
+        "bytes",
+        Maximum,
+    ),
+    p(
+        "plugins",
         "require_idempotency_key",
         BoolKind,
         Bool(true),

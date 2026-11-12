@@ -49,6 +49,8 @@ class CliParityTests(unittest.TestCase):
         interpreter = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
         manifest["python"] = {"interpreter": str(interpreter), "timeout_seconds": 30}
         manifest.setdefault("config", {}).setdefault("security", {})["allow_external_writes"] = True
+        # ENT-056: plugins que escrevem arquivo declaram `filesystem` e a política os permite.
+        manifest["config"].setdefault("plugins", {})["allow_filesystem"] = True
         manifest_path.write_text(json.dumps(manifest))
         (cls.project / "models" / "ok.py").write_text(
             "def model(env):\n    env.setVar('x', 1)\n"
@@ -101,7 +103,11 @@ class CliParityTests(unittest.TestCase):
                     "id": plugin_id,
                     "version": "1.0.0",
                     "entrypoints": {"run": "main:run"},
-                    "permissions": {"network": [], "filesystem": [], "secrets": []},
+                    "permissions": {
+                        "network": [],
+                        "filesystem": ["effects"] if effects else [],
+                        "secrets": [],
+                    },
                     "timeout_seconds": 30,
                     "side_effects": effects,
                     "idempotency_key_required": effects,

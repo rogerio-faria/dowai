@@ -46,6 +46,8 @@
       "default_timeout_seconds": 300,
       "allow_network": false,
       "allow_filesystem": false,
+      "allow_secrets": false,
+      "max_output_bytes": 1048576,
       "require_idempotency_key": true
     },
     "logging": {

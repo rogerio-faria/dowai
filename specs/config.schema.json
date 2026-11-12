@@ -303,6 +303,8 @@
             "default_timeout_seconds",
             "allow_network",
             "allow_filesystem",
+            "allow_secrets",
+            "max_output_bytes",
             "require_idempotency_key"
           ],
           "properties": {
@@ -339,6 +341,18 @@
               "type": "boolean",
               "default": false,
               "x-unit": ""
+            },
+            "allow_secrets": {
+              "type": "boolean",
+              "default": false,
+              "x-unit": ""
+            },
+            "max_output_bytes": {
+              "type": "integer",
+              "minimum": 1024,
+              "maximum": 67108864,
+              "default": 1048576,
+              "x-unit": "bytes"
             },
             "require_idempotency_key": {
               "type": "boolean",

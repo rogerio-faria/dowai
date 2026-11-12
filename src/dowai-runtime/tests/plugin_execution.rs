@@ -4,7 +4,7 @@
 use dowai_core::plugin_registry::{discover, resolve_call, PluginRoots, PluginScope};
 use dowai_core::state::OutboxStatus;
 use dowai_core::{AuditLog, DowaiError, RunStore};
-use dowai_runtime::{execute_plugin, PluginExecution};
+use dowai_runtime::{execute_plugin, PluginExecution, PluginPolicy};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -36,7 +36,7 @@ impl Fixture {
             "id": id,
             "version": if scope == "project" { "2.0.0" } else { "1.0.0" },
             "entrypoints": { "send": "main:send" },
-            "permissions": { "network": [], "filesystem": [], "secrets": [] },
+            "permissions": { "network": [], "filesystem": ["effects"], "secrets": [] },
             "timeout_seconds": timeout,
             "side_effects": required,
             "idempotency_key_required": required,
@@ -78,6 +78,10 @@ impl Fixture {
             idempotency_key: key,
             store: Some(&store),
             audit: Some(&audit),
+            policy: &PluginPolicy {
+                allow_filesystem: true,
+                ..PluginPolicy::default()
+            },
         })
     }
 
@@ -229,10 +233,11 @@ fn timeout_kills_the_process_group_and_leaves_no_orphan() {
         1,
         false,
         &format!(
-            "import subprocess, time\n\
+            "import os, time\n\
              def send(**kw):\n    \
-                 child = subprocess.Popen(['sleep', '60'])\n    \
-                 open({:?}, 'w').write(str(child.pid))\n    \
+                 child = os.fork()\n    \
+                 if child == 0:\n        time.sleep(60)\n        os._exit(0)\n    \
+                 open({:?}, 'w').write(str(child))\n    \
                  time.sleep(60)\n",
             pid_file.display().to_string()
         ),
@@ -274,10 +279,11 @@ fn descendants_left_behind_by_a_finished_plugin_are_stopped() {
         30,
         false,
         &format!(
-            "import subprocess\n\
+            "import os, time\n\
              def send(**kw):\n    \
-                 child = subprocess.Popen(['sleep', '60'])\n    \
-                 open({:?}, 'w').write(str(child.pid))\n    \
+                 child = os.fork()\n    \
+                 if child == 0:\n        time.sleep(60)\n        os._exit(0)\n    \
+                 open({:?}, 'w').write(str(child))\n    \
                  return 1\n",
             pid_file.display().to_string()
         ),

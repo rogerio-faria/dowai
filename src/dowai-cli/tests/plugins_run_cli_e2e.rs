@@ -107,6 +107,22 @@ fn write_plugin(root: &Path, id: &str, timeout: u64, required: bool, source: &st
     fs::write(dir.join("sender.py"), source).expect("module");
 }
 
+/// Declara `filesystem` no manifesto do plugin e libera `plugins.allow_filesystem` no projeto (ENT-056).
+fn allow_filesystem_for(project: &Path, id: &str, resource: &str) {
+    let plugin_path = project.join("plugins").join(id).join("plugin.json");
+    let mut plugin: Value =
+        serde_json::from_str(&fs::read_to_string(&plugin_path).expect("read plugin"))
+            .expect("json");
+    plugin["permissions"]["filesystem"] = json!([resource]);
+    fs::write(&plugin_path, plugin.to_string()).expect("write plugin");
+    let manifest_path = project.join("dowai_project.json");
+    let mut manifest: Value =
+        serde_json::from_str(&fs::read_to_string(&manifest_path).expect("read manifest"))
+            .expect("manifest JSON");
+    manifest["config"]["plugins"]["allow_filesystem"] = Value::Bool(true);
+    fs::write(&manifest_path, manifest.to_string()).expect("write manifest");
+}
+
 fn stdout_json(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
         panic!(
@@ -202,6 +218,7 @@ fn missing_key_exit_code_and_repeated_key_do_not_repeat_the_effect() {
             effects.display().to_string()
         ),
     );
+    allow_filesystem_for(&project, "email", "effects");
 
     let refused = sandbox.command(&project, &["plugins", "run", "email.send", "--json"]);
     assert_eq!(refused.status.code(), Some(2));
@@ -292,4 +309,32 @@ fn invalid_input_text_is_refused_with_the_input_code() {
             "DOWAI_PLUGIN_INPUT_INVALID"
         );
     }
+}
+
+#[test]
+fn declared_network_without_policy_is_refused_with_exit_5_and_never_runs() {
+    let sandbox = Sandbox::new();
+    let project = sandbox.project();
+    let marker = sandbox.0.join("imported.flag");
+    write_plugin(
+        &project,
+        "email",
+        30,
+        false,
+        &format!(
+            "open({:?}, 'w').close()\ndef send(**kw):\n    return {{}}\n",
+            marker.display().to_string()
+        ),
+    );
+    let plugin_path = project.join("plugins").join("email").join("plugin.json");
+    let mut plugin: Value =
+        serde_json::from_str(&fs::read_to_string(&plugin_path).expect("read plugin"))
+            .expect("json");
+    plugin["permissions"]["network"] = json!(["mail_gateway"]);
+    fs::write(&plugin_path, plugin.to_string()).expect("write plugin");
+
+    let output = sandbox.command(&project, &["plugins", "run", "email.send", "--json"]);
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(stdout_json(&output)["error_code"], "DOWAI_POLICY_DENIED");
+    assert!(!marker.exists());
 }

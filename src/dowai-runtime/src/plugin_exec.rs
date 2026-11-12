@@ -10,8 +10,13 @@
 //! execução é registrada na outbox (ENT-051). Chave já confirmada devolve `DUPLICATE` sem
 //! executar. Chave em `FAILED`, `UNCERTAIN` ou `SENT` nunca é reexecutada.
 //!
-//! Fora do escopo (ENT-056): permissões granulares, limites de stdout/stderr e saneamento de logs.
-//! Aqui o stdout é lido com limite fixo e o stderr é descartado.
+//! Permissões (ENT-056): o manifesto declara `network`, `filesystem` e `secrets`. Uma permissão
+//! só é concedida quando o manifesto a declara **e** a política efetiva (`plugins.allow_network`,
+//! `plugins.allow_filesystem`, `plugins.allow_secrets`) a permite. Declarado e não permitido recusa
+//! a execução com `DOWAI_POLICY_DENIED` antes de qualquer código do plugin rodar. Não declarado é
+//! negado no worker. O bloqueio no worker é cooperativo (hook de auditoria do Python): reduz o
+//! acesso acidental ou não autorizado de código do plugin, mas não é sandbox contra código hostil.
+//! Stderr do plugin nunca é capturado; stdout é limitado por `plugins.max_output_bytes`.
 
 use crate::python_runtime::{
     apply_worker_environment, attach_process_tree, configure_process_group, terminate_descendants,
@@ -37,8 +42,8 @@ pub const PLUGIN_RUN_SCHEMA_VERSION: u32 = 1;
 
 /// Tamanho máximo da entrada JSON enviada ao plugin.
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
-/// Tamanho máximo do resultado JSON lido do stdout. Limites configuráveis são do ENT-056.
-const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+/// Tamanho máximo padrão do resultado JSON lido do stdout (`plugins.max_output_bytes`).
+pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_KEY_CHARS: usize = 64;
 const MAX_OUTBOX_KEY_CHARS: usize = 128;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -48,13 +53,112 @@ const READER_GRACE: Duration = Duration::from_secs(2);
 const EXIT_PLUGIN_RAISED: i32 = 10;
 const EXIT_UNSERIALIZABLE: i32 = 12;
 
-/// Worker: lê a entrada de stdin, carrega o módulo validado pelo caminho canônico e chama a
-/// função com a entrada como kwargs. O resultado é o único conteúdo escrito no stdout real.
+/// Política efetiva de execução de plugins, lida da configuração pelo chamador.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginPolicy {
+    pub allow_network: bool,
+    pub allow_filesystem: bool,
+    pub allow_secrets: bool,
+    pub max_output_bytes: usize,
+}
+
+impl Default for PluginPolicy {
+    /// Padrão da configuração: tudo negado e limite de saída de 1 MiB.
+    fn default() -> Self {
+        Self {
+            allow_network: false,
+            allow_filesystem: false,
+            allow_secrets: false,
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+        }
+    }
+}
+
+/// Permissões concedidas a uma execução: declaradas no manifesto e permitidas pela política.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Grants {
+    network: bool,
+    filesystem: bool,
+}
+
+impl Grants {
+    fn as_worker_arg(self) -> String {
+        format!(
+            "network={},filesystem={}",
+            u8::from(self.network),
+            u8::from(self.filesystem)
+        )
+    }
+}
+
+/// Decide as permissões. Declarado sem política recusa antes de qualquer processo existir.
+/// `banco` não é categoria do schema de manifesto e por isso é tratado como `network`.
+fn resolve_grants(
+    manifest: &dowai_core::plugin_manifest::PluginManifest,
+    policy: &PluginPolicy,
+) -> Result<Grants> {
+    let declares = &manifest.permissions;
+    let denied = |category: &str| {
+        Err(DowaiError::Policy(format!(
+            "Plugin {} declares {category} permission, which the effective policy does not allow",
+            manifest.id
+        )))
+    };
+    if !declares.network.is_empty() && !policy.allow_network {
+        return denied("network (plugins.allow_network = false)");
+    }
+    if !declares.filesystem.is_empty() && !policy.allow_filesystem {
+        return denied("filesystem (plugins.allow_filesystem = false)");
+    }
+    if !declares.secrets.is_empty() && !policy.allow_secrets {
+        return denied("secrets (plugins.allow_secrets = false)");
+    }
+    Ok(Grants {
+        network: !declares.network.is_empty() && policy.allow_network,
+        filesystem: !declares.filesystem.is_empty() && policy.allow_filesystem,
+    })
+}
+
+/// Worker: lê a entrada de stdin, instala o hook de permissões antes de qualquer código do
+/// plugin, carrega o módulo validado pelo caminho canônico e chama a função com a entrada como
+/// kwargs. O resultado é o único conteúdo escrito no stdout real.
 const WORKER: &str = r#"
 import sys, os, json, importlib.util, inspect
-path, module_name, function, plugin_dir = sys.argv[1:5]
+path, module_name, function, plugin_dir, grants = sys.argv[1:6]
+allow_network = "network=1" in grants.split(",")
+allow_filesystem = "filesystem=1" in grants.split(",")
 real_stdout = sys.stdout
 sys.stdout = open(os.devnull, "w")
+sys.dont_write_bytecode = True
+NETWORK_EVENTS = {
+    "socket.connect", "socket.sendto", "socket.sendmsg", "socket.bind",
+    "socket.getaddrinfo", "socket.gethostbyname", "socket.gethostbyaddr",
+}
+FILE_MUTATION_EVENTS = {
+    "os.remove", "os.rename", "os.replace", "os.mkdir", "os.rmdir",
+    "os.link", "os.symlink", "os.truncate", "shutil.rmtree",
+}
+WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_TRUNC
+PROCESS_EVENTS = {
+    "subprocess.Popen", "os.system", "os.posix_spawn", "os.spawn", "os.exec",
+}
+def _guard(event, args):
+    if event in PROCESS_EVENTS or event.startswith("os.exec") or event.startswith("os.spawn"):
+        raise PermissionError("process creation is not permitted for plugins")
+    if event in NETWORK_EVENTS and not allow_network:
+        raise PermissionError("network access is not permitted for this plugin")
+    if allow_filesystem:
+        return
+    if event in FILE_MUTATION_EVENTS:
+        raise PermissionError("filesystem changes are not permitted for this plugin")
+    if event == "open":
+        mode = args[1]
+        flags = args[2]
+        writes = isinstance(mode, str) and any(c in mode for c in "wxa+")
+        writes = writes or (isinstance(flags, int) and bool(flags & WRITE_FLAGS))
+        if writes:
+            raise PermissionError("filesystem writes are not permitted for this plugin")
+sys.addaudithook(_guard)
 try:
     payload = json.loads(sys.stdin.read())
     sys.path.append(plugin_dir)
@@ -88,6 +192,8 @@ pub struct PluginExecution<'a> {
     pub store: Option<&'a RunStore>,
     /// AUDIT. Falha de escrita nunca altera o resultado; vira `audit_recorded: false`.
     pub audit: Option<&'a AuditLog>,
+    /// Política efetiva de permissões e limites (ENT-056).
+    pub policy: &'a PluginPolicy,
 }
 
 /// Falha após o início do subprocesso. `uncertain` indica que o efeito externo pode ter sido
@@ -139,6 +245,7 @@ fn is_refusal(code: &str) -> bool {
             | "DOWAI_PLUGIN_IDEMPOTENCY_UNCERTAIN"
             | "DOWAI_PLUGIN_IDEMPOTENCY_FAILED"
             | "DOWAI_POLICY_PATH"
+            | "DOWAI_POLICY_DENIED"
             | "DOWAI_CONFIG_INVALID"
     )
 }
@@ -186,6 +293,7 @@ fn run(execution: &PluginExecution<'_>) -> Result<Value> {
         .manifest_path
         .parent()
         .ok_or_else(|| DowaiError::Path("Plugin manifest has no directory".to_owned()))?;
+    let grants = resolve_grants(manifest, execution.policy)?;
     let (source, module, function) =
         resolve_entrypoint_file(plugin_dir, &call.method, &call.entrypoint)?;
     let working_dir = std::fs::canonicalize(plugin_dir)?;
@@ -214,6 +322,8 @@ fn run(execution: &PluginExecution<'_>) -> Result<Value> {
         &input,
         &target,
         manifest.timeout_seconds,
+        grants,
+        execution.policy.max_output_bytes,
     );
     match launched {
         Ok(result) => {
@@ -347,6 +457,8 @@ fn launch(
     input: &[u8],
     target: &str,
     timeout_seconds: u64,
+    grants: Grants,
+    max_output_bytes: usize,
 ) -> std::result::Result<Value, RunFailure> {
     let failed = |message: String| RunFailure {
         error: plugin_error("DOWAI_PLUGIN_FAILED", &message),
@@ -361,6 +473,7 @@ fn launch(
         .arg(module)
         .arg(function)
         .arg(working_dir)
+        .arg(grants.as_worker_arg())
         .current_dir(working_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -404,7 +517,7 @@ fn launch(
                 Ok(0) | Err(_) => break,
                 Ok(read) => {
                     collected.extend_from_slice(&chunk[..read]);
-                    if collected.len() > MAX_OUTPUT_BYTES {
+                    if collected.len() > max_output_bytes {
                         oversized_flag.store(true, Ordering::SeqCst);
                         break;
                     }
@@ -474,7 +587,7 @@ fn launch(
     let bytes = receiver
         .recv_timeout(READER_GRACE)
         .map_err(|_| output_invalid(target))?;
-    if bytes.len() > MAX_OUTPUT_BYTES {
+    if bytes.len() > max_output_bytes {
         return Err(output_invalid(target));
     }
     serde_json::from_slice::<Value>(&bytes).map_err(|_| output_invalid(target))
