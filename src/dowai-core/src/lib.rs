@@ -4,6 +4,7 @@ pub mod compatibility;
 mod config;
 pub mod config_catalog;
 mod error;
+pub mod package_policy;
 mod planner;
 mod project;
 mod python_ast;
