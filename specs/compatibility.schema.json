@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dowai.dev/schemas/compatibility.schema.json",
+  "title": "DOWAI compatibility check report (dowai compatibility check --json)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "project", "status", "models_checked", "summary", "findings"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "project": { "type": "string", "minLength": 1 },
+    "status": { "enum": ["SUPPORTED", "PARTIAL", "UNSUPPORTED"] },
+    "models_checked": { "type": "integer", "minimum": 0 },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["supported", "partial", "unsupported"],
+      "properties": {
+        "supported": { "type": "integer", "minimum": 0 },
+        "partial": { "type": "integer", "minimum": 0 },
+        "unsupported": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["status", "code", "construct", "path", "line", "message", "suggestion"],
+        "properties": {
+          "status": { "enum": ["PARTIAL", "UNSUPPORTED"] },
+          "code": { "type": "string", "pattern": "^DOWAI_COMPAT_[A-Z_]+$" },
+          "construct": { "type": "string" },
+          "path": { "type": "string", "minLength": 1 },
+          "line": { "type": ["integer", "null"], "minimum": 1 },
+          "message": { "type": "string", "minLength": 1 },
+          "suggestion": { "type": "string" }
+        }
+      }
+    }
+  }
+}

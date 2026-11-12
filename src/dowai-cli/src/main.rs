@@ -1,9 +1,10 @@
 use clap::{Args, Parser, Subcommand};
 use dowai_core::{
-    admin_config_path, create_project, default_run_store_path, default_session_store_path,
-    filter_invocations, invocation_depths, plan, resolve_effective_configuration,
-    session_ttl_from_config, user_config_path, validate_project_with_configuration,
-    CancellationToken, DowaiError, ExecutionMode, InvocationEntry, LogLevel, Result,
+    admin_config_path, check_compatibility, create_project, default_run_store_path,
+    default_session_store_path, filter_invocations, invocation_depths, plan,
+    resolve_effective_configuration, session_ttl_from_config, user_config_path,
+    validate_project_with_configuration, CancellationToken, CompatibilityReport,
+    CompatibilityStatus, DowaiError, ExecutionMode, InvocationEntry, LogLevel, Result,
     RevisionSnapshot, RunDetail, RunStore, RunSummary, SessionMetadata, SessionStore,
     TemplateOptions,
 };
@@ -65,6 +66,21 @@ enum Command {
     Runs {
         #[command(subcommand)]
         command: RunsCommand,
+    },
+    /// Classify dbt-style constructs as SUPPORTED, PARTIAL or UNSUPPORTED (ENT-035).
+    /// The check only reads files; unsupported constructs are reported, not executed.
+    Compatibility {
+        #[command(subcommand)]
+        command: CompatibilityCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CompatibilityCommand {
+    Check {
+        project_path: PathBuf,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -512,6 +528,19 @@ fn dispatch(command: Command) -> Result<Option<Value>> {
             })?;
             dispatch_runs(command, &RunStore::for_user_state(path))
         }
+        Command::Compatibility { command } => match command {
+            CompatibilityCommand::Check { project_path, json } => {
+                let report = check_compatibility(&project_path)?;
+                if json {
+                    let value = serde_json::to_value(&report)
+                        .map_err(|error| DowaiError::Config(error.to_string()))?;
+                    Ok(Some(value))
+                } else {
+                    print_compatibility_report(&report);
+                    Ok(None)
+                }
+            }
+        },
         Command::Config { command } => match command {
             ConfigCommand::Show {
                 effective,
@@ -707,6 +736,9 @@ fn wants_json(command: &Command) -> bool {
         Command::Logs { json, .. } => *json,
         Command::Runs { command } => match command {
             RunsCommand::List { json, .. } | RunsCommand::Show { json, .. } => *json,
+        },
+        Command::Compatibility { command } => match command {
+            CompatibilityCommand::Check { json, .. } => *json,
         },
     }
 }
@@ -959,6 +991,38 @@ fn find_config_root(start: &Path) -> PathBuf {
         })
         .map(Path::to_path_buf)
         .unwrap_or_else(|| start.to_path_buf())
+}
+
+fn compatibility_status_label(status: CompatibilityStatus) -> &'static str {
+    match status {
+        CompatibilityStatus::Supported => "SUPPORTED",
+        CompatibilityStatus::Partial => "PARTIAL",
+        CompatibilityStatus::Unsupported => "UNSUPPORTED",
+    }
+}
+
+fn print_compatibility_report(report: &CompatibilityReport) {
+    println!(
+        "Compatibility: {} ({} model(s) checked; constructs: {} supported, {} partial, {} unsupported)",
+        compatibility_status_label(report.status),
+        report.models_checked,
+        report.summary.supported,
+        report.summary.partial,
+        report.summary.unsupported,
+    );
+    for finding in &report.findings {
+        let location = match finding.line {
+            Some(line) => format!("{}:{line}", finding.path),
+            None => finding.path.clone(),
+        };
+        println!(
+            "{} [{}] {location}: {} Suggestion: {}",
+            compatibility_status_label(finding.status),
+            finding.code,
+            finding.message,
+            finding.suggestion,
+        );
+    }
 }
 
 #[cfg(test)]

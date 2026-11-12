@@ -1,5 +1,6 @@
 mod audit;
 mod cancel;
+pub mod compatibility;
 mod config;
 pub mod config_catalog;
 mod error;
@@ -13,6 +14,10 @@ mod templates;
 
 pub use audit::{default_audit_log_path, sha256_hex, AuditEvent, AuditLog, AUDIT_SCHEMA_VERSION};
 pub use cancel::CancellationToken;
+pub use compatibility::{
+    check_compatibility, CompatibilityFinding, CompatibilityReport, CompatibilityStatus,
+    CompatibilitySummary, COMPATIBILITY_SCHEMA_VERSION,
+};
 pub use config::{
     admin_config_path, check_configuration_formats, load_workspace_profile, migrate_legacy_yaml,
     resolve_effective_configuration, user_config_path, MigrationReport, ProfileTlsMode,
