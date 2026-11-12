@@ -4,7 +4,10 @@
 //! Every test uses a real project virtual environment and an isolated state
 //! directory. No PostgreSQL is required.
 
-use dowai_core::{create_project, default_session_store_path, ExecutionMode, SessionStore};
+use dowai_core::{
+    admin_config_path, create_project, default_session_store_path, plan, user_config_path,
+    validate_project_with_configuration, ExecutionMode, SessionStore,
+};
 use dowai_runtime::{run_postgres, RunRequest, RunResult};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -793,4 +796,83 @@ fn a_worker_flooding_stdout_fails_cleanly_without_hanging_the_host() {
 
     assert_eq!(error.code(), "DOWAI_PYTHON_PROTOCOL");
     assert!(started.elapsed().as_secs() < 20);
+}
+
+// ENT-040: `env.run` returns the §6.3 fields with the run_id of the parent run.
+#[test]
+fn ac040_env_run_returns_the_contract_fields_with_the_parent_run_id() {
+    let harness = Harness::new();
+    harness.model("child.py", CHILD_OK);
+    harness.model(
+        "parent.py",
+        "def model(env):\n    r = env.run('child.py')\n    env.setVar('child_run_id', r.run_id)\n    env.setVar('child_invocation_id', r.invocation_id)\n    env.setVar('child_status', r.status)\n    env.setVar('child_failed', r.failed)\n    env.setVar('child_mode', r.execution_mode)\n",
+    );
+
+    let result = harness.run("parent.py").expect("nested run succeeds");
+
+    let variables = harness.snapshot(&result.session_id);
+    assert_eq!(variables["child_run_id"], json!(result.run_id));
+    assert_eq!(variables["child_status"], json!("SUCCEEDED"));
+    assert_eq!(variables["child_failed"], json!(false));
+    assert_eq!(variables["child_mode"], json!("automatic"));
+    let child = find(&result, "child.py");
+    assert_eq!(
+        variables["child_invocation_id"],
+        json!(child[0].invocation_id)
+    );
+}
+
+// ENT-040: `env.plan` and `env.validate` return the same payloads as the engine functions
+// that back `dowai plan --json` and `dowai validate --json`.
+#[test]
+fn ac040_env_plan_and_validate_return_the_engine_payloads() {
+    let harness = Harness::new();
+    harness.model("child.py", CHILD_OK);
+    harness.model(
+        "parent.py",
+        "def model(env):\n    env.setVar('plan', env.plan('child.py'))\n    env.setVar('validation', env.validate())\n",
+    );
+
+    let result = harness.run("parent.py").expect("nested run succeeds");
+
+    let variables = harness.snapshot(&result.session_id);
+    let root = harness.project.canonicalize().expect("canonical project");
+    let expected_plan =
+        plan(&root, &["child.py".to_owned()], ExecutionMode::Automatic).expect("engine plan");
+    assert_eq!(
+        variables["plan"],
+        serde_json::to_value(expected_plan).expect("plan json")
+    );
+    let expected_validation = validate_project_with_configuration(
+        &root,
+        user_config_path().as_deref(),
+        admin_config_path().as_deref(),
+    );
+    assert_eq!(
+        variables["validation"],
+        serde_json::to_value(expected_validation).expect("validation json")
+    );
+    // Inspection commands record no invocation: only the parent is in the history.
+    assert_eq!(result.invocations.len(), 1);
+}
+
+// ENT-040: a rejected engine command is a catchable error with a stable code only.
+#[test]
+fn ac040_env_plan_of_missing_target_fails_catchably_with_a_stable_code() {
+    let harness = Harness::new();
+    harness.model(
+        "parent.py",
+        "def model(env):\n    try:\n        env.plan('missing.py')\n    except Exception as error:\n        env.setVar('plan_error', error.code)\n",
+    );
+
+    let result = harness
+        .run("parent.py")
+        .expect("parent catches the rejection");
+
+    let variables = harness.snapshot(&result.session_id);
+    let code = variables["plan_error"].as_str().expect("code is a string");
+    assert!(code.starts_with("DOWAI_"), "stable code: {code}");
+    let root = harness.project.canonicalize().expect("canonical project");
+    let root_text = root.display().to_string();
+    assert!(!code.contains(&root_text));
 }

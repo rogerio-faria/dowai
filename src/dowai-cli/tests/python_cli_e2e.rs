@@ -127,3 +127,67 @@ fn cli_runs_python_models_without_a_database_profile() {
     assert_eq!(shown["run"]["status"], json!("SUCCEEDED"));
     assert_eq!(shown["run"]["invocations"][0]["target"], json!("model.py"));
 }
+
+// ENT-040 / AC034: `env.plan` and `env.validate` inside a model return the same JSON that
+// `dowai plan --json` and `dowai validate --json` print for the same project.
+#[test]
+fn env_plan_and_validate_match_the_cli_json_output() {
+    let workspace = Workspace::new();
+    let project = workspace.project(&system_python());
+    fs::write(
+        project.join("models").join("child.py"),
+        "def model(env):\n    env.setVar('child', True)\n",
+    )
+    .expect("write child model");
+    fs::write(
+        project.join("models").join("parent.py"),
+        "import json\n\ndef model(env):\n    plan = env.plan('child.py')\n    validation = env.validate()\n    with open('sdk-plan.json', 'w', encoding='utf-8') as handle:\n        json.dump(plan, handle)\n    with open('sdk-validate.json', 'w', encoding='utf-8') as handle:\n        json.dump(validation, handle)\n",
+    )
+    .expect("write parent model");
+    let state = workspace.state_directory("state");
+    let config = workspace.state_directory("config");
+    let appdata = workspace.state_directory("appdata");
+    let system_data = workspace.state_directory("system");
+    let environment = |command: &mut Command| {
+        command
+            .current_dir(&project)
+            .env("XDG_STATE_HOME", &state)
+            .env("XDG_CONFIG_HOME", &config)
+            .env("LOCALAPPDATA", &state)
+            .env("APPDATA", &appdata)
+            .env("PROGRAMDATA", &system_data);
+    };
+
+    let mut run = Command::new(env!("CARGO_BIN_EXE_dowai"));
+    run.args(["run", "parent.py", "--json"]);
+    environment(&mut run);
+    let run = run.output().expect("run DOWAI CLI");
+    assert!(run.status.success(), "parent model runs through the CLI");
+
+    let mut plan_cli = Command::new(env!("CARGO_BIN_EXE_dowai"));
+    plan_cli.args(["plan", "child.py", "--json"]);
+    environment(&mut plan_cli);
+    let plan_cli = plan_cli.output().expect("run dowai plan");
+    assert!(plan_cli.status.success(), "dowai plan succeeds");
+    let mut validate_cli = Command::new(env!("CARGO_BIN_EXE_dowai"));
+    validate_cli.args(["validate", "--json"]);
+    environment(&mut validate_cli);
+    let validate_cli = validate_cli.output().expect("run dowai validate");
+
+    let sdk_plan: Value = serde_json::from_slice(
+        &fs::read(project.join("sdk-plan.json")).expect("model wrote its plan"),
+    )
+    .expect("plan is JSON");
+    let sdk_validation: Value = serde_json::from_slice(
+        &fs::read(project.join("sdk-validate.json")).expect("model wrote its validation"),
+    )
+    .expect("validation is JSON");
+    let cli_plan: Value = serde_json::from_slice(&plan_cli.stdout).expect("plan CLI JSON");
+    let cli_validation: Value =
+        serde_json::from_slice(&validate_cli.stdout).expect("validate CLI JSON");
+    assert_eq!(sdk_plan, cli_plan, "env.plan matches dowai plan --json");
+    assert_eq!(
+        sdk_validation, cli_validation,
+        "env.validate matches dowai validate --json"
+    );
+}

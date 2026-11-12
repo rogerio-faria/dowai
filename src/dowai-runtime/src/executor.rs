@@ -4,14 +4,18 @@
 //! invocation history linked by `parent_invocation_id`.
 
 use crate::python_runtime::{
-    self, ChildCall, ChildOutcome, DatasetAnswer, DatasetColumn, HostReply, HostRequest,
-    ModelInvocation,
+    self, CallDetails, ChildCall, ChildOutcome, DatasetAnswer, DatasetColumn, HostReply,
+    HostRequest, ModelInvocation,
 };
 use crate::resources;
-use crate::{resolve_execution_mode, resolve_python_model_path, InvocationRecord};
+use crate::{
+    prepare_postgres_plan, resolve_execution_mode, resolve_python_model_path, template_options,
+    InvocationRecord,
+};
 use dowai_core::state::NodeStatus;
 use dowai_core::{
-    plan, CancellationToken, DowaiError, ExecutionMode, PlanNode, Result, SessionStore,
+    admin_config_path, plan, user_config_path, validate_project_with_configuration,
+    CancellationToken, DowaiError, ExecutionMode, PlanNode, Result, SessionStore,
 };
 use dowai_postgres::{DatasetCell, PgProfile, PostgresAdapter};
 use serde_json::Value;
@@ -206,17 +210,34 @@ pub(crate) struct Executor<'a> {
     stack: Vec<String>,
     /// Every invocation attempt received, including rejected ones.
     attempts: usize,
+    /// Run that owns this executor; nested `env.run` results report it (ENT-040).
+    run_id: String,
+    /// Session of the run when it is already known (explicit session); `None` otherwise.
+    session_id: Option<String>,
+}
+
+/// Interpreter and per-worker timeout used by every Python model of a run.
+pub(crate) struct WorkerSettings<'a> {
+    pub interpreter: &'a Path,
+    pub timeout: Duration,
+}
+
+/// Identifiers of the run an executor serves, reported by nested `env.run` results (ENT-040).
+pub(crate) struct RunIdentity {
+    pub run_id: String,
+    /// `None` while the run has no session yet (implicit session created at the end).
+    pub session_id: Option<String>,
 }
 
 impl<'a> Executor<'a> {
     pub(crate) fn new(
         root: &'a Path,
         models_dir: &'a Path,
-        interpreter: &'a Path,
-        timeout: Duration,
+        worker: WorkerSettings<'a>,
         configuration: &'a Value,
         store: &'a SessionStore,
         cancel: CancellationToken,
+        identity: RunIdentity,
     ) -> Result<Self> {
         let limit = |name: &str| {
             configuration["effective"]["execution"][name]
@@ -227,8 +248,8 @@ impl<'a> Executor<'a> {
         Ok(Self {
             root,
             models_dir,
-            interpreter,
-            timeout,
+            interpreter: worker.interpreter,
+            timeout: worker.timeout,
             max_call_depth: limit("max_call_depth")?,
             max_invocations: limit("max_invocations_per_run")?,
             configuration,
@@ -238,6 +259,8 @@ impl<'a> Executor<'a> {
             datasets: None,
             stack: Vec::new(),
             attempts: 0,
+            run_id: identity.run_id,
+            session_id: identity.session_id,
         })
     }
 
@@ -426,6 +449,61 @@ impl<'a> Executor<'a> {
             } => HostReply::Dataset(
                 self.dataset_request(&dataset, &operation, offset, limit, depends_on),
             ),
+            HostRequest::Command {
+                operation,
+                target,
+                mode,
+                variables,
+            } => HostReply::Command(self.command(&operation, target, mode, variables)),
+        }
+    }
+
+    /// Engine commands callable from a model (`env.plan`, `env.validate`) (ENT-040). Each one
+    /// runs the same function as the CLI command and returns the same JSON payload. They
+    /// never execute a model and record no invocation.
+    fn command(
+        &mut self,
+        operation: &str,
+        target: Option<String>,
+        mode: Option<String>,
+        variables: Variables,
+    ) -> Result<serde_json::Value> {
+        self.cancel.check()?;
+        match operation {
+            "plan" => {
+                let target = target
+                    .ok_or_else(|| DowaiError::Config("env.plan requires a target".to_owned()))?;
+                let mode = match mode.as_deref().unwrap_or("automatic") {
+                    "automatic" => ExecutionMode::Automatic,
+                    "manual" => ExecutionMode::Manual,
+                    _ => {
+                        return Err(DowaiError::Config(
+                            "env.plan mode must be 'automatic' or 'manual'".to_owned(),
+                        ))
+                    }
+                };
+                self.store.validate_variables(&variables)?;
+                let execution_plan = plan(self.root, &[target], mode)?;
+                prepare_postgres_plan(
+                    self.root,
+                    &execution_plan,
+                    &variables,
+                    &template_options(self.configuration)?,
+                )?;
+                serde_json::to_value(execution_plan)
+                    .map_err(|error| DowaiError::Model(error.to_string()))
+            }
+            "validate" => {
+                let report = validate_project_with_configuration(
+                    self.root,
+                    user_config_path().as_deref(),
+                    admin_config_path().as_deref(),
+                );
+                serde_json::to_value(report).map_err(|error| DowaiError::Model(error.to_string()))
+            }
+            _ => Err(DowaiError::NotImplemented(
+                "This engine command is not available to models".to_owned(),
+            )),
         }
     }
 
@@ -486,11 +564,13 @@ impl<'a> Executor<'a> {
                 return ChildOutcome {
                     invocation_id,
                     result,
+                    details: None,
                 };
             }
         };
         let target = call.target;
         let variables = call.variables;
+        let started = Instant::now();
         // The worker-supplied text is never recorded: the record starts as
         // invalid and is upgraded to the canonical id once resolved.
         let (invocation_id, result) = self.record(
@@ -500,9 +580,16 @@ impl<'a> Executor<'a> {
             mode,
             |this, invocation_id| this.run_child(&target, mode, variables, invocation_id, deadline),
         );
+        let details = result.is_ok().then(|| CallDetails {
+            run_id: self.run_id.clone(),
+            session_id: self.session_id.clone(),
+            execution_mode: mode.as_str().to_owned(),
+            duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        });
         ChildOutcome {
             invocation_id,
             result,
+            details,
         }
     }
 

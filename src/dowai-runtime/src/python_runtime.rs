@@ -29,6 +29,13 @@ use std::time::{Duration, Instant};
 // (`code`). Only datasets declared as dependencies of the model are served, and
 // only from SQL models already committed by the run.
 //
+// Worker -> host, zero or more `{"kind":"command"}` lines (ENT-040, `env.plan` and
+// `env.validate`), each with `operation` ("plan" or "validate") and, for "plan", `target`
+// and `mode`; both carry the caller's `variables`. The host answers with exactly one line:
+// `command_ok` (`payload`: the same JSON the CLI prints for the operation) or
+// `command_failed` (`code`, static). `call_ok` also carries `run_id`, `session_id`,
+// `execution_mode` and `duration_ms` (additive) so `env.run` returns the §6.3 fields.
+//
 // Worker -> host, last line (final): `ok`/`failed`/`unsupported`/`protocol`
 // exactly as before; `failed` may additionally carry the stable `code` of an
 // uncaught DowaiExecutionError, plus the `invocation_id` of the failed call it
@@ -83,6 +90,25 @@ def _error_class():
     module.DowaiExecutionError = DowaiExecutionError
     sys.modules.setdefault("dowai", module)
     return DowaiExecutionError
+
+class EngineResult:
+    # Mirrors the SDK result contract (plano §6.3) for nested `env.run` calls.
+    def __init__(self, fields):
+        self.schema_version = 2
+        self.session_id = fields.get("session_id")
+        self.run_id = fields.get("run_id")
+        self.invocation_id = fields.get("invocation_id")
+        self.status = fields.get("status") or "SUCCEEDED"
+        self.execution_mode = fields.get("execution_mode")
+        self.duration_ms = fields.get("duration_ms")
+        self.nodes = ()
+        self.warnings = ()
+        self.error_code = None
+        self.message = "Completed"
+
+    @property
+    def failed(self):
+        return self.status != "SUCCEEDED"
 
 def main():
     try:
@@ -165,7 +191,7 @@ def main():
             if reply.get("kind") == "call_ok" and isinstance(reply.get("variables"), dict):
                 self._variables.clear()
                 self._variables.update(reply["variables"])
-                return {"invocation_id": reply.get("invocation_id"), "status": "SUCCEEDED"}
+                return EngineResult(reply)
             if reply.get("kind") == "call_failed":
                 raise ExecutionError(
                     str(reply.get("code") or "DOWAI_EXECUTION_FAILED"),
@@ -173,6 +199,40 @@ def main():
                     invocation_id=reply.get("invocation_id"),
                 )
             raise RuntimeError("invalid nested call reply")
+
+        def _command(self, operation, target=None, mode=None):
+            message = {"protocol_version": 1, "kind": "command", "operation": operation, "variables": self._variables}
+            if target is not None:
+                message["target"] = target
+            if mode is not None:
+                message["mode"] = mode
+            json.dumps(self._variables)
+            respond(message)
+            line = _in.readline()
+            if not line:
+                raise RuntimeError("the DOWAI host closed the command channel")
+            reply = json.loads(line)
+            if reply.get("protocol_version") != 1:
+                raise RuntimeError("invalid command reply")
+            if reply.get("kind") == "command_ok" and isinstance(reply.get("payload"), dict):
+                return reply["payload"]
+            if reply.get("kind") == "command_failed":
+                raise ExecutionError(
+                    str(reply.get("code") or "DOWAI_EXECUTION_FAILED"),
+                    "engine command was rejected: " + operation,
+                )
+            raise RuntimeError("invalid command reply")
+
+        def plan(self, target, *, mode=None):
+            if not isinstance(target, str) or not target.strip():
+                raise ValueError("target must be a non-empty string")
+            selected = self._mode if mode is None else mode
+            if selected not in ("automatic", "manual"):
+                raise ValueError("mode must be 'automatic' or 'manual'")
+            return self._command("plan", target=target, mode=selected)
+
+        def validate(self):
+            return self._command("validate")
 
         def _dataset_request(self, name, operation, **fields):
             if not isinstance(name, str) or name not in self._dependencies:
@@ -322,7 +382,7 @@ pub(crate) struct DatasetColumn {
     pub data_type: String,
 }
 
-/// A request from the worker: a nested call or a dataset operation.
+/// A request from the worker: a nested call, a dataset operation or an engine command.
 pub(crate) enum HostRequest {
     Call(ChildCall),
     Dataset {
@@ -330,6 +390,12 @@ pub(crate) enum HostRequest {
         operation: String,
         offset: Option<u64>,
         limit: Option<u32>,
+    },
+    Command {
+        operation: String,
+        target: Option<String>,
+        mode: Option<String>,
+        variables: BTreeMap<String, Value>,
     },
 }
 
@@ -346,6 +412,7 @@ pub(crate) enum DatasetAnswer {
 pub(crate) enum HostReply {
     Call(ChildOutcome),
     Dataset(Result<DatasetAnswer>),
+    Command(Result<Value>),
 }
 
 #[derive(Serialize)]
@@ -377,6 +444,26 @@ struct CallReply<'a> {
     code: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution_mode: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct CommandReply<'a> {
+    protocol_version: u32,
+    kind: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payload: Option<&'a Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<&'a str>,
 }
 
 /// A nested `env.run()` request issued by a running model.
@@ -386,10 +473,21 @@ pub(crate) struct ChildCall {
     pub variables: BTreeMap<String, Value>,
 }
 
+/// Identifiers and timing of a successful nested call (ENT-040, `env.run` result).
+/// Never carries variable values.
+pub(crate) struct CallDetails {
+    pub run_id: String,
+    pub session_id: Option<String>,
+    pub execution_mode: String,
+    pub duration_ms: u64,
+}
+
 /// Result of a nested call, as decided by the host.
 pub(crate) struct ChildOutcome {
     pub invocation_id: String,
     pub result: Result<BTreeMap<String, Value>>,
+    /// Present only when `result` is `Ok`.
+    pub details: Option<CallDetails>,
 }
 
 /// Parameters of one supervised model process.
@@ -543,7 +641,7 @@ pub(crate) fn execute_model(
             return Err(protocol_error());
         }
         let message = parse_message(&line)?;
-        if matches!(message.kind.as_str(), "call" | "dataset") {
+        if matches!(message.kind.as_str(), "call" | "dataset" | "command") {
             return Err(protocol_error());
         }
         final_message = Some(message);
@@ -640,6 +738,7 @@ impl Supervision {
                 })) else {
                     return Err(protocol_error());
                 };
+                let details = outcome.details.as_ref();
                 let reply = match &outcome.result {
                     Ok(variables) => CallReply {
                         protocol_version: IPC_PROTOCOL_VERSION,
@@ -648,6 +747,11 @@ impl Supervision {
                         variables: Some(variables),
                         code: None,
                         message: None,
+                        run_id: details.map(|d| d.run_id.as_str()),
+                        session_id: details.and_then(|d| d.session_id.as_deref()),
+                        execution_mode: details.map(|d| d.execution_mode.as_str()),
+                        duration_ms: details.map(|d| d.duration_ms),
+                        status: details.map(|_| "SUCCEEDED"),
                     },
                     Err(error) => CallReply {
                         protocol_version: IPC_PROTOCOL_VERSION,
@@ -656,6 +760,11 @@ impl Supervision {
                         variables: None,
                         code: Some(error.code()),
                         message: Some(worker_visible_message(error.code())),
+                        run_id: None,
+                        session_id: None,
+                        execution_mode: None,
+                        duration_ms: None,
+                        status: None,
                     },
                 };
                 let mut bytes = serde_json::to_vec(&reply).map_err(|_| protocol_error())?;
@@ -711,6 +820,50 @@ impl Supervision {
                         kind: "dataset_failed",
                         columns: None,
                         code: Some(crate::executor::DATASET_LIMIT),
+                    })
+                    .map_err(|_| protocol_error())?;
+                }
+                bytes.push(b'\n');
+                self.replies.send(bytes).map_err(|_| protocol_error())?;
+                Ok(())
+            }
+            "command" => {
+                let Some(operation) = message.operation else {
+                    return Err(protocol_error());
+                };
+                let Some(variables) = message.variables else {
+                    return Err(protocol_error());
+                };
+                let HostReply::Command(result) = on_request(HostRequest::Command {
+                    operation,
+                    target: message.target,
+                    mode: message.mode,
+                    variables,
+                }) else {
+                    return Err(protocol_error());
+                };
+                let mut bytes = match &result {
+                    Ok(payload) => serde_json::to_vec(&CommandReply {
+                        protocol_version: IPC_PROTOCOL_VERSION,
+                        kind: "command_ok",
+                        payload: Some(payload),
+                        code: None,
+                    }),
+                    Err(error) => serde_json::to_vec(&CommandReply {
+                        protocol_version: IPC_PROTOCOL_VERSION,
+                        kind: "command_failed",
+                        payload: None,
+                        code: Some(error.code()),
+                    }),
+                }
+                .map_err(|_| protocol_error())?;
+                // A payload that does not fit the protocol is refused, not truncated.
+                if bytes.len() > MAX_IPC_BYTES {
+                    bytes = serde_json::to_vec(&CommandReply {
+                        protocol_version: IPC_PROTOCOL_VERSION,
+                        kind: "command_failed",
+                        payload: None,
+                        code: Some("DOWAI_EXECUTION_FAILED"),
                     })
                     .map_err(|_| protocol_error())?;
                 }

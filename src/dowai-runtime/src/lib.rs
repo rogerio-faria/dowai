@@ -739,11 +739,19 @@ fn execute_run(
         let mut executor = executor::Executor::new(
             &root,
             &models_dir,
-            interpreter,
-            Duration::from_secs(python.timeout_seconds),
+            executor::WorkerSettings {
+                interpreter,
+                timeout: Duration::from_secs(python.timeout_seconds),
+            },
             &configuration,
             &store,
             cancel.clone(),
+            executor::RunIdentity {
+                run_id: run_id.to_owned(),
+                session_id: prior_session
+                    .as_ref()
+                    .map(|session| session.session_id.clone()),
+            },
         )?;
         let mut completed_nodes = Vec::with_capacity(execution_plan.nodes.len());
         for (index, node) in execution_plan.nodes.iter().enumerate() {
@@ -829,11 +837,19 @@ fn execute_run(
         let mut executor = executor::Executor::new(
             &root,
             &models_dir,
-            &python.interpreter,
-            Duration::from_secs(python.timeout_seconds),
+            executor::WorkerSettings {
+                interpreter: &python.interpreter,
+                timeout: Duration::from_secs(python.timeout_seconds),
+            },
             &configuration,
             &store,
             cancel.clone(),
+            executor::RunIdentity {
+                run_id: run_id.to_owned(),
+                session_id: prior_session
+                    .as_ref()
+                    .map(|session| session.session_id.clone()),
+            },
         )?;
         // AC002: Python models read SQL datasets of this plan, read-only, through the host.
         let sql_relations: BTreeSet<String> = execution_plan
@@ -1414,7 +1430,7 @@ fn model_stem(model_id: &str) -> Result<String> {
         .ok_or_else(|| DowaiError::Model(format!("Invalid model relation name: {model_id}")))
 }
 
-fn template_options(configuration: &Value) -> Result<TemplateOptions> {
+pub(crate) fn template_options(configuration: &Value) -> Result<TemplateOptions> {
     let templates = &configuration["effective"]["templates"];
     let max_nesting = templates["max_nesting_depth"]
         .as_u64()
