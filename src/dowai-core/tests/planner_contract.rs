@@ -608,3 +608,90 @@ fn sql_source_declarations_are_not_plan_dependencies() {
     assert_eq!(plan.nodes.len(), 1);
     assert!(plan.nodes[0].depends_on.is_empty());
 }
+
+#[test]
+fn python_plan_analysis_does_not_execute_the_module() {
+    let project = TestProject::new();
+    project.write_model("source.sql", "select 1 as id");
+    let marker = project.path().join("import_marker.txt");
+    project.write_model(
+        "consumer.py",
+        &format!(
+            "import pathlib\npathlib.Path({:?}).write_text('executed')\n\ndef model(env):\n    env.depends_on('source.sql')\n    return None\n",
+            marker.display().to_string()
+        ),
+    );
+
+    let plan = plan(
+        project.path(),
+        &["consumer.py".into()],
+        ExecutionMode::Automatic,
+    )
+    .expect("AST analysis extracts the static dependency");
+
+    let target = plan.nodes.last().expect("plan has the target node");
+    assert_eq!(target.id, "consumer.py");
+    assert_eq!(target.depends_on, ["source.sql"]);
+    assert!(
+        !marker.exists(),
+        "plan must analyse Python models by AST without running their top-level code"
+    );
+}
+
+#[test]
+fn python_comments_and_strings_do_not_create_env_dependencies() {
+    let project = TestProject::new();
+    project.write_model("source.sql", "select 1 as id");
+    project.write_model(
+        "consumer.py",
+        "# env.ref('source.sql')\ndef model(env):\n    text = \"env.depends_on('source.sql')\"\n    env.setVar('text', text)\n    return None\n",
+    );
+
+    let plan = plan(
+        project.path(),
+        &["consumer.py".into()],
+        ExecutionMode::Automatic,
+    )
+    .expect("comments and string literals are not calls");
+
+    assert!(plan.nodes[0].depends_on.is_empty());
+}
+
+#[test]
+fn python_env_reference_without_call_or_via_getattr_fails_with_a_stable_code() {
+    for body in [
+        "def model(env):\n    f = env.ref\n    return None\n",
+        "def model(env):\n    getattr(env, 'depends_on')('source.sql')\n",
+        "def model(env):\n    env.ref('a', 'b')\n",
+        "def model(env):\n    env.ref(name=\"source.sql\")\n",
+        "def model(env):\n    env.ref(f\"{x}\")\n",
+    ] {
+        let project = TestProject::new();
+        project.write_model("source.sql", "select 1 as id");
+        project.write_model("caller.py", body);
+
+        let error = plan(
+            project.path(),
+            &["caller.py".into()],
+            ExecutionMode::Automatic,
+        )
+        .expect_err("dynamic environment references must not be silently omitted");
+
+        assert_eq!(error.code(), "DOWAI_PLAN_INVALID", "body: {body}");
+    }
+}
+
+#[test]
+fn python_syntax_errors_fail_planning_with_a_stable_code() {
+    let project = TestProject::new();
+    project.write_model("caller.py", "def model(env):\n    env.depends_on('a'\n");
+
+    let error = plan(
+        project.path(),
+        &["caller.py".into()],
+        ExecutionMode::Automatic,
+    )
+    .expect_err("unparseable Python cannot be analysed");
+
+    assert_eq!(error.code(), "DOWAI_PLAN_INVALID");
+}

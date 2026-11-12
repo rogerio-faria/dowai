@@ -5,6 +5,7 @@ pub mod config_catalog;
 mod error;
 mod planner;
 mod project;
+mod python_ast;
 mod runs;
 mod sessions;
 mod templates;
