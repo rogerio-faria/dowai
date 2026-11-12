@@ -1,0 +1,171 @@
+# API pública — CLI, SDK Python e contratos
+
+Documento de referência da superfície pública do DOWAI nesta revisão (`dowai 0.1.0`).
+Status real por comando e limitações estão em `docs/STATUS.md`; este arquivo não promete
+nada além do que foi verificado. Requisitos de origem: `plano_mestre.md` §6.1 e §20.1.
+
+Verificação deste documento: `cargo build -p dowai-cli --locked` com as variáveis
+`OPENSSL_*` documentadas em `STATUS.md`, e execução real dos comandos marcados como
+"verificado localmente" nos exemplos abaixo, em `examples/automatic-dag` e em um
+diretório temporário. Os exemplos **não** foram executados no CI (critério pendente, ver
+ENT-078 e ENT-010).
+
+## 1. CLI
+
+### 1.1 Status dos comandos de §6.1
+
+| Comando | Status | Observação |
+|---|---|---|
+| `dowai --version` | Implementado | Verificado localmente (`dowai 0.1.0`). |
+| `dowai init <name> [--workspace PATH] [--json]` | Parcial | Cria projeto e workspace sem sobrescrever configuração existente. Verificado em diretório temporário. |
+| `dowai doctor [--json] [--check-connections]` | Parcial | Checa configuração, runtime Python e conexão SQL. Verificado com `--json`. |
+| `dowai config show --effective [--json] [--project-dir PATH]` | Parcial | Camadas admin/usuário/workspace/projeto com origem. Catálogo completo de parâmetros não implementado (ver `CONFIGURATION.md`). Verificado. |
+| `dowai config migrate <path> --output <novo.json>` | Implementado | Lê YAML legado sem alterá-lo; recusa sobrescrever saída. |
+| `dowai validate [PATH] [--strict] [--json]` | Parcial | Schema, referências, ciclos, declarações de source e sintaxe de template. Verificado: `valid: true` em `examples/automatic-dag`. |
+| `dowai plan <targets>... [--vars JSON] [--project-dir PATH] [--json]` | Parcial | Ordenação automática offline. Verificado: `stg_vendas.sql` antes de `faturamento.sql`. |
+| `dowai plan --manual <targets>... [--vars JSON] [--json]` | Parcial | Ordem informada pelo usuário com dependências. Verificado com `faturamento.sql stg_vendas.sql`. |
+| `dowai run <targets>|all [--profile NAME] [--vars JSON] [--session ID] [--json]` | Parcial | SQL (tabelas/views no PostgreSQL) e Python em venv do projeto. Exige banco configurado; **não executado** nesta revisão (P-09). Full refresh e demais adaptadores: ver §1.3. |
+| `dowai run --manual <targets>... [--session ID]` | Parcial | Mesma restrição de `run`. |
+| `dowai run <target> --full-refresh [--yes]` | Não implementado | Flag existe no `--help`, mas o comportamento de full refresh não está implementado (`STATUS.md`, linha "SQL execution"). |
+| `dowai session start [--project-dir PATH] [--json]` | Parcial | Verificado: retorna `session_id`, `status: ACTIVE`, TTL. |
+| `dowai session show <session_id> [--json]` | Parcial | Verificado. |
+| `dowai session end <session_id> [--json]` | Parcial | Verificado: `status: ENDED`. |
+| `dowai runs list [--limit N] [--json]` | Parcial | Diário local de execuções. Verificado (padrão 20). |
+| `dowai runs show <run_id> [--json]` | Parcial | Execução com invocações. |
+| `dowai logs <run_id> [--node NODE] [--level LEVEL] [--json]` | Parcial | Árvore de invocações do diário. Não há mensagens livres. |
+| `dowai retry <run_id> [--failed-only] [--vars JSON] [--yes] [--json]` | Parcial | Reexecuta execução `FAILED` ou `CANCELLED` como nova execução. Variáveis não são armazenadas e devem ser informadas novamente. |
+| `dowai plugins list [--scope project\|global\|all]` | Parcial | Apenas leitura de manifestos. |
+| `dowai plugins info <id>` | Parcial | Apenas leitura de manifestos. |
+| `dowai plugins sync` | Parcial | Gera stubs `.pyi` em `.dowai/stubs`, sem importar código de plugin. |
+| `dowai plugins resolve <namespace.method>` | Parcial | Apenas resolve; não executa código de plugin. |
+| `dowai plugins run <namespace.method> --input JSON --idempotency-key KEY` | Parcial | Executa plugin em subprocesso isolado, com AUDIT e idempotência. Sandbox de SO não implementado (ENT-108). |
+| `dowai compatibility check <project_path> [--json]` | Parcial | Classifica constructs dbt como `SUPPORTED`, `PARTIAL` ou `UNSUPPORTED`; apenas lê arquivos. |
+| `dowai ia generateLineage <file_or_model>` | Não implementado | Ausente do CLI. Fora das rodadas aprovadas (M5). |
+| `dowai ia generateHumanDocs <file_or_model>` | Não implementado | Ausente do CLI. Fora das rodadas aprovadas (M5). |
+| `dowai ai review <run_id>` | Não implementado | Ausente do CLI. Fora das rodadas aprovadas (M5). |
+| `dowai benchmark <file_or_model>` | Não implementado | Ausente do CLI. Fora das rodadas aprovadas (backlog em `TAREFAS.md`). |
+
+Comandos não implementados **não aparecem** no `--help` como funcionais e retornam
+`error: unrecognized subcommand` (verificado para `ia`, `ai` e `benchmark`).
+
+### 1.2 Alvos, modos e variáveis
+
+- Alvos aceitos: arquivos `.sql` ou `.py`, `all`, ou ID inequívoco de modelo. Caminhos são
+  confinados à raiz autorizada; symlinks e path traversal são recusados.
+- **Modo automático** (padrão): a ordem vem do grafo de `ref()` e `env.depends_on()`.
+- **Modo manual** (`--manual`): a ordem é a informada, desde que respeite as dependências.
+- **Variáveis**: `--vars '<JSON objeto>'`. Os valores são efêmeros; o diário registra apenas
+  o número de variáveis. Variáveis de sessão persistem somente após sucesso de todos os
+  modelos da execução.
+- **Sessão**: `--session <session_id>` reutiliza variáveis da sessão. Sessões expiram por TTL.
+
+### 1.3 Execução real e limitações
+
+- `run` escreve no PostgreSQL apenas com adaptador configurado. Substituir relações
+  existentes exige `--yes`.
+- Adaptadores MySQL e demais origens/destinos: não implementados nesta revisão.
+- Cancelamento (Ctrl+C/SIGTERM) retorna `CANCELLED`, exit 130 e `DOWAI_CANCELLED`.
+
+### 1.4 Saída JSON e códigos de erro
+
+Com `--json`, toda resposta é um objeto JSON com `schema_version` e, em falha, `status`,
+`error_code` e `message`. Exemplo real de falha (`plan --manual` com caminho inexistente):
+
+```json
+{"details":null,"error_code":"DOWAI_PLAN_INVALID","message":"Model not found: ...","schema_version":2,"status":"FAILED"}
+```
+
+Códigos de saída (`dowai-core/src/error.rs`):
+
+| Código | Significado |
+|---|---|
+| 0 | Sucesso |
+| 2 | Entrada, configuração, parser ou plano inválido; também uso incorreto da CLI |
+| 3 | Falha de execução de modelo |
+| 4 | Falha de conexão externa |
+| 5 | Política, permissão ou segurança negada |
+| 6 | Funcionalidade não implementada |
+| 130 | Cancelado |
+
+### 1.5 Exemplos verificados localmente
+
+Executados em `examples/automatic-dag` (sem banco, sem SQL executado):
+
+```bash
+dowai validate examples/automatic-dag --json
+dowai plan all --project-dir examples/automatic-dag --json
+dowai plan --manual faturamento.sql stg_vendas.sql --project-dir examples/automatic-dag --json
+dowai compatibility check examples/automatic-dag --json
+dowai session start --project-dir examples/automatic-dag --json
+```
+
+Observação: `doctor`, `run`, `retry` e `logs` resolvem o projeto pelo diretório atual
+(`cd` antes); `doctor` não aceita `--project-dir`. `run` **não foi executado** nesta revisão.
+
+## 2. SDK Python (`dowai`)
+
+Pacote em `src/dowai-sdk`. Exporta `DowaiClient`, `Env`, `Dataset`, `ExecutionBackend`,
+`RunResult`, `DowaiExecutionError` e `__version__`. O SDK chama o binário `dowai` com `--json`;
+o caminho é obtido de `DOWAI_BIN`, do `PATH` ou do argumento `binary=`.
+
+### 2.1 `DowaiClient`
+
+```python
+from dowai import DowaiClient
+
+client = DowaiClient("examples/automatic-dag", binary=None, timeout_seconds=None)
+plan = client.plan(["all"], manual=False, variables={"x": 1})
+result = client.run(["faturamento.sql"], manual=False, profile=None,
+                    session_id=None, variables=None, confirm_destructive=False)
+retry = client.retry("<run_id>", failed_only=True, variables=None, confirm_destructive=False)
+runs = client.runs(limit=20)
+detail = client.run_detail("<run_id>")
+logs = client.logs("<run_id>", node=None, level="INFO")
+resolved = client.plugin_resolve("namespace.method")
+```
+
+- `plan` retorna o mesmo JSON de `dowai plan --json` (teste de paridade AC034).
+- `run` e `retry` retornam `RunResult`; recusas do engine voltam como resultado de falha.
+- `runs(limit)` aceita 1 a 1000.
+- Falha de sistema (binário ausente, versão incompatível, timeout) lança `DowaiExecutionError`
+  com código estável.
+
+### 2.2 `Env` (SDK dentro de modelos Python)
+
+Disponível no modelo Python executado pelo runtime:
+
+| Método | Status |
+|---|---|
+| `setVar(name, value)`, `getVar(name, default)`, `unsetVar(name)` | Implementado como sobreposição local, publicada só se a execução inteira tiver sucesso. |
+| `manual()` (contexto) | Implementado. |
+| `run(target, mode=None, raise_on_error=True)` | Implementado para `.py` (subprocesso supervisionado, com limites de profundidade e contagem). `.sql` retorna `DOWAI_NOT_IMPLEMENTED`. |
+| `plan(target, mode=None)`, `validate()` | Implementado; mesmo JSON do CLI. |
+| `ref(name).schema()` | Implementado para modelos SQL de uma execução mista SQL+Python (somente leitura, apenas relações declaradas em `depends_on`; limite de 10 000 requisições por execução). |
+| `ref(name).iter_rows(batch_size)` | Implementado em lotes de até 10 000 linhas, em ordem física; recusado para views (`DOWAI_DATASET_UNAVAILABLE`). |
+| `ref(name).to_*`, `source()`, `write()`, `generateCSV` com streaming | Não implementado (`STATUS.md`, área "Python subprocess runtime"). |
+| Dependências instaladas pelo modelo | Não implementado. |
+
+Erros de runtime são `DowaiExecutionError` com `code`, `hint`, `run_id` e `invocation_id`.
+
+### 2.3 Modo manual x automático no SDK
+
+```python
+client.plan(["stg_vendas.sql", "faturamento.sql"], manual=True)   # ordem informada
+client.plan(["all"])                                              # ordem automática
+```
+
+## 3. Limitações conhecidas
+
+- Não há CI hospedado que execute estes exemplos (ENT-010 em `tarefas-autorizacao/`).
+- Os testes com PostgreSQL exigem `DOWAI_TEST_PG_*` (P-09); execução de `run` contra banco
+  não foi verificada nesta revisão.
+- Windows não foi verificado a partir deste ambiente.
+- A superfície de plugins não tem sandbox de SO (ENT-108).
+
+## 4. Referências
+
+- `docs/STATUS.md`: estado real por área.
+- `docs/CONFIGURATION.md`: parâmetros, precedência e defaults.
+- `docs/OPERATIONS.md`: sessões, backup, logs e upgrades.
+- `docs/SECURITY.md`: limites de segurança e permissões.
+- `docs/COMPATIBILITY.md`: sistemas, versões e constructs dbt.
