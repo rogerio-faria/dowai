@@ -8,6 +8,10 @@
 //! - `runtime.max_memory_mb`: aplicado a cada worker Python como `RLIMIT_AS` no Linux (memória
 //!   virtual, estado `partial`). Fora do Linux, `not_enforced` até o Job Object (ENT-093).
 //! - `runtime.max_cpu_percent` abaixo de 100: sem enforcement de percentual (`not_enforced`).
+//! - `runtime.max_threads`, `python.max_threads` e `runtime.max_inflight_bytes` (ENT-104): não
+//!   há enforcement (threads não são limitadas e o buffer de datasets Python é por linhas). Cada
+//!   um gera aviso `not_enforced` quando se aplica ao run (`max_threads` ao run com nós;
+//!   `python.max_threads` e `max_inflight_bytes` ao run com nós Python).
 //! - `python.resource_enforcement = require`: um limite solicitado com estado `not_enforced`
 //!   impede o início do worker, com `DOWAI_RESOURCE_UNSUPPORTED`, antes de qualquer código do
 //!   usuário. Com `best_effort` (padrão), o estado é apenas reportado em `warnings`.
@@ -122,6 +126,27 @@ pub(crate) fn run_warnings(configuration: &Value, nodes: &[PlanNode]) -> Result<
             cpu_enforcement().as_str()
         ));
     }
+    // ENT-104: limites de threads e de bytes em voo ainda não são aplicados em nenhuma
+    // plataforma. Cada um gera aviso `not_enforced` quando se aplica ao run.
+    if !nodes.is_empty() {
+        warnings.push(format!(
+            "runtime.max_threads={} não aplicado; estado {} (ENT-104)",
+            effective_u64(configuration, "runtime", "max_threads")?,
+            Enforcement::NotEnforced.as_str()
+        ));
+    }
+    if nodes.iter().any(|node| crate::is_python_path(&node.path)) {
+        warnings.push(format!(
+            "python.max_threads={} não aplicado; estado {} (ENT-104)",
+            effective_u64(configuration, "python", "max_threads")?,
+            Enforcement::NotEnforced.as_str()
+        ));
+        warnings.push(format!(
+            "runtime.max_inflight_bytes={} não aplicado ao buffer de datasets Python (iter_rows é por linhas); estado {} (ENT-104)",
+            effective_u64(configuration, "runtime", "max_inflight_bytes")?,
+            Enforcement::NotEnforced.as_str()
+        ));
+    }
     if (max_parallel > 1 || max_workers > 1) && has_independent_nodes(nodes) {
         warnings.push(format!(
             "runtime.max_parallel_nodes={max_parallel} e runtime.max_worker_processes={max_workers}: o scheduler executa nós em sequência com um worker por vez (concorrência efetiva 1); limite respeitado, paralelismo entre nós não ativo"
@@ -188,7 +213,7 @@ mod tests {
         json!({
             "effective": {
                 "runtime": runtime,
-                "python": { "resource_enforcement": python_mode }
+                "python": { "resource_enforcement": python_mode, "max_threads": 4 }
             }
         })
     }
@@ -198,8 +223,37 @@ mod tests {
             "max_parallel_nodes": 4,
             "max_worker_processes": 4,
             "max_memory_mb": 2048,
-            "max_cpu_percent": 100
+            "max_cpu_percent": 100,
+            "max_threads": 8,
+            "max_inflight_bytes": 134217728
         })
+    }
+
+    #[test]
+    fn unenforced_thread_and_byte_limits_are_reported_for_python_runs() {
+        let nodes = [node("a.py", "models/a.py", &[])];
+        let warnings = run_warnings(&configuration(defaults(), "best_effort"), &nodes)
+            .expect("warnings are computed from valid configuration");
+        for needle in [
+            "runtime.max_threads=8 não aplicado; estado not_enforced",
+            "python.max_threads=4 não aplicado; estado not_enforced",
+            "runtime.max_inflight_bytes=134217728 não aplicado",
+        ] {
+            assert!(
+                warnings.iter().any(|w| w.contains(needle)),
+                "missing warning {needle}: {warnings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn python_only_limit_warnings_are_absent_for_sql_only_runs() {
+        let nodes = [node("a.sql", "models/a.sql", &[])];
+        let warnings = run_warnings(&configuration(defaults(), "best_effort"), &nodes)
+            .expect("warnings are computed from valid configuration");
+        assert!(warnings.iter().any(|w| w.contains("runtime.max_threads=8")));
+        assert!(!warnings.iter().any(|w| w.contains("python.max_threads")));
+        assert!(!warnings.iter().any(|w| w.contains("max_inflight_bytes")));
     }
 
     #[test]
