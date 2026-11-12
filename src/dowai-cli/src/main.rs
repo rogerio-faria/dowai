@@ -7,8 +7,9 @@ use dowai_core::{
     SessionStore, TemplateOptions,
 };
 use dowai_runtime::{
-    check_postgres_connection, prepare_postgres_plan, retry_run_detailed_with_cancel,
-    run_postgres_detailed_with_cancel, RetryRequest, RunRequest, RunResult,
+    check_postgres_connection, check_python_runtime, check_python_sdk, declared_default_profile,
+    prepare_postgres_plan, retry_run_detailed_with_cancel, run_postgres_detailed_with_cancel,
+    RetryRequest, RunRequest, RunResult,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -292,39 +293,90 @@ fn dispatch(command: Command) -> Result<Option<Value>> {
                 user_config_path().as_deref(),
                 admin_config_path().as_deref(),
             );
-            let report_value = serde_json::to_value(&report)
-                .map_err(|error| DowaiError::Config(error.to_string()))?;
-            let sql_database = if args.check_connections {
-                check_postgres_connection(&current, None)?;
-                "connected"
-            } else {
-                "not_checked"
-            };
+            // ENT-016: every problem becomes a diagnostic with a stable code. Messages never
+            // carry driver output, which may contain connection data.
+            let mut diagnostics: Vec<Value> = report
+                .diagnostics
+                .iter()
+                .map(|diagnostic| json!({"code": diagnostic.code, "message": diagnostic.message}))
+                .collect();
+            let mut python_runtime = "not_checked";
+            let mut python_sdk = "not_checked";
+            if report.project.is_some() {
+                match check_python_runtime(&current) {
+                    Ok(None) => python_runtime = "not_configured",
+                    Ok(Some(interpreter)) => {
+                        python_runtime = "configured";
+                        match check_python_sdk(&interpreter, &current) {
+                            Ok(()) => python_sdk = "available",
+                            Err(error) => {
+                                python_sdk = "unavailable";
+                                diagnostics.push(
+                                    json!({"code": error.code(), "message": error.message()}),
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        python_runtime = "invalid";
+                        diagnostics.push(json!({"code": error.code(), "message": error.message()}));
+                    }
+                }
+            }
+            let mut sql_database = "not_checked";
+            if args.check_connections && report.project.is_some() {
+                match declared_default_profile(&current) {
+                    Ok(None) => sql_database = "not_declared",
+                    Ok(Some(_)) => match check_postgres_connection(&current, None) {
+                        Ok(_) => sql_database = "connected",
+                        Err(error @ DowaiError::Connection(_)) => {
+                            sql_database = "failed";
+                            diagnostics.push(json!({
+                                "code": error.code(),
+                                "message": "Could not connect with the declared default profile"
+                            }));
+                        }
+                        Err(error) => {
+                            sql_database = "failed";
+                            diagnostics
+                                .push(json!({"code": error.code(), "message": error.message()}));
+                        }
+                    },
+                    Err(error) => {
+                        sql_database = "failed";
+                        diagnostics.push(json!({"code": error.code(), "message": error.message()}));
+                    }
+                }
+            }
+            let valid = diagnostics.is_empty();
             let result = json!({
                 "schema_version": 2,
-                "status": if report.valid { "HEALTHY" } else { "DEGRADED" },
+                "status": if valid { "HEALTHY" } else { "DEGRADED" },
                 "project": report.project,
-                "diagnostics": report.diagnostics,
+                "diagnostics": diagnostics,
                 "checks": {
                     "project_config": report.valid,
                     "sql_database": sql_database,
-                    "python_runtime": "partial"
+                    "python_runtime": python_runtime,
+                    "python_sdk": python_sdk
                 }
             });
-            if !report.valid {
+            if !valid {
                 return Err(DowaiError::Validation {
                     message: "Project health check failed".to_owned(),
-                    report: report_value,
+                    report: result,
                 });
             }
             if args.json {
                 Ok(Some(result))
             } else {
                 println!("DOWAI project checks passed.");
-                if args.check_connections {
+                if sql_database == "connected" {
                     println!("PostgreSQL connection check passed.");
                 }
-                println!("Python runtime supports limited Python-only model execution.");
+                if python_runtime == "configured" {
+                    println!("Python runtime and dowai SDK checks passed.");
+                }
                 Ok(None)
             }
         }

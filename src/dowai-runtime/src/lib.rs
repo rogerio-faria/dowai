@@ -1156,6 +1156,80 @@ fn resolve_python_model_path(
     Ok(model_path)
 }
 
+/// Name of the default connection profile declared by the project, read without connecting (ENT-016).
+pub fn declared_default_profile(project_dir: &Path) -> Result<Option<String>> {
+    let root = project_dir.canonicalize().map_err(|error| {
+        DowaiError::Path(format!(
+            "Project directory is unavailable: {} ({error})",
+            project_dir.display()
+        ))
+    })?;
+    let configuration = effective_configuration(&root)?;
+    Ok(configuration["effective"]["execution"]["default_profile"]
+        .as_str()
+        .map(str::to_owned))
+}
+
+/// Read-only check of the Python runtime declared by the project (ENT-016).
+/// Returns `None` when the project does not configure Python; otherwise the validated interpreter.
+pub fn check_python_runtime(project_dir: &Path) -> Result<Option<PathBuf>> {
+    let root = project_dir.canonicalize().map_err(|error| {
+        DowaiError::Path(format!(
+            "Project directory is unavailable: {} ({error})",
+            project_dir.display()
+        ))
+    })?;
+    if load_project(&root)?.python.is_none() {
+        return Ok(None);
+    }
+    let (_, python) = python_settings(&root)?;
+    Ok(Some(python.interpreter))
+}
+
+/// Verifies that the `dowai` SDK can be imported by the project interpreter, in isolated mode
+/// and with a bounded time (ENT-016). Nothing is installed.
+pub fn check_python_sdk(interpreter: &Path, project_dir: &Path) -> Result<()> {
+    const SDK_CHECK_TIMEOUT: Duration = Duration::from_secs(15);
+    let mut child = std::process::Command::new(interpreter)
+        .args(["-I", "-c", "import dowai"])
+        .current_dir(project_dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|_| {
+            DowaiError::PythonFailure(
+                "Could not start the configured project interpreter".to_owned(),
+            )
+        })?;
+    let deadline = std::time::Instant::now() + SDK_CHECK_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(_)) => {
+                return Err(DowaiError::PythonFailure(
+                    "The dowai SDK is not importable from the project interpreter".to_owned(),
+                ))
+            }
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(DowaiError::PythonTimeout(
+                    "The SDK check exceeded its time limit".to_owned(),
+                ));
+            }
+            Err(_) => {
+                return Err(DowaiError::PythonFailure(
+                    "Could not monitor the SDK check process".to_owned(),
+                ))
+            }
+        }
+    }
+}
+
 pub fn check_postgres_connection(
     project_dir: &Path,
     requested_profile: Option<&str>,
