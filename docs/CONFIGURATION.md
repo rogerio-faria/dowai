@@ -235,7 +235,7 @@ Unidades e limites aparecem na tabela. Limites mínimos e máximos são inclusiv
 | `plugins.default_timeout_seconds` | `300` | inteiro 1–86400 | s | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
 | `plugins.allow_network` | `false` | booleano | — | administrador `false` proíbe `true` | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
 | `plugins.allow_filesystem` | `false` | booleano | — | administrador `false` proíbe `true` | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
-| `plugins.allow_secrets` | `false` | booleano | — | administrador `false` proíbe `true` | validado; plugin que declara `secrets` só executa com `true` (ENT-056) |
+| `plugins.allow_secrets` | `false` | booleano | — | administrador `false` proíbe `true` | validado; plugin que declara `secrets` só executa com `true` (ENT-056); plugin `rest` usa o segredo `rest_token` quando `token` não é informado (ENT-109) |
 | `plugins.max_output_bytes` | `1048576` | inteiro 1024–67108864 | bytes | não pode exceder o teto administrativo | validado; limite do resultado JSON (stdout) do plugin (ENT-056) |
 | `plugins.require_idempotency_key` | `true` | booleano | — | administrador `true` impõe `true` | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
 

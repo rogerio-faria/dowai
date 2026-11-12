@@ -136,6 +136,26 @@ class RestPluginTests(unittest.TestCase):
         self.assertEqual(self.api.requests[0]["auth"], "Bearer segredo-123")
         self.assertNotIn("segredo-123", json.dumps(result))
 
+    def test_rest_token_secret_is_used_when_token_is_absent(self):
+        self.api.routes["/me"] = [(200, {"id": "u1"}, {}, 0)]
+        result = client.get(f"{self.api.base}/me", secrets={"rest_token": "segredo-host-456"})
+        self.assertEqual(self.api.requests[0]["auth"], "Bearer segredo-host-456")
+        self.assertNotIn("segredo-host-456", json.dumps(result))
+
+    def test_explicit_token_takes_precedence_over_secret(self):
+        self.api.routes["/me"] = [(200, {"id": "u1"}, {}, 0)]
+        client.get(f"{self.api.base}/me", token="explicito-789", secrets={"rest_token": "segredo-host-456"})
+        self.assertEqual(self.api.requests[0]["auth"], "Bearer explicito-789")
+
+    def test_rest_token_secret_in_post_and_get_pages(self):
+        self.api.routes["/items"] = [(200, {"data": [{"id": 1}]}, {}, 0)]
+        self.api.routes["/send"] = [(200, {"ok": True}, {}, 0)]
+        client.post(f"{self.api.base}/send", body={"a": 1}, secrets={"rest_token": "segredo-post"})
+        result = client.get_pages(f"{self.api.base}/items", secrets={"rest_token": "segredo-pages"})
+        self.assertEqual(self.api.requests[0]["auth"], "Bearer segredo-post")
+        self.assertEqual(self.api.requests[1]["auth"], "Bearer segredo-pages")
+        self.assertNotIn("segredo-pages", json.dumps(result))
+
     def test_post_sends_json_body(self):
         self.api.routes["/orders"] = [(201, {"id": 7}, {}, 0)]
         result = client.post(f"{self.api.base}/orders", body={"sku": "A1"})

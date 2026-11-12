@@ -75,7 +75,7 @@ fn open_policy() -> PluginPolicy {
 }
 
 /// API falsa: responde às requisições em ordem com `(status, cabeçalhos extras, corpo)` e
-/// devolve a lista das requisições recebidas (primeira linha de cada uma).
+/// devolve o cabeçalho HTTP completo de cada requisição recebida.
 fn fake_api(
     responses: Vec<(u16, &'static str, String)>,
 ) -> (String, thread::JoinHandle<Vec<String>>) {
@@ -94,7 +94,7 @@ fn fake_api(
                 }
             }
             let head = String::from_utf8_lossy(&buffer);
-            seen.push(head.lines().next().unwrap_or_default().to_owned());
+            seen.push(head.into_owned());
             let reason = match status {
                 200 => "OK",
                 429 => "Too Many Requests",
@@ -183,6 +183,43 @@ fn bearer_token_reaches_the_api_and_not_the_result() {
     server.join().expect("server");
     assert_eq!(value["result"]["status"], 200);
     assert!(!value.to_string().contains("tok-super-secreto"));
+}
+
+#[test]
+fn rest_token_secret_reaches_the_api_when_token_is_absent_and_never_the_result() {
+    // Único teste deste arquivo que mexe em DOWAI_SECRET_REST_TOKEN (ENT-109).
+    const SECRET: &str = "tok-do-segredo-host";
+    std::env::set_var("DOWAI_SECRET_REST_TOKEN", SECRET);
+    let fixture = Fixture::new();
+    let (base, server) = fake_api(vec![(200, "", json!({"id": "u1"}).to_string())]);
+
+    let value = fixture
+        .execute(
+            "rest.get",
+            json!({
+                "url": format!("{base}/me"),
+                "timeout_seconds": 5,
+                "max_attempts": 1,
+            }),
+            Some("get-segredo-1"),
+            &open_policy(),
+        )
+        .expect("get com segredo");
+
+    let requests = server.join().expect("server");
+    std::env::remove_var("DOWAI_SECRET_REST_TOKEN");
+    assert_eq!(value["result"]["status"], 200);
+    assert!(
+        requests[0].contains(&format!("Authorization: Bearer {SECRET}")),
+        "o token do segredo deve chegar à API: {}",
+        requests[0]
+    );
+    assert!(!value.to_string().contains(SECRET));
+    let audit = fs::read_to_string(fixture.root.join("state/audit.jsonl")).unwrap_or_default();
+    assert!(
+        !audit.contains(SECRET),
+        "o token não pode aparecer no AUDIT"
+    );
 }
 
 #[test]

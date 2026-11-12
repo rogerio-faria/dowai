@@ -9,8 +9,9 @@ Regras:
 - 429 é reexecutado com backoff exponencial (ou `Retry-After` numérico, limitado).
 - Redirecionamentos não são seguidos, para o token não sair para outro host.
 - Timeout por requisição vira `RestError` com código `DOWAI_REST_TIMEOUT`.
-- O token é recebido pelo chamador e nunca é devolvido no resultado nem escrito em log.
-  Resolução por referência de segredo fica para a tarefa do plugin de e-mail (D-072).
+- O token vem de `token` (valor do chamador) ou, se ausente, do segredo `rest_token` entregue pelo
+  host em `secrets` (ENT-109, D-076). Um token explícito prevalece sobre o segredo.
+- O token nunca é devolvido no resultado nem escrito em log.
 """
 
 import json
@@ -49,6 +50,14 @@ def _check_limits(timeout_seconds, max_attempts, backoff_seconds):
         raise RestError("DOWAI_REST_INPUT_INVALID", "max_attempts fora do intervalo 1 a 10")
     if float(backoff_seconds) < 0:
         raise RestError("DOWAI_REST_INPUT_INVALID", "backoff_seconds não pode ser negativo")
+
+
+def _resolve_token(token, secrets):
+    """Token explícito do chamador tem prioridade; senão usa o segredo `rest_token` do host."""
+    if token:
+        return token
+    value = (secrets or {}).get("rest_token")
+    return value if value else None
 
 
 def _headers(headers, token, auth_header, json_body):
@@ -115,11 +124,13 @@ def get(
     url: str,
     headers: dict | None = None,
     token: str | None = None,
+    secrets: dict | None = None,
     auth_header: str = "Authorization",
     timeout_seconds: int = 10,
     max_attempts: int = 3,
     backoff_seconds: float = 1.0,
 ) -> dict:
+    token = _resolve_token(token, secrets)
     status, body, retries = _send(
         "GET",
         url,
@@ -137,11 +148,13 @@ def post(
     body: dict | None = None,
     headers: dict | None = None,
     token: str | None = None,
+    secrets: dict | None = None,
     auth_header: str = "Authorization",
     timeout_seconds: int = 10,
     max_attempts: int = 3,
     backoff_seconds: float = 1.0,
 ) -> dict:
+    token = _resolve_token(token, secrets)
     status, decoded, retries = _send(
         "POST",
         url,
@@ -163,6 +176,7 @@ def get_pages(
     include_items: bool = False,
     headers: dict | None = None,
     token: str | None = None,
+    secrets: dict | None = None,
     auth_header: str = "Authorization",
     timeout_seconds: int = 10,
     max_attempts: int = 3,
@@ -171,6 +185,7 @@ def get_pages(
     """Lê páginas por cursor até `cursor_key` ser nulo. Cursor repetido interrompe a leitura."""
     if not 1 <= int(max_pages) <= MAX_PAGES_LIMIT:
         raise RestError("DOWAI_REST_INPUT_INVALID", "max_pages fora do intervalo 1 a 10000")
+    token = _resolve_token(token, secrets)
     base_headers = _headers(headers, token, auth_header, None)
     seen_cursors = set()
     items = []

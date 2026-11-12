@@ -15,7 +15,8 @@ Todas as chamadas exigem `idempotency_key` (o manifesto marca efeitos externos),
 
 ## Parâmetros principais
 
-- `url` (obrigatório), `headers`, `token` (valor já resolvido pelo chamador), `auth_header` (padrão `Authorization`, com `Bearer`).
+- `url` (obrigatório), `headers`, `token` (valor do chamador; opcional), `auth_header` (padrão `Authorization`, com `Bearer`).
+- Autenticação: se `token` não for informado, usa o segredo `rest_token` entregue pelo host (`DOWAI_SECRET_REST_TOKEN`). Um `token` explícito prevalece sobre o segredo.
 - `timeout_seconds` (1 a 300), `max_attempts` (1 a 10), `backoff_seconds` (exponencial; `Retry-After` numérico até 60 s).
 - `get_pages`: `items_key` (padrão `data`), `cursor_key` (padrão `next_cursor`), `cursor_param` (padrão `cursor`), `max_pages` (padrão 100).
 
@@ -30,7 +31,7 @@ Todas as chamadas exigem `idempotency_key` (o manifesto marca efeitos externos),
 ## Permissões e limitações
 
 - Manifesto declara `network: ["rest_api"]` e `secrets: ["rest_token"]`. A política precisa permitir `plugins.allow_network` e `plugins.allow_secrets`.
-- Segredo: nesta fase o token chega como valor pelo chamador. Resolver referência de segredo fica para o plugin de e-mail (ENT-059, D-072).
+- Segredo `rest_token`: entregue pelo host somente com `plugins.allow_secrets = true` e fora de argumentos, ambiente visível e AUDIT (D-076, ENT-109). Sem o segredo e sem `token`, a requisição segue sem autenticação.
 - Bloqueio de rede é cooperativo (hook de auditoria do worker), não sandbox de SO (ENT-108).
 
 ## Testes
