@@ -4,7 +4,8 @@ use dowai_core::{
     load_workspace_profile, plan, read_planned_model, resolve_effective_configuration, sha256_hex,
     source_relation_key, user_config_path, verify_planned_model, CancellationToken, DowaiError,
     ExecutionMode, ExecutionPlan, Materialization, NewInvocation, NewRun, PlanNode, Result,
-    RunStore, SessionStore, TemplateOptions, VariableOrigin, VersionedSnapshot, WorkspaceProfile,
+    RunStart, RunStore, SessionStore, TemplateOptions, VariableOrigin, VersionedSnapshot,
+    WorkspaceProfile,
 };
 use dowai_postgres::{
     quote_identifier, AdapterError, Materialization as PostgresMaterialization, PgProfile,
@@ -345,6 +346,45 @@ fn run_selected(
         python: Vec::new(),
         extra: Vec::new(),
     };
+    // Startup recovery and in-flight marker (ENT-062). The journal is optional for execution:
+    // failures become warnings, as the final journal write already does.
+    let journal_store = default_run_store_path().map(RunStore::for_user_state);
+    if let Some(store) = &journal_store {
+        match store.recover_interrupted(current_time_ms()) {
+            Ok(report) => {
+                if !report.interrupted_runs.is_empty() {
+                    eprintln!(
+                        "Warning: {} interrupted run(s) recorded as FAILED ({})",
+                        report.interrupted_runs.len(),
+                        dowai_core::RUN_INTERRUPTED_CODE
+                    );
+                }
+                if report.uncertain_effects > 0 {
+                    eprintln!(
+                        "Warning: {} outbox effect(s) marked UNCERTAIN; they are not resent",
+                        report.uncertain_effects
+                    );
+                }
+            }
+            Err(error) => eprintln!("Warning: interrupted runs could not be recovered: {error}"),
+        }
+    }
+    // Held until the end of this function, so it outlives the journal write below.
+    let _lease = journal_store.as_ref().and_then(|store| {
+        store
+            .begin_run(&RunStart {
+                run_id: run_id.clone(),
+                session_id: journal_request.session.clone(),
+                project: project_display_name(project_dir).unwrap_or_default(),
+                execution_mode: trace.execution_mode.clone(),
+                started_at_ms: started_ms,
+                requested_targets: Some(journal_request.targets.clone()),
+                profile: journal_request.profile.clone(),
+                variable_count: journal_request.variable_count,
+            })
+            .map_err(|error| eprintln!("Warning: the run start could not be journaled: {error}"))
+            .ok()
+    });
     let outcome = execute_run(
         project_dir,
         request,

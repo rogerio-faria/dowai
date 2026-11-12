@@ -46,9 +46,9 @@ pub use project::{
     ValidationReport,
 };
 pub use runs::{
-    current_time_ms, default_run_store_path, filter_invocations, invocation_depths,
-    InvocationEntry, LogLevel, NewInvocation, NewRun, RetrySource, RunDetail, RunStore, RunSummary,
-    RUN_SCHEMA_VERSION,
+    current_time_ms, default_run_store_path, filter_invocations, invocation_depths, ActivityGuard,
+    InvocationEntry, LogLevel, NewInvocation, NewRun, RecoveryReport, RetrySource, RunDetail,
+    RunLease, RunStart, RunStore, RunSummary, RUN_INTERRUPTED_CODE, RUN_SCHEMA_VERSION,
 };
 pub use sessions::{
     current_owner, default_session_store_path, session_limits_from_config, session_ttl_from_config,

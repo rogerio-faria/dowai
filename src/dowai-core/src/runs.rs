@@ -11,11 +11,54 @@ use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-#[cfg(test)]
 use uuid::Uuid;
 
 /// Current `PRAGMA user_version` of the run journal database.
-pub const RUN_SCHEMA_VERSION: i64 = 4;
+pub const RUN_SCHEMA_VERSION: i64 = 5;
+
+/// Reason recorded for a run whose process died before its final record (ENT-062).
+pub const RUN_INTERRUPTED_CODE: &str = "DOWAI_RUN_INTERRUPTED";
+
+/// Identity and request facts of a run, written when it starts (`run_inflight`). Holds no
+/// variable values, like the final record.
+#[derive(Clone, Debug)]
+pub struct RunStart {
+    pub run_id: String,
+    pub session_id: Option<String>,
+    pub project: String,
+    pub execution_mode: Option<String>,
+    pub started_at_ms: i64,
+    pub requested_targets: Option<Vec<String>>,
+    pub profile: Option<String>,
+    pub variable_count: Option<u32>,
+}
+
+/// Proof that a run is alive. While it exists, the OS-level locks of the run and the shared
+/// journal gate are held. Dropping it without [`RunStore::record`] leaves the run in
+/// `run_inflight`; the next [`RunStore::recover_interrupted`] then treats it as interrupted.
+#[derive(Debug)]
+pub struct RunLease {
+    _run_lock: fs::File,
+    _gate: fs::File,
+}
+
+/// Shared hold on the journal gate taken by work that may leave outbox entries `SENT`.
+/// Recovery marks such entries `UNCERTAIN` only when no guard is alive anywhere.
+#[derive(Debug)]
+pub struct ActivityGuard {
+    _gate: fs::File,
+}
+
+/// What [`RunStore::recover_interrupted`] found and changed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RecoveryReport {
+    /// Runs whose process died; each is recorded as `FAILED` with `DOWAI_RUN_INTERRUPTED`.
+    pub interrupted_runs: Vec<String>,
+    /// Outbox entries that were `SENT` and became `UNCERTAIN`.
+    pub uncertain_effects: usize,
+    /// `true` when live work prevented the outbox check; it runs at the next recovery.
+    pub outbox_deferred: bool,
+}
 pub const MAX_LIST_LIMIT: usize = 1_000;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_TARGET_CHARS: usize = 256;
@@ -236,6 +279,23 @@ impl RunStore {
     pub fn record(&self, run: &NewRun, invocations: &[NewInvocation]) -> Result<()> {
         let mut connection = self.connect()?;
         let transaction = connection.transaction().map_err(state_error)?;
+        // The final record and the removal of the in-flight marker commit together: a run is
+        // either recorded or still in flight, never both.
+        transaction
+            .execute(
+                "DELETE FROM run_inflight WHERE run_id = ?1",
+                params![run.run_id],
+            )
+            .map_err(state_error)?;
+        Self::insert_record(&transaction, run, invocations)?;
+        transaction.commit().map_err(state_error)
+    }
+
+    fn insert_record(
+        transaction: &rusqlite::Transaction<'_>,
+        run: &NewRun,
+        invocations: &[NewInvocation],
+    ) -> Result<()> {
         transaction
             .execute(
                 "INSERT INTO runs (run_id, session_id, project, status, execution_mode,
@@ -280,7 +340,121 @@ impl RunStore {
                 )
                 .map_err(state_error)?;
         }
-        transaction.commit().map_err(state_error)
+        Ok(())
+    }
+
+    /// Marks a run as started. Holds the run lock and a shared journal gate until the lease is
+    /// dropped. Call [`RunStore::record`] before dropping it on success or failure.
+    pub fn begin_run(&self, start: &RunStart) -> Result<RunLease> {
+        Uuid::parse_str(&start.run_id)
+            .map_err(|_| DowaiError::State("Run id is malformed".to_owned()))?;
+        let gate = self.open_lock(GATE_FILE)?;
+        gate.lock_shared().map_err(lock_error)?;
+        let run_lock = self.open_lock(&run_lock_name(&start.run_id))?;
+        match run_lock.try_lock() {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => {
+                return Err(DowaiError::State("Run lock is already held".to_owned()))
+            }
+            Err(fs::TryLockError::Error(error)) => return Err(lock_error(error)),
+        }
+        let connection = self.connect()?;
+        connection
+            .execute(
+                "INSERT INTO run_inflight (run_id, project, session_id, execution_mode,
+                   started_at_ms, requested_targets, profile, variable_count)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    start.run_id,
+                    bounded(&start.project),
+                    start.session_id,
+                    start.execution_mode,
+                    start.started_at_ms,
+                    targets_json(start.requested_targets.as_deref())?,
+                    start.profile.as_deref().map(bounded),
+                    start.variable_count.map(i64::from),
+                ],
+            )
+            .map_err(state_error)?;
+        Ok(RunLease {
+            _run_lock: run_lock,
+            _gate: gate,
+        })
+    }
+
+    /// Takes a shared hold on the journal gate for work that may leave outbox entries `SENT`.
+    pub fn activity_guard(&self) -> Result<ActivityGuard> {
+        let gate = self.open_lock(GATE_FILE)?;
+        gate.lock_shared().map_err(lock_error)?;
+        Ok(ActivityGuard { _gate: gate })
+    }
+
+    /// Startup recovery (ENT-062). A run whose lock is free but whose in-flight marker remains
+    /// died before its final record: it is recorded as `FAILED` with `DOWAI_RUN_INTERRUPTED`,
+    /// never as a success. Runs still holding their lock are left alone. When no run or
+    /// guarded call is alive, outbox entries `SENT` become `UNCERTAIN` and are never resent.
+    /// Session variables are not touched: they changed only through committed transactions,
+    /// so the last committed revision is the checkpoint.
+    pub fn recover_interrupted(&self, now_ms: i64) -> Result<RecoveryReport> {
+        let mut report = RecoveryReport::default();
+        let gate = self.open_lock(GATE_FILE)?;
+        let quiescent = match gate.try_lock() {
+            Ok(()) => true,
+            Err(fs::TryLockError::WouldBlock) => false,
+            Err(fs::TryLockError::Error(error)) => return Err(lock_error(error)),
+        };
+        let mut connection = self.connect()?;
+        for start in read_inflight(&connection)? {
+            let run_lock = self.open_lock(&run_lock_name(&start.run_id))?;
+            match run_lock.try_lock() {
+                Ok(()) => {}
+                Err(fs::TryLockError::WouldBlock) => continue,
+                Err(fs::TryLockError::Error(error)) => return Err(lock_error(error)),
+            }
+            let transaction = connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(state_error)?;
+            // A run recorded between the read above and the lock check has no marker left.
+            let removed = transaction
+                .execute(
+                    "DELETE FROM run_inflight WHERE run_id = ?1",
+                    params![start.run_id],
+                )
+                .map_err(state_error)?;
+            if removed == 1 {
+                let interrupted = interrupted_run(&start, now_ms);
+                Self::insert_record(&transaction, &interrupted, &[])?;
+                transaction.commit().map_err(state_error)?;
+                report.interrupted_runs.push(start.run_id.clone());
+            }
+        }
+        if quiescent {
+            report.uncertain_effects = self.outbox_recover_sent()?;
+        } else {
+            report.outbox_deferred = true;
+        }
+        Ok(report)
+    }
+
+    fn open_lock(&self, name: &str) -> Result<fs::File> {
+        let directory = self
+            .path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .join("run-locks");
+        fs::create_dir_all(&directory)?;
+        set_private_directory_permissions(&directory)?;
+        let path = directory.join(name);
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(lock_error)?;
+        set_private_file_permissions(&path)?;
+        Ok(file)
     }
 
     /// Most recent runs first. `limit` must be within `1..=1000`.
@@ -444,12 +618,18 @@ impl RunStore {
                 migrate_v1_to_v2(&mut connection)?;
                 migrate_v2_to_v3(&mut connection)?;
                 migrate_v3_to_v4(&mut connection)?;
+                migrate_v4_to_v5(&mut connection)?;
             }
             2 => {
                 migrate_v2_to_v3(&mut connection)?;
                 migrate_v3_to_v4(&mut connection)?;
+                migrate_v4_to_v5(&mut connection)?;
             }
-            3 => migrate_v3_to_v4(&mut connection)?,
+            3 => {
+                migrate_v3_to_v4(&mut connection)?;
+                migrate_v4_to_v5(&mut connection)?;
+            }
+            4 => migrate_v4_to_v5(&mut connection)?,
             RUN_SCHEMA_VERSION => {}
             other => {
                 return Err(DowaiError::State(format!(
@@ -555,6 +735,32 @@ fn migrate_v3_to_v4(connection: &mut Connection) -> Result<()> {
     transaction.commit().map_err(state_error)
 }
 
+/// Schema 5 adds `run_inflight`: one row per run that has started and not yet been recorded.
+/// A row left behind by a dead process is how startup recovery finds interrupted runs (ENT-062).
+fn migrate_v4_to_v5(connection: &mut Connection) -> Result<()> {
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(state_error)?;
+    if user_version(&transaction)? == 4 {
+        transaction
+            .execute_batch(
+                "CREATE TABLE run_inflight (
+                   run_id TEXT PRIMARY KEY,
+                   project TEXT NOT NULL,
+                   session_id TEXT,
+                   execution_mode TEXT CHECK (execution_mode IS NULL OR execution_mode IN ('automatic','manual')),
+                   started_at_ms INTEGER NOT NULL,
+                   requested_targets TEXT,
+                   profile TEXT,
+                   variable_count INTEGER CHECK (variable_count IS NULL OR variable_count >= 0)
+                 );
+                 PRAGMA user_version = 5;",
+            )
+            .map_err(state_error)?;
+    }
+    transaction.commit().map_err(state_error)
+}
+
 /// JSON array of the requested targets; `None` stays NULL.
 fn targets_json(targets: Option<&[String]>) -> Result<Option<String>> {
     targets
@@ -565,6 +771,67 @@ fn targets_json(targets: Option<&[String]>) -> Result<Option<String>> {
                 .map_err(|error| DowaiError::State(format!("Run journal encoding failed: {error}")))
         })
         .transpose()
+}
+
+/// Journal gate: shared while a run or a guarded call is alive, exclusive during recovery.
+const GATE_FILE: &str = "journal.gate";
+
+fn run_lock_name(run_id: &str) -> String {
+    format!("run-{run_id}.lock")
+}
+
+fn lock_error(error: std::io::Error) -> DowaiError {
+    DowaiError::State(format!("Run journal lock is unavailable: {error}"))
+}
+
+/// In-flight markers in `run_id` order. Targets that cannot be decoded are treated as absent,
+/// so recovery still records the run.
+fn read_inflight(connection: &rusqlite::Connection) -> Result<Vec<RunStart>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT run_id, project, session_id, execution_mode, started_at_ms,
+               requested_targets, profile, variable_count
+             FROM run_inflight ORDER BY started_at_ms, run_id",
+        )
+        .map_err(state_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            let targets: Option<String> = row.get(5)?;
+            let variable_count: Option<i64> = row.get(7)?;
+            Ok(RunStart {
+                run_id: row.get(0)?,
+                project: row.get(1)?,
+                session_id: row.get(2)?,
+                execution_mode: row.get(3)?,
+                started_at_ms: row.get(4)?,
+                requested_targets: targets.and_then(|text| serde_json::from_str(&text).ok()),
+                profile: row.get(6)?,
+                variable_count: variable_count.and_then(|count| u32::try_from(count).ok()),
+            })
+        })
+        .map_err(state_error)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(state_error)
+}
+
+/// The `FAILED` record of a run that died before recording itself. It has no invocations:
+/// those were never journaled, and nothing is claimed about them.
+fn interrupted_run(start: &RunStart, now_ms: i64) -> NewRun {
+    let finished_at_ms = now_ms.max(start.started_at_ms);
+    NewRun {
+        run_id: start.run_id.clone(),
+        session_id: start.session_id.clone(),
+        project: start.project.clone(),
+        status: "FAILED".to_owned(),
+        execution_mode: start.execution_mode.clone(),
+        started_at_ms: start.started_at_ms,
+        finished_at_ms,
+        duration_ms: u64::try_from(finished_at_ms - start.started_at_ms).unwrap_or(0),
+        error_code: Some(RUN_INTERRUPTED_CODE.to_owned()),
+        requested_targets: start.requested_targets.clone(),
+        profile: start.profile.clone(),
+        variable_count: start.variable_count,
+    }
 }
 
 const RUN_COLUMNS: &str = "run_id, session_id, project, status, execution_mode, started_at, \
@@ -1169,5 +1436,270 @@ mod tests {
         assert_eq!(source.requested_targets, None);
         assert_eq!(source.variable_count, None);
         assert_eq!(fixture.store.list(5).expect("list").len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use crate::state::OutboxStatus;
+    use crate::{SessionStore, VariableOrigin};
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    struct Fixture {
+        dir: PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            Self {
+                dir: std::env::temp_dir().join(format!("dowai-recovery-test-{}", Uuid::new_v4())),
+            }
+        }
+        fn journal(&self) -> RunStore {
+            RunStore::new(self.dir.join("state/runs.sqlite3"))
+        }
+        fn sessions(&self) -> SessionStore {
+            SessionStore::new(self.dir.join("state/sessions.sqlite3"))
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn start(run_id: &str, started_ms: i64, session_id: Option<String>) -> RunStart {
+        RunStart {
+            run_id: run_id.to_owned(),
+            session_id,
+            project: "fixture".to_owned(),
+            execution_mode: Some("automatic".to_owned()),
+            started_at_ms: started_ms,
+            requested_targets: Some(vec!["model.py".to_owned()]),
+            profile: None,
+            variable_count: Some(0),
+        }
+    }
+
+    fn final_record(run_id: &str, started_ms: i64, status: &str) -> NewRun {
+        NewRun {
+            run_id: run_id.to_owned(),
+            session_id: None,
+            project: "fixture".to_owned(),
+            status: status.to_owned(),
+            execution_mode: Some("automatic".to_owned()),
+            started_at_ms: started_ms,
+            finished_at_ms: started_ms + 10,
+            duration_ms: 10,
+            error_code: None,
+            requested_targets: Some(vec!["model.py".to_owned()]),
+            profile: None,
+            variable_count: Some(0),
+        }
+    }
+
+    fn nothing_to_do() -> RecoveryReport {
+        RecoveryReport::default()
+    }
+
+    #[test]
+    fn completed_run_leaves_no_marker_and_is_not_recovered() {
+        let fixture = Fixture::new();
+        let journal = fixture.journal();
+        let run_id = Uuid::new_v4().to_string();
+        let lease = journal
+            .begin_run(&start(&run_id, 1_000, None))
+            .expect("begin");
+        journal
+            .record(&final_record(&run_id, 1_000, "SUCCEEDED"), &[])
+            .expect("record");
+        drop(lease);
+
+        assert_eq!(
+            journal.recover_interrupted(5_000).expect("recover"),
+            nothing_to_do()
+        );
+        assert_eq!(journal.get(&run_id).expect("get").run.status, "SUCCEEDED");
+    }
+
+    #[test]
+    fn run_that_died_before_recording_is_recorded_as_failed_interrupted() {
+        // Crash after the start marker and before the final record (phase: execution).
+        let fixture = Fixture::new();
+        let journal = fixture.journal();
+        let run_id = Uuid::new_v4().to_string();
+        let lease = journal
+            .begin_run(&start(&run_id, 1_000, None))
+            .expect("begin");
+        drop(lease);
+
+        let report = journal.recover_interrupted(4_000).expect("recover");
+        assert_eq!(report.interrupted_runs, vec![run_id.clone()]);
+        let detail = journal.get(&run_id).expect("get");
+        assert_eq!(detail.run.status, "FAILED", "never reported as success");
+        assert_eq!(detail.run.error_code.as_deref(), Some(RUN_INTERRUPTED_CODE));
+        assert_eq!(detail.run.duration_ms, 3_000);
+        assert!(detail.invocations.is_empty());
+
+        assert_eq!(
+            journal.recover_interrupted(9_000).expect("again"),
+            nothing_to_do(),
+            "recovery is idempotent"
+        );
+    }
+
+    #[test]
+    fn live_run_is_not_recovered_while_its_lease_is_held() {
+        let fixture = Fixture::new();
+        let journal = fixture.journal();
+        let run_id = Uuid::new_v4().to_string();
+        let lease = journal
+            .begin_run(&start(&run_id, 1_000, None))
+            .expect("begin");
+
+        let report = journal
+            .recover_interrupted(2_000)
+            .expect("recover while alive");
+        assert!(report.interrupted_runs.is_empty());
+        assert!(report.outbox_deferred);
+        assert!(
+            journal.get(&run_id).is_err(),
+            "still in flight, not recorded"
+        );
+
+        let duplicate = journal.begin_run(&start(&run_id, 1_000, None));
+        assert!(
+            duplicate.is_err(),
+            "a second lease on the same run is refused"
+        );
+
+        drop(lease);
+        let report = journal
+            .recover_interrupted(3_000)
+            .expect("recover after death");
+        assert_eq!(report.interrupted_runs, vec![run_id]);
+    }
+
+    #[test]
+    fn sent_effect_becomes_uncertain_only_when_no_activity_is_alive() {
+        // Crash between the claim (SENT) and the confirmation (phase: send).
+        let fixture = Fixture::new();
+        let journal = fixture.journal();
+        journal
+            .outbox_enqueue("mail-1", "email", "gerente")
+            .expect("enqueue");
+        assert!(journal.outbox_claim("mail-1").expect("claim"));
+
+        let guard = journal.activity_guard().expect("guard");
+        let report = journal.recover_interrupted(1).expect("recover during send");
+        assert!(report.outbox_deferred);
+        assert_eq!(report.uncertain_effects, 0);
+        assert_eq!(
+            journal
+                .outbox_get("mail-1")
+                .expect("get")
+                .expect("entry")
+                .status,
+            OutboxStatus::Sent
+        );
+
+        drop(guard);
+        let report = journal.recover_interrupted(2).expect("recover after send");
+        assert!(!report.outbox_deferred);
+        assert_eq!(report.uncertain_effects, 1);
+        assert_eq!(
+            journal
+                .outbox_get("mail-1")
+                .expect("get")
+                .expect("entry")
+                .status,
+            OutboxStatus::Uncertain
+        );
+        assert!(
+            !journal.outbox_claim("mail-1").expect("claim again"),
+            "an UNCERTAIN effect is never claimed for resending"
+        );
+    }
+
+    #[test]
+    fn crash_after_session_commit_keeps_the_committed_checkpoint() {
+        // Crash after the variables were committed and before the run was recorded
+        // (phase: commit then registration). The committed value is the checkpoint.
+        let fixture = Fixture::new();
+        let journal = fixture.journal();
+        let sessions = fixture.sessions();
+        let project = crate::create_project(&fixture.dir, "fixture").expect("project");
+        let session = sessions
+            .create(&project, Duration::from_secs(3_600))
+            .expect("session");
+        let base = sessions
+            .snapshot_versioned(&session.session_id)
+            .expect("base snapshot");
+        let run_id = Uuid::new_v4().to_string();
+        let lease = journal
+            .begin_run(&start(&run_id, 1_000, Some(session.session_id.clone())))
+            .expect("begin");
+        let changes = BTreeMap::from([("stage".to_owned(), json!("ready"))]);
+        let origin = VariableOrigin {
+            run_id: run_id.clone(),
+            invocation_id: Uuid::new_v4().to_string(),
+        };
+        sessions
+            .commit_variables(&session.session_id, &changes, &base.revisions, &origin)
+            .expect("commit");
+        drop(lease);
+
+        let report = journal.recover_interrupted(2_000).expect("recover");
+        assert_eq!(report.interrupted_runs, vec![run_id.clone()]);
+        assert_eq!(journal.get(&run_id).expect("get").run.status, "FAILED");
+        let snapshot = sessions.snapshot(&session.session_id).expect("snapshot");
+        assert_eq!(snapshot.get("stage"), Some(&json!("ready")));
+    }
+
+    #[test]
+    fn crash_before_session_commit_leaves_no_partial_variables() {
+        // Crash before the commit (phase: preparation): nothing from the run is published.
+        let fixture = Fixture::new();
+        let journal = fixture.journal();
+        let sessions = fixture.sessions();
+        let project = crate::create_project(&fixture.dir, "fixture").expect("project");
+        let session = sessions
+            .create(&project, Duration::from_secs(3_600))
+            .expect("session");
+        let run_id = Uuid::new_v4().to_string();
+        let lease = journal
+            .begin_run(&start(&run_id, 1_000, Some(session.session_id.clone())))
+            .expect("begin");
+        drop(lease);
+
+        journal.recover_interrupted(2_000).expect("recover");
+        assert!(sessions
+            .snapshot(&session.session_id)
+            .expect("snapshot")
+            .is_empty());
+    }
+
+    #[test]
+    fn schema_four_journal_gains_the_inflight_table() {
+        let fixture = Fixture::new();
+        let journal = fixture.journal();
+        journal.schema_version().expect("create");
+        let connection = Connection::open(fixture.dir.join("state/runs.sqlite3")).expect("open");
+        connection
+            .execute_batch("DROP TABLE run_inflight; PRAGMA user_version = 4;")
+            .expect("downgrade to schema 4");
+        drop(connection);
+
+        assert_eq!(
+            journal.schema_version().expect("migrated"),
+            RUN_SCHEMA_VERSION
+        );
+        let lease = journal
+            .begin_run(&start(&Uuid::new_v4().to_string(), 1, None))
+            .expect("begin after migration");
+        drop(lease);
     }
 }

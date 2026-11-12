@@ -341,6 +341,12 @@ fn run(execution: &PluginExecution<'_>) -> Result<Value> {
     let working_dir = std::fs::canonicalize(plugin_dir)?;
 
     let tracked = key.filter(|_| manifest.idempotency_key_required || manifest.side_effects);
+    // A tracked call may leave its outbox entry `SENT`; the shared hold keeps startup recovery
+    // from marking it `UNCERTAIN` while the call is still in progress.
+    let _activity = match (tracked, execution.store) {
+        (Some(_), Some(store)) => Some(store.activity_guard()?),
+        _ => None,
+    };
     let outbox = match tracked {
         Some(key) => {
             let store = execution.store.ok_or_else(|| {

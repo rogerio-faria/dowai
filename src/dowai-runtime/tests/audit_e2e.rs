@@ -1,7 +1,10 @@
 //! AUDIT trail (plan 12.2, 12.3 item 9, 3.4, 20; P21): a stream separate from logs,
 //! recorded for every run without values, SQL, credentials, free text or absolute paths.
 
-use dowai_core::{create_project, default_audit_log_path, AuditEvent, AuditLog};
+use dowai_core::{
+    create_project, current_time_ms, default_audit_log_path, default_run_store_path, AuditEvent,
+    AuditLog, RunStore,
+};
 use dowai_runtime::{run_postgres, RunRequest};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -411,4 +414,26 @@ fn node_invocation_and_run_events_carry_durations() {
     );
     assert!(run_finished.duration_ms >= node_finished[0].duration_ms);
     assert!(harness.raw().contains("\"duration_ms\""));
+}
+
+#[test]
+fn finished_run_is_journaled_and_leaves_no_in_flight_marker() {
+    // ENT-062: a completed run removes its start marker in the same commit as its record,
+    // so startup recovery finds nothing to repair.
+    let harness = Harness::new();
+    harness.model("a.py", "def model(env):\n    env.setVar('stage', 'x')\n");
+    let result = harness.run("a.py").expect("run succeeds");
+
+    let journal = RunStore::for_user_state(default_run_store_path().expect("isolated path"));
+    let recovery = journal
+        .recover_interrupted(current_time_ms())
+        .expect("recover");
+    assert!(
+        recovery.interrupted_runs.is_empty(),
+        "a finished run must not leave an in-flight marker"
+    );
+    let runs = journal.list(10).expect("list");
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].run_id, result.run_id);
+    assert_eq!(runs[0].status, "SUCCEEDED");
 }
