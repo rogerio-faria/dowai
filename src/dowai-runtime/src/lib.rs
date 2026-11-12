@@ -1441,9 +1441,13 @@ fn template_options(configuration: &Value) -> Result<TemplateOptions> {
     let strict_undefined = templates["strict_undefined"].as_bool().ok_or_else(|| {
         DowaiError::Config("Effective templates.strict_undefined is invalid".to_owned())
     })?;
+    let allow_dowai_if_alias = templates["allow_dowai_if_alias"].as_bool().ok_or_else(|| {
+        DowaiError::Config("Effective templates.allow_dowai_if_alias is invalid".to_owned())
+    })?;
     Ok(TemplateOptions {
         max_nesting,
         strict_undefined,
+        allow_dowai_if_alias,
     })
 }
 

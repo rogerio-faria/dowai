@@ -179,14 +179,14 @@ Unidades e limites aparecem na tabela. Limites mínimos e máximos são inclusiv
 
 | Parâmetro | Default | Tipo e validação | Unidade | Teto administrativo | Estado |
 |---|---|---|---|---|---|
-| `runtime.max_parallel_nodes` | `4` | inteiro 1–256 | nós | não pode exceder o teto administrativo | validado; ainda sem consumo pelo runtime |
-| `runtime.max_worker_processes` | `4` | inteiro 1–64 | processos | não pode exceder o teto administrativo | validado; ainda sem consumo pelo runtime |
-| `runtime.max_threads` | `8` | inteiro 1–256 | threads | não pode exceder o teto administrativo | validado; ainda sem consumo pelo runtime |
-| `runtime.max_cpu_percent` | `100` | inteiro 1–100 | % de CPU | não pode exceder o teto administrativo | validado; ainda sem consumo pelo runtime |
-| `runtime.max_memory_mb` | `2048` | inteiro 64–1048576 | MiB | não pode exceder o teto administrativo | validado; ainda sem consumo pelo runtime |
-| `runtime.max_inflight_bytes` | `134217728` | inteiro 1–1099511627776 | bytes | não pode exceder o teto administrativo | validado; ainda sem consumo pelo runtime |
-| `runtime.queue_capacity` | `1000` | inteiro 1–1000000 | itens | não pode exceder o teto administrativo | validado; ainda sem consumo pelo runtime |
-| `runtime.shutdown_grace_seconds` | `10` | inteiro 0–600 | s | não pode exceder o teto administrativo | validado; ainda sem consumo pelo runtime |
+| `runtime.max_parallel_nodes` | `4` | inteiro 1–256 | nós | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `runtime.max_worker_processes` | `4` | inteiro 1–64 | processos | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `runtime.max_threads` | `8` | inteiro 1–256 | threads | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `runtime.max_cpu_percent` | `100` | inteiro 1–100 | % de CPU | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `runtime.max_memory_mb` | `2048` | inteiro 64–1048576 | MiB | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `runtime.max_inflight_bytes` | `134217728` | inteiro 1–1099511627776 | bytes | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `runtime.queue_capacity` | `1000` | inteiro 1–1000000 | itens | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `runtime.shutdown_grace_seconds` | `10` | inteiro 0–600 | s | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
 
 ### `execution`
 
@@ -194,25 +194,25 @@ Unidades e limites aparecem na tabela. Limites mínimos e máximos são inclusiv
 |---|---|---|---|---|---|
 | `execution.default_mode` | `"automatic"` | enum: `automatic`, `manual` | — | — | em uso pelo runtime/CLI |
 | `execution.default_profile` | `null` | texto não vazio ou `null` (herda) | nome do perfil | — | em uso pelo runtime/CLI |
-| `execution.stop_on_error` | `true` | booleano | — | — | validado; ainda sem consumo pelo runtime |
+| `execution.stop_on_error` | `true` | booleano | — | — | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
 | `execution.allow_manual_mode` | `true` | booleano | — | administrador `false` proíbe `true` | em uso pelo runtime/CLI |
 | `execution.max_call_depth` | `16` | inteiro 1–256 | níveis | não pode exceder o teto administrativo | em uso pelo runtime/CLI |
 | `execution.max_invocations_per_run` | `1000` | inteiro 1–100000 | invocações | não pode exceder o teto administrativo | em uso pelo runtime/CLI |
-| `execution.node_timeout_seconds` | `3600` | inteiro 1–86400 | s | não pode exceder o teto administrativo | validado; ainda sem consumo pelo runtime |
-| `execution.run_timeout_seconds` | `86400` | inteiro 1–604800 | s | não pode exceder o teto administrativo | validado; ainda sem consumo pelo runtime |
-| `execution.retry_max_attempts` | `1` | inteiro 1–10 | tentativas totais, incluindo a primeira | não pode exceder o teto administrativo | validado; ainda sem consumo pelo runtime |
-| `execution.retry_backoff_ms` | `1000` | inteiro 0–600000 | ms | não pode exceder o teto administrativo | validado; ainda sem consumo pelo runtime |
-| `execution.retry_jitter` | `true` | booleano | — | — | validado; ainda sem consumo pelo runtime |
+| `execution.node_timeout_seconds` | `3600` | inteiro 1–86400 | s | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `execution.run_timeout_seconds` | `86400` | inteiro 1–604800 | s | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `execution.retry_max_attempts` | `1` | inteiro 1–10 | tentativas totais, incluindo a primeira | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `execution.retry_backoff_ms` | `1000` | inteiro 0–600000 | ms | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `execution.retry_jitter` | `true` | booleano | — | — | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
 
 ### `templates`
 
 | Parâmetro | Default | Tipo e validação | Unidade | Teto administrativo | Estado |
 |---|---|---|---|---|---|
 | `templates.strict_undefined` | `true` | booleano | — | — | em uso pelo runtime/CLI |
-| `templates.allow_dowai_if_alias` | `true` | booleano | — | — | validado; ainda sem consumo pelo runtime |
+| `templates.allow_dowai_if_alias` | `true` | booleano | — | — | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
 | `templates.max_nesting_depth` | `32` | inteiro 1–64 | níveis | não pode exceder o teto administrativo | em uso pelo runtime/CLI |
-| `templates.max_render_bytes` | `1048576` | inteiro 1024–104857600 | bytes | não pode exceder o teto administrativo | validado; ainda sem consumo pelo runtime |
-| `templates.allowed_macros` | `[]` | lista vazia (não suportado nesta versão) | nomes; nesta versão só lista vazia (ADR 0004) | — | validado; ainda sem consumo pelo runtime |
+| `templates.max_render_bytes` | `1048576` | inteiro 1024–104857600 | bytes | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `templates.allowed_macros` | `[]` | lista vazia (não suportado nesta versão) | nomes; nesta versão só lista vazia (ADR 0004) | — | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
 
 ### `security`
 
@@ -220,8 +220,8 @@ Unidades e limites aparecem na tabela. Limites mínimos e máximos são inclusiv
 |---|---|---|---|---|---|
 | `security.allow_external_writes` | `false` | booleano | — | administrador `false` proíbe `true` | em uso pelo runtime/CLI |
 | `security.require_approval_for_destructive` | `true` | booleano | — | administrador `true` impõe `true` | em uso pelo runtime/CLI |
-| `security.allow_insecure_tls` | `false` | booleano | — | administrador `false` proíbe `true` | validado; ainda sem consumo pelo runtime |
-| `security.allowed_paths` | `[]` | lista de textos | caminhos | interseção com a lista administrativa | validado; ainda sem consumo pelo runtime |
+| `security.allow_insecure_tls` | `false` | booleano | — | administrador `false` proíbe `true` | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `security.allowed_paths` | `[]` | lista de textos | caminhos | interseção com a lista administrativa | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
 | `security.allowed_hosts` | `[]` | lista de textos | hosts | interseção com a lista administrativa | em uso pelo runtime/CLI |
 | `security.allowed_profiles` | `[]` | lista de textos | perfis | interseção com a lista administrativa | em uso pelo runtime/CLI |
 
@@ -229,48 +229,48 @@ Unidades e limites aparecem na tabela. Limites mínimos e máximos são inclusiv
 
 | Parâmetro | Default | Tipo e validação | Unidade | Teto administrativo | Estado |
 |---|---|---|---|---|---|
-| `plugins.require_manifest` | `true` | booleano | — | administrador `true` impõe `true` | validado; ainda sem consumo pelo runtime |
-| `plugins.allow_local_override` | `true` | booleano | — | administrador `false` proíbe `true` | validado; ainda sem consumo pelo runtime |
-| `plugins.max_parallel_calls` | `4` | inteiro 1–64 | chamadas | não pode exceder o teto administrativo | validado; ainda sem consumo pelo runtime |
-| `plugins.default_timeout_seconds` | `300` | inteiro 1–86400 | s | não pode exceder o teto administrativo | validado; ainda sem consumo pelo runtime |
-| `plugins.allow_network` | `false` | booleano | — | administrador `false` proíbe `true` | validado; ainda sem consumo pelo runtime |
-| `plugins.allow_filesystem` | `false` | booleano | — | administrador `false` proíbe `true` | validado; ainda sem consumo pelo runtime |
-| `plugins.require_idempotency_key` | `true` | booleano | — | administrador `true` impõe `true` | validado; ainda sem consumo pelo runtime |
+| `plugins.require_manifest` | `true` | booleano | — | administrador `true` impõe `true` | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `plugins.allow_local_override` | `true` | booleano | — | administrador `false` proíbe `true` | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `plugins.max_parallel_calls` | `4` | inteiro 1–64 | chamadas | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `plugins.default_timeout_seconds` | `300` | inteiro 1–86400 | s | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `plugins.allow_network` | `false` | booleano | — | administrador `false` proíbe `true` | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `plugins.allow_filesystem` | `false` | booleano | — | administrador `false` proíbe `true` | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `plugins.require_idempotency_key` | `true` | booleano | — | administrador `true` impõe `true` | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
 
 ### `logging`
 
 | Parâmetro | Default | Tipo e validação | Unidade | Teto administrativo | Estado |
 |---|---|---|---|---|---|
-| `logging.level` | `"INFO"` | enum: `ERROR`, `WARNING`, `INFO`, `DEBUG` | — | — | validado; ainda sem consumo pelo runtime |
+| `logging.level` | `"INFO"` | enum: `ERROR`, `WARNING`, `INFO`, `DEBUG` | — | — | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
 | `logging.audit_enabled` | `true` | booleano, sempre `true` | AUDIT essencial: sempre true | — | AUDIT essencial: sempre ativo |
-| `logging.retention_days` | `90` | inteiro 1–3650 | dias | não pode exceder o teto administrativo | validado; ainda sem consumo pelo runtime |
-| `logging.rotation_max_mb` | `64` | inteiro 1–10240 | MiB | não pode exceder o teto administrativo | validado; ainda sem consumo pelo runtime |
-| `logging.compression` | `"gzip"` | enum: `none`, `gzip` | — | — | validado; ainda sem consumo pelo runtime |
-| `logging.redaction_enabled` | `true` | booleano | — | administrador `true` impõe `true` | validado; ainda sem consumo pelo runtime |
-| `logging.console_format` | `"text"` | enum: `text`, `json` | — | — | validado; ainda sem consumo pelo runtime |
+| `logging.retention_days` | `90` | inteiro 1–3650 | dias | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `logging.rotation_max_mb` | `64` | inteiro 1–10240 | MiB | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `logging.compression` | `"gzip"` | enum: `none`, `gzip` | — | — | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `logging.redaction_enabled` | `true` | booleano | — | administrador `true` impõe `true` | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `logging.console_format` | `"text"` | enum: `text`, `json` | — | — | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
 
 ### `lineage`
 
 | Parâmetro | Default | Tipo e validação | Unidade | Teto administrativo | Estado |
 |---|---|---|---|---|---|
-| `lineage.enabled` | `false` | booleano | — | — | validado; ainda sem consumo pelo runtime |
-| `lineage.emit_mode` | `"disabled"` | enum: `disabled`, `file` | — | — | validado; ainda sem consumo pelo runtime |
-| `lineage.output_path` | `"lineage/openlineage.jsonl"` | texto não vazio | caminho relativo ao projeto | — | validado; ainda sem consumo pelo runtime |
-| `lineage.namespace` | `"dowai"` | texto não vazio | — | — | validado; ainda sem consumo pelo runtime |
-| `lineage.fail_on_emit_error` | `false` | booleano | — | — | validado; ainda sem consumo pelo runtime |
+| `lineage.enabled` | `false` | booleano | — | — | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `lineage.emit_mode` | `"disabled"` | enum: `disabled`, `file` | — | — | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `lineage.output_path` | `"lineage/openlineage.jsonl"` | texto não vazio | caminho relativo ao projeto | — | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `lineage.namespace` | `"dowai"` | texto não vazio | — | — | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `lineage.fail_on_emit_error` | `false` | booleano | — | — | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
 
 ### `ai`
 
 | Parâmetro | Default | Tipo e validação | Unidade | Teto administrativo | Estado |
 |---|---|---|---|---|---|
-| `ai.enabled` | `false` | booleano | — | administrador `false` proíbe `true` | validado; ainda sem consumo pelo runtime |
-| `ai.default_profile` | `null` | texto não vazio ou `null` (herda) | nome do perfil | — | validado; ainda sem consumo pelo runtime |
-| `ai.max_tokens` | `4096` | inteiro 1–1000000 | tokens | não pode exceder o teto administrativo | validado; ainda sem consumo pelo runtime |
-| `ai.max_cost_per_run` | `0.0` | número ≥ 0 | unidade monetária do provedor; 0 = nenhum custo permitido | não pode exceder o teto administrativo | validado; ainda sem consumo pelo runtime |
-| `ai.timeout_seconds` | `60` | inteiro 1–600 | s | não pode exceder o teto administrativo | validado; ainda sem consumo pelo runtime |
-| `ai.allow_data_rows` | `false` | booleano | — | administrador `false` proíbe `true` | validado; ainda sem consumo pelo runtime |
-| `ai.redaction` | `true` | booleano | — | administrador `true` impõe `true` | validado; ainda sem consumo pelo runtime |
-| `ai.profiles` | `{}` | objeto | perfis de IA (objeto) | — | validado; ainda sem consumo pelo runtime |
+| `ai.enabled` | `false` | booleano | — | administrador `false` proíbe `true` | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `ai.default_profile` | `null` | texto não vazio ou `null` (herda) | nome do perfil | — | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `ai.max_tokens` | `4096` | inteiro 1–1000000 | tokens | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `ai.max_cost_per_run` | `0.0` | número ≥ 0 | unidade monetária do provedor; 0 = nenhum custo permitido | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `ai.timeout_seconds` | `60` | inteiro 1–600 | s | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `ai.allow_data_rows` | `false` | booleano | — | administrador `false` proíbe `true` | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `ai.redaction` | `true` | booleano | — | administrador `true` impõe `true` | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `ai.profiles` | `{}` | objeto | perfis de IA (objeto) | — | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
 
 ### `sessions`
 
@@ -278,44 +278,44 @@ Unidades e limites aparecem na tabela. Limites mínimos e máximos são inclusiv
 |---|---|---|---|---|---|
 | `sessions.conflict_policy` | `"error"` | enum: `error`, `wait_process` | — | — | em uso pelo runtime/CLI |
 | `sessions.wait_process_timeout_seconds` | `300` | inteiro 1–86400 | s | não pode exceder o teto administrativo | em uso pelo runtime/CLI |
-| `sessions.ttl_seconds` | `86400` | inteiro 60–31536000 | s | não pode exceder o teto administrativo | validado; ainda sem consumo pelo runtime |
-| `sessions.max_variables` | `1000` | inteiro 1–100000 | variáveis | não pode exceder o teto administrativo | validado; ainda sem consumo pelo runtime |
-| `sessions.max_value_bytes` | `65536` | inteiro 1–10485760 | bytes | não pode exceder o teto administrativo | validado; ainda sem consumo pelo runtime |
-| `sessions.max_context_bytes` | `1048576` | inteiro 1–104857600 | bytes | não pode exceder o teto administrativo | validado; ainda sem consumo pelo runtime |
-| `sessions.allow_resume` | `true` | booleano | — | — | validado; ainda sem consumo pelo runtime |
-| `sessions.persist_state` | `true` | booleano | — | — | validado; ainda sem consumo pelo runtime |
+| `sessions.ttl_seconds` | `86400` | inteiro 60–31536000 | s | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `sessions.max_variables` | `1000` | inteiro 1–100000 | variáveis | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `sessions.max_value_bytes` | `65536` | inteiro 1–10485760 | bytes | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `sessions.max_context_bytes` | `1048576` | inteiro 1–104857600 | bytes | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `sessions.allow_resume` | `true` | booleano | — | — | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `sessions.persist_state` | `true` | booleano | — | — | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
 
 ### `database`
 
 | Parâmetro | Default | Tipo e validação | Unidade | Teto administrativo | Estado |
 |---|---|---|---|---|---|
-| `database.pool_max_connections` | `4` | inteiro 1–100 | conexões | não pode exceder o teto administrativo | validado; ainda sem consumo pelo runtime |
-| `database.connect_timeout_seconds` | `10` | inteiro 1–600 | s | não pode exceder o teto administrativo | validado; ainda sem consumo pelo runtime |
-| `database.query_timeout_seconds` | `1800` | inteiro 1–86400 | s | não pode exceder o teto administrativo | validado; ainda sem consumo pelo runtime |
-| `database.fetch_batch_rows` | `10000` | inteiro 1–1000000 | linhas | não pode exceder o teto administrativo | validado; ainda sem consumo pelo runtime |
-| `database.write_batch_rows` | `10000` | inteiro 1–1000000 | linhas | não pode exceder o teto administrativo | validado; ainda sem consumo pelo runtime |
-| `database.max_transfer_bytes` | `1073741824` | inteiro 1–1099511627776 | bytes | não pode exceder o teto administrativo | validado; ainda sem consumo pelo runtime |
-| `database.tls_required` | `true` | booleano | — | administrador `true` impõe `true` | validado; ainda sem consumo pelo runtime |
+| `database.pool_max_connections` | `4` | inteiro 1–100 | conexões | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `database.connect_timeout_seconds` | `10` | inteiro 1–600 | s | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `database.query_timeout_seconds` | `1800` | inteiro 1–86400 | s | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `database.fetch_batch_rows` | `10000` | inteiro 1–1000000 | linhas | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `database.write_batch_rows` | `10000` | inteiro 1–1000000 | linhas | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `database.max_transfer_bytes` | `1073741824` | inteiro 1–1099511627776 | bytes | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `database.tls_required` | `true` | booleano | — | administrador `true` impõe `true` | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
 
 ### `python`
 
 | Parâmetro | Default | Tipo e validação | Unidade | Teto administrativo | Estado |
 |---|---|---|---|---|---|
-| `python.dependency_lock_required` | `true` | booleano | — | administrador `true` impõe `true` | validado; ainda sem consumo pelo runtime |
-| `python.install_tool` | `"uv"` | enum: `uv` | — | — | validado; ainda sem consumo pelo runtime |
-| `python.venv_path` | `".venv"` | texto não vazio | caminho relativo ao projeto | — | validado; ainda sem consumo pelo runtime |
-| `python.max_threads` | `4` | inteiro 1–256 | threads | não pode exceder o teto administrativo | validado; ainda sem consumo pelo runtime |
-| `python.resource_enforcement` | `"best_effort"` | enum: `best_effort`, `require` | — | — | validado; ainda sem consumo pelo runtime |
+| `python.dependency_lock_required` | `true` | booleano | — | administrador `true` impõe `true` | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `python.install_tool` | `"uv"` | enum: `uv` | — | — | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `python.venv_path` | `".venv"` | texto não vazio | caminho relativo ao projeto | — | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `python.max_threads` | `4` | inteiro 1–256 | threads | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `python.resource_enforcement` | `"best_effort"` | enum: `best_effort`, `require` | — | — | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
 
 ### `state`
 
 | Parâmetro | Default | Tipo e validação | Unidade | Teto administrativo | Estado |
 |---|---|---|---|---|---|
-| `state.backend` | `"sqlite"` | enum: `sqlite` | — | — | validado; ainda sem consumo pelo runtime |
-| `state.path` | `"state/dowai.sqlite"` | texto não vazio | caminho relativo ao projeto | — | validado; ainda sem consumo pelo runtime |
-| `state.busy_timeout_ms` | `5000` | inteiro 0–600000 | ms | — | validado; ainda sem consumo pelo runtime |
-| `state.checkpoint_policy` | `"after_commit"` | enum: `after_commit` | — | — | validado; ainda sem consumo pelo runtime |
-| `state.retention_days` | `90` | inteiro 1–3650 | dias | não pode exceder o teto administrativo | validado; ainda sem consumo pelo runtime |
+| `state.backend` | `"sqlite"` | enum: `sqlite` | — | — | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `state.path` | `"state/dowai.sqlite"` | texto não vazio | caminho relativo ao projeto | — | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `state.busy_timeout_ms` | `5000` | inteiro 0–600000 | ms | — | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `state.checkpoint_policy` | `"after_commit"` | enum: `after_commit` | — | — | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `state.retention_days` | `90` | inteiro 1–3650 | dias | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
 
 ## Segredos e origem dos valores (ENT-013)
 

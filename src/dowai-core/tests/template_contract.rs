@@ -215,6 +215,7 @@ fn sql_model_rendering_validates_sources_in_unselected_branches() {
     let options = TemplateOptions {
         max_nesting: 32,
         strict_undefined: false,
+        allow_dowai_if_alias: true,
     };
 
     let error = render_sql_model(

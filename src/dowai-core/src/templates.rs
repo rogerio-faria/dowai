@@ -9,6 +9,9 @@ pub struct TemplateOptions {
     pub max_nesting: usize,
     /// Whether a missing variable without a default is an error.
     pub strict_undefined: bool,
+    /// Whether the DOWAI aliases `{{ if }}`, `{{ elif }}`, `{{ else }}` and `{{ endif }}`
+    /// are accepted as equivalents of the `{% ... %}` conditional delimiters.
+    pub allow_dowai_if_alias: bool,
 }
 
 impl Default for TemplateOptions {
@@ -16,6 +19,7 @@ impl Default for TemplateOptions {
         Self {
             max_nesting: 32,
             strict_undefined: true,
+            allow_dowai_if_alias: true,
         }
     }
 }
@@ -54,7 +58,7 @@ pub fn render_template(
     variables: &BTreeMap<String, Value>,
     options: &TemplateOptions,
 ) -> Result<TemplateRender> {
-    let tokens = tokenize(source, false)?;
+    let tokens = tokenize(source, false, options.allow_dowai_if_alias)?;
     let mut parser = Parser {
         tokens,
         position: 0,
@@ -116,7 +120,7 @@ fn template_error(message: impl Into<String>) -> DowaiError {
 
 /// `plan_errors` reports malformed `ref()`/`source()`/`config()` macros as plan
 /// errors (`DOWAI_PLAN_INVALID`); the renderer keeps `DOWAI_TEMPLATE_INVALID`.
-fn tokenize(source: &str, plan_errors: bool) -> Result<Vec<Token>> {
+fn tokenize(source: &str, plan_errors: bool, allow_dowai_if_alias: bool) -> Result<Vec<Token>> {
     let mut tokens = Vec::new();
     let mut position = 0;
     while position < source.len() {
@@ -157,6 +161,11 @@ fn tokenize(source: &str, plan_errors: bool) -> Result<Vec<Token>> {
         let content = source[content_start..close_start].trim();
         let full_end = close_start + close.len();
         match parse_directive(content)? {
+            Some(token) if is_alias && !allow_dowai_if_alias && is_conditional_token(&token) => {
+                return Err(template_error(format!(
+                    "DOWAI alias '{{{{ {content} }}}}' is disabled by templates.allow_dowai_if_alias; use the '{{% ... %}}' delimiters"
+                )))
+            }
             Some(token) => tokens.push(token),
             None if is_alias && is_static_macro_call(content) => {
                 push_text(&mut tokens, &source[next..full_end])
@@ -171,6 +180,13 @@ fn tokenize(source: &str, plan_errors: bool) -> Result<Vec<Token>> {
         position = full_end;
     }
     Ok(tokens)
+}
+
+fn is_conditional_token(token: &Token) -> bool {
+    matches!(
+        token,
+        Token::If(_) | Token::Elif(_) | Token::Else | Token::EndIf
+    )
 }
 
 fn push_text(tokens: &mut Vec<Token>, text: &str) {
@@ -283,7 +299,12 @@ pub fn render_sql_model(
     options: &TemplateOptions,
     relations: &BTreeMap<String, String>,
 ) -> Result<RenderedSqlModel> {
-    validate_static_sources(source, relations, options.max_nesting)?;
+    validate_static_sources(
+        source,
+        relations,
+        options.max_nesting,
+        options.allow_dowai_if_alias,
+    )?;
     let rendered = render_template(source, variables, options)?;
     let mut sql = String::with_capacity(rendered.sql.len());
     let mut position = 0;
@@ -356,8 +377,9 @@ fn validate_static_sources(
     source: &str,
     relations: &BTreeMap<String, String>,
     max_nesting: usize,
+    allow_dowai_if_alias: bool,
 ) -> Result<()> {
-    let tokens = tokenize(source, false)?;
+    let tokens = tokenize(source, false, allow_dowai_if_alias)?;
     let mut parser = Parser {
         tokens,
         position: 0,
@@ -425,7 +447,7 @@ pub enum StaticSqlReference {
 /// Both branches of a conditional contribute references (conservative union).
 pub fn static_sql_references(source: &str, max_nesting: usize) -> Result<Vec<StaticSqlReference>> {
     let masked = mask_sql_comments(source)?;
-    let tokens = tokenize(&masked, true)?;
+    let tokens = tokenize(&masked, true, true)?;
     let mut parser = Parser {
         tokens,
         position: 0,
