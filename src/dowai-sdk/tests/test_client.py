@@ -17,6 +17,9 @@ from dowai import DowaiClient, DowaiExecutionError  # noqa: E402
 FAKE_ENGINE = """#!{python}
 import json, sys
 arguments = sys.argv[1:]
+if arguments == ["--version"]:
+    print("dowai {version}")
+    raise SystemExit(0)
 if arguments[:1] == ["retry"] and "--failed-only" not in arguments:
     print(json.dumps({{"status": "FAILED", "error_code": "DOWAI_RUN_NOT_FOUND",
                       "message": "No run", "schema_version": 2, "details": None}}))
@@ -34,12 +37,17 @@ else:
 """
 
 
+def _write_engine(directory, version="0.1.0"):
+    engine = Path(directory) / "dowai"
+    engine.write_text(FAKE_ENGINE.format(python=sys.executable, version=version))
+    engine.chmod(engine.stat().st_mode | stat.S_IXUSR)
+    return engine
+
+
 class FakeEngineTests(unittest.TestCase):
     def setUp(self):
         self._directory = tempfile.TemporaryDirectory()
-        engine = Path(self._directory.name) / "dowai"
-        engine.write_text(FAKE_ENGINE.format(python=sys.executable))
-        engine.chmod(engine.stat().st_mode | stat.S_IXUSR)
+        engine = _write_engine(self._directory.name)
         self.client = DowaiClient(self._directory.name, binary=engine)
 
     def tearDown(self):
@@ -101,6 +109,40 @@ class FakeEngineTests(unittest.TestCase):
         with self.assertRaises(DowaiExecutionError) as context:
             DowaiClient(self._directory.name, binary=Path(self._directory.name) / "absent")
         self.assertEqual(context.exception.code, "DOWAI_CLI_NOT_FOUND")
+
+
+class EngineCompatibilityTests(unittest.TestCase):
+    def setUp(self):
+        self._directory = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self._directory.cleanup()
+
+    def test_same_major_and_minor_engine_is_accepted(self):
+        engine = _write_engine(self._directory.name, version="0.1.7")
+        client = DowaiClient(self._directory.name, binary=engine)
+        self.assertEqual(client.plan(["ok.py"])["echo"][0], "plan")
+
+    def test_engine_with_another_minor_version_is_refused_explicitly(self):
+        engine = _write_engine(self._directory.name, version="0.2.0")
+        with self.assertRaises(DowaiExecutionError) as context:
+            DowaiClient(self._directory.name, binary=engine)
+        self.assertEqual(context.exception.code, "DOWAI_VERSION_INCOMPATIBLE")
+        self.assertIn("0.2.0", str(context.exception))
+        self.assertIn("0.1", str(context.exception))
+
+    def test_unparseable_version_output_is_refused(self):
+        engine = Path(self._directory.name) / "dowai"
+        engine.write_text("#!/bin/sh\necho 'not a version'\n")
+        engine.chmod(0o755)
+        with self.assertRaises(DowaiExecutionError) as context:
+            DowaiClient(self._directory.name, binary=engine)
+        self.assertEqual(context.exception.code, "DOWAI_VERSION_INCOMPATIBLE")
+
+    def test_sdk_exposes_its_version(self):
+        import dowai
+
+        self.assertEqual(dowai.__version__, "0.1.0")
 
 
 if __name__ == "__main__":

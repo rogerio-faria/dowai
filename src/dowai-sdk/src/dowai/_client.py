@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from collections.abc import Mapping, Sequence
@@ -17,6 +18,9 @@ from typing import Any
 
 from ._errors import DowaiExecutionError
 from ._result import RunResult
+from ._version import __version__ as _SDK_VERSION
+
+_SDK_SERIES = ".".join(_SDK_VERSION.split(".")[:2])
 
 _ENVELOPE_STATUSES = ("SUCCEEDED", "FAILED", "CANCELLED")
 
@@ -42,6 +46,7 @@ class DowaiClient:
             )
         if timeout_seconds is not None and timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
+        _check_engine_version(resolved)
         self._binary = resolved
         self._project_dir = Path(project_dir)
         self._timeout = timeout_seconds
@@ -178,6 +183,39 @@ class DowaiClient:
         if not isinstance(payload, dict):
             raise DowaiExecutionError("DOWAI_CLI_OUTPUT", "dowai printed a non-object result")
         return completed.returncode, payload
+
+
+_VERSION_PATTERN = re.compile(r"^dowai (\d+)\.(\d+)\.(\d+)", re.MULTILINE)
+
+
+def _series(version: str) -> tuple[int, int]:
+    major, minor, *_ = version.split(".")
+    return int(major), int(minor)
+
+
+def _check_engine_version(binary: str) -> None:
+    """Refuses an engine whose major.minor differs from the SDK's (pre-1.0: minor is breaking)."""
+    try:
+        completed = subprocess.run(
+            [binary, "--version"], capture_output=True, text=True, timeout=30, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise DowaiExecutionError(
+            "DOWAI_CLI_NOT_FOUND", "The dowai executable could not report its version"
+        ) from error
+    match = _VERSION_PATTERN.search(completed.stdout)
+    if match is None:
+        raise DowaiExecutionError(
+            "DOWAI_VERSION_INCOMPATIBLE",
+            f"Could not read the engine version; the SDK requires {_SDK_SERIES}.x",
+        )
+    engine_version = ".".join(match.groups())
+    if _series(engine_version) != _series(_SDK_VERSION):
+        raise DowaiExecutionError(
+            "DOWAI_VERSION_INCOMPATIBLE",
+            f"Engine {engine_version} is not compatible with dowai-sdk {_SDK_VERSION}; "
+            f"use the engine {_SDK_SERIES}.x",
+        )
 
 
 def _text(value: str, name: str) -> str:

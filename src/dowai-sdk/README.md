@@ -56,3 +56,16 @@ Run the test suite from this directory (parity tests need the engine binary):
 ```powershell
 python -m unittest discover -s tests -v
 ```
+
+## Installation and engine compatibility
+
+The package is versioned in `src/dowai/_version.py` (currently `0.1.0`) and ships `py.typed`.
+Requires Python 3.10 or newer; verified on 3.10.22 and 3.12.3.
+
+```bash
+python -m venv .venv && .venv/bin/pip install dist/dowai_sdk-0.1.0-py3-none-any.whl
+```
+
+`DowaiClient` checks `dowai --version` when it is created. The engine must have the same
+`major.minor` as the SDK (pre-1.0 policy: a minor change is breaking). Otherwise the client
+raises `DowaiExecutionError` with code `DOWAI_VERSION_INCOMPATIBLE`.
