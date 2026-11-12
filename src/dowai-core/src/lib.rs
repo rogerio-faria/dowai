@@ -15,6 +15,7 @@ mod python_ast;
 mod runs;
 mod sessions;
 pub mod state;
+pub mod state_backup;
 mod templates;
 
 pub use audit::{default_audit_log_path, sha256_hex, AuditEvent, AuditLog, AUDIT_SCHEMA_VERSION};

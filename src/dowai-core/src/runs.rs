@@ -837,7 +837,7 @@ fn interrupted_run(start: &RunStart, now_ms: i64) -> NewRun {
 const RUN_COLUMNS: &str = "run_id, session_id, project, status, execution_mode, started_at, \
                            finished_at, duration_ms, error_code";
 
-const SCHEMA_V1: &str = "
+pub(crate) const SCHEMA_V1: &str = "
 BEGIN IMMEDIATE;
 CREATE TABLE IF NOT EXISTS runs (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
