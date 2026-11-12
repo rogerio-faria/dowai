@@ -3,7 +3,7 @@
 
 use dowai_core::{
     create_project, current_time_ms, default_audit_log_path, default_run_store_path, AuditEvent,
-    AuditLog, RunStore,
+    AuditLog, LogPolicy, OperationalLog, RunStore,
 };
 use dowai_runtime::{run_postgres, RunRequest};
 use serde_json::{json, Value};
@@ -436,4 +436,45 @@ fn finished_run_is_journaled_and_leaves_no_in_flight_marker() {
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].run_id, result.run_id);
     assert_eq!(runs[0].status, "SUCCEEDED");
+}
+
+/// ENT-065: every AUDIT event is mirrored to `logs/dowai.jsonl` in the same order, with
+/// owner-only permissions and no variable values or secrets in the file.
+#[cfg(unix)]
+#[test]
+fn operational_log_mirrors_audit_events_privately() {
+    use std::os::unix::fs::PermissionsExt;
+    let harness = Harness::new();
+    harness.model(
+        "a.py",
+        &format!(
+            "def model(env):\n    env.setVar('stage', '{SENTINEL_VARIABLE}')\n    raise RuntimeError('{SENTINEL_ERROR}')\n"
+        ),
+    );
+    let _ = harness.run("a.py");
+
+    let audit_events = harness.events();
+    let audit_names = names(&audit_events);
+    let directory = default_audit_log_path()
+        .expect("isolated path")
+        .with_file_name("logs");
+    let path = directory.join("dowai.jsonl");
+    let records = OperationalLog::new(&path, LogPolicy::default())
+        .read_all()
+        .expect("read operational log");
+    let operational_names: Vec<&str> = records.iter().map(|r| r.event.as_str()).collect();
+    assert_eq!(operational_names, audit_names);
+    assert!(records.iter().any(|r| r.error_code.is_some()));
+
+    let raw = fs::read_to_string(&path).expect("raw operational log");
+    for sentinel in [SENTINEL_VARIABLE, SENTINEL_PASSWORD, SENTINEL_ERROR] {
+        assert!(
+            !raw.contains(sentinel),
+            "{sentinel} leaked into operational log"
+        );
+    }
+    let file_mode = fs::metadata(&path).expect("file").permissions().mode();
+    let dir_mode = fs::metadata(&directory).expect("dir").permissions().mode();
+    assert_eq!(file_mode & 0o777, 0o600);
+    assert_eq!(dir_mode & 0o777, 0o700);
 }

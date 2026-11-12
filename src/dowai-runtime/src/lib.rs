@@ -3,8 +3,8 @@ use dowai_core::{
     admin_config_path, current_time_ms, default_run_store_path, load_project,
     load_workspace_profile, plan, read_planned_model, resolve_effective_configuration, sha256_hex,
     source_relation_key, user_config_path, verify_planned_model, CancellationToken, DowaiError,
-    ExecutionMode, ExecutionPlan, Materialization, NewInvocation, NewRun, PlanNode, Result,
-    RunStart, RunStore, SessionStore, TemplateOptions, VariableOrigin, VersionedSnapshot,
+    ExecutionMode, ExecutionPlan, LogPolicy, Materialization, NewInvocation, NewRun, PlanNode,
+    Result, RunStart, RunStore, SessionStore, TemplateOptions, VariableOrigin, VersionedSnapshot,
     WorkspaceProfile,
 };
 use dowai_postgres::{
@@ -333,6 +333,11 @@ fn run_selected(
     };
     let requested_mode = request.mode;
     let root_invocation_id = Uuid::new_v4().to_string();
+    // Operational log policy (ENT-065). Logging must not block a run: an unreadable
+    // configuration falls back to the catalog defaults.
+    let log_policy = effective_configuration(project_dir)
+        .map(|configuration| LogPolicy::from_logging(&configuration["effective"]["logging"]))
+        .unwrap_or_default();
     let mut trace = Trace {
         audit: Auditor::new(
             &run_id,
@@ -340,6 +345,7 @@ fn run_selected(
             started_ms,
             journal_request.session.clone(),
             project_display_name(project_dir),
+            log_policy,
         ),
         root_invocation_id,
         execution_mode: requested_mode.map(|mode| mode.as_str().to_owned()),

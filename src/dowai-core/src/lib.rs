@@ -4,6 +4,7 @@ pub mod compatibility;
 mod config;
 pub mod config_catalog;
 mod error;
+pub mod operational_log;
 mod outbox;
 pub mod package_policy;
 mod planner;
@@ -30,6 +31,10 @@ pub use config::{
     WorkspaceProfile,
 };
 pub use error::{exit_codes, DowaiError, Result};
+pub use operational_log::{
+    default_operational_log_path, redact_text, LogPolicy, LogRecord, OperationalLog, RecordLevel,
+    OPERATIONAL_LOG_SCHEMA_VERSION,
+};
 pub use outbox::{
     DeliveryOutcome, DispatchReport, EffectSink, OutboxEntry, Probe, NOT_DELIVERED_CODE,
 };

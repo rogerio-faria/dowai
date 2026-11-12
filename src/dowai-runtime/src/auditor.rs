@@ -5,7 +5,10 @@
 //! `failed` and reported once as a sanitized warning by the caller.
 
 use crate::InvocationRecord;
-use dowai_core::{default_audit_log_path, AuditEvent, AuditLog, DowaiError};
+use dowai_core::{
+    default_audit_log_path, default_operational_log_path, AuditEvent, AuditLog, DowaiError,
+    LogPolicy, LogRecord, OperationalLog, RecordLevel,
+};
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -16,6 +19,8 @@ fn elapsed_ms(since: Instant) -> u64 {
 
 pub(crate) struct Auditor {
     log: Option<AuditLog>,
+    /// Operational JSONL mirror of every AUDIT event (ENT-065); best effort.
+    operational: Option<OperationalLog>,
     run_id: String,
     root_invocation_id: String,
     started_ms: i64,
@@ -39,11 +44,15 @@ impl Auditor {
         started_ms: i64,
         session_id: Option<String>,
         project: Option<String>,
+        log_policy: LogPolicy,
     ) -> Self {
         let log = default_audit_log_path().map(AuditLog::for_user_state);
+        let operational =
+            default_operational_log_path().map(|path| OperationalLog::new(path, log_policy));
         Self {
             failed: log.is_none(),
             log,
+            operational,
             run_id: run_id.to_owned(),
             root_invocation_id: root_invocation_id.to_owned(),
             started_ms,
@@ -78,6 +87,23 @@ impl Auditor {
         };
         if !written {
             self.failed = true;
+        }
+        // Operational mirror: identifiers and codes only. Its failure never changes the run
+        // outcome and is not reported as an AUDIT failure.
+        if let Some(operational) = &self.operational {
+            let mut record = LogRecord::new(
+                if event.error_code.is_some() {
+                    RecordLevel::Error
+                } else {
+                    RecordLevel::Info
+                },
+                &event.event,
+                &event.run_id,
+            );
+            record.timestamp = event.timestamp.clone();
+            record.node_id = event.node_id.clone();
+            record.error_code = event.error_code.clone();
+            let _ = operational.write(&record);
         }
     }
 

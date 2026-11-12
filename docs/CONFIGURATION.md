@@ -243,12 +243,12 @@ Unidades e limites aparecem na tabela. Limites mínimos e máximos são inclusiv
 
 | Parâmetro | Default | Tipo e validação | Unidade | Teto administrativo | Estado |
 |---|---|---|---|---|---|
-| `logging.level` | `"INFO"` | enum: `ERROR`, `WARNING`, `INFO`, `DEBUG` | — | — | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
-| `logging.audit_enabled` | `true` | booleano, sempre `true` | AUDIT essencial: sempre true | — | AUDIT essencial: sempre ativo |
-| `logging.retention_days` | `90` | inteiro 1–3650 | dias | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
-| `logging.rotation_max_mb` | `64` | inteiro 1–10240 | MiB | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
-| `logging.compression` | `"gzip"` | enum: `none`, `gzip` | — | — | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
-| `logging.redaction_enabled` | `true` | booleano | — | administrador `true` impõe `true` | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
+| `logging.level` | `"INFO"` | enum: `ERROR`, `WARNING`, `INFO`, `DEBUG` | — | — | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021); consumido pelo log operacional `logs/dowai.jsonl` (ENT-065) |
+| `logging.audit_enabled` | `true` | booleano, sempre `true` | AUDIT essencial: sempre true | — | AUDIT essencial: sempre ativo; AUDIT não é afetado pelo log operacional |
+| `logging.retention_days` | `90` | inteiro 1–3650 | dias | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021); consumido pelo log operacional `logs/dowai.jsonl` (ENT-065) |
+| `logging.rotation_max_mb` | `64` | inteiro 1–10240 | MiB | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021); consumido pelo log operacional `logs/dowai.jsonl` (ENT-065) |
+| `logging.compression` | `"gzip"` | enum: `none`, `gzip` | — | — | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021); consumido pelo log operacional `logs/dowai.jsonl` (ENT-065) |
+| `logging.redaction_enabled` | `true` | booleano | — | administrador `true` impõe `true` | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021); consumido pelo log operacional `logs/dowai.jsonl` (ENT-065) |
 | `logging.console_format` | `"text"` | enum: `text`, `json` | — | — | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
 
 ### `lineage`
