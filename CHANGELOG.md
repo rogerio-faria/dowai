@@ -1,5 +1,30 @@
 # Changelog
 
+Este arquivo segue o formato de [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/)
+e a política de versionamento [SemVer 2.0.0](https://semver.org/lang/pt-BR/),
+com as regras abaixo.
+
+## Política de versionamento
+
+- Versões são `MAJOR.MINOR.PATCH`. Os pacotes Rust do workspace e o SDK Python
+  (`dowai-sdk`) são versionados juntos enquanto o projeto estiver na série `0.x`.
+- Enquanto a versão for `0.x`, mudanças incompatíveis podem ocorrer em `MINOR`,
+  mas **sempre** devem ser listadas em `Breaking changes` com migração.
+- A partir de `1.0.0`, mudanças incompatíveis exigem `MAJOR`.
+- Compatibilidade pública inclui: comandos e flags da CLI, formato de saída
+  `--json` (campos e envelopes), códigos de erro `DOWAI_*`, exit codes,
+  schemas em `specs/`, formato de `dowai_project.json`, configuração em
+  `docs/CONFIGURATION.md` e API pública do SDK Python.
+- Campos novos e opcionais em saídas JSON são mudanças compatíveis (`MINOR`).
+  Remoção, renomeação ou mudança de significado são incompatíveis.
+- O SDK recusa motor de `major.minor` diferente com `DOWAI_VERSION_INCOMPATIBLE`.
+
+## Breaking changes e migrações
+
+Cada entrada incompatível deve conter: o que mudou, quem é afetado, o passo de
+migração e, quando houver, o comando ou arquivo de migração disponível (por
+exemplo `dowai config migrate`). Ainda não há mudanças incompatíveis publicadas.
+
 ## Unreleased
 
 - Report the `run_id` of a run that started and then failed, in the `--json`
