@@ -5,9 +5,16 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 const PROJECT_FILE: &str = "dowai_project.json";
+
+/// Locais do sistema onde o workspace nunca é criado (ENT-017). Lista conservadora:
+/// `init` roda sem root e não deve gravar em áreas administrativas.
+const PROTECTED_WORKSPACE_ROOTS: &[&str] = &[
+    "/bin", "/boot", "/dev", "/etc", "/lib", "/lib32", "/lib64", "/proc", "/root", "/run", "/sbin",
+    "/sys", "/usr", "/var",
+];
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -173,8 +180,56 @@ fn validate_relation_name(name: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
+/// Valida o caminho do workspace antes de qualquer escrita (ENT-017).
+///
+/// Recusa `..` literal, caminhos cujo ancestral existente resolve (com symlinks) para um
+/// diretório protegido do sistema ou para a raiz do sistema de arquivos. Não exige root.
+pub fn validate_workspace_root(workspace: &Path) -> Result<()> {
+    if workspace
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        return Err(DowaiError::Path(
+            "Workspace path must not contain '..' components".to_owned(),
+        ));
+    }
+    let absolute = if workspace.is_absolute() {
+        workspace.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(workspace)
+    };
+    let mut existing = absolute.as_path();
+    while !existing.exists() {
+        existing = existing.parent().ok_or_else(|| {
+            DowaiError::Path("Workspace path has no existing ancestor".to_owned())
+        })?;
+    }
+    if !existing.is_dir() {
+        return Err(DowaiError::Path(format!(
+            "Workspace ancestor is not a directory: {}",
+            existing.display()
+        )));
+    }
+    let resolved = fs::canonicalize(existing)?;
+    if resolved.parent().is_none() {
+        return Err(DowaiError::Path(
+            "Workspace must not be the filesystem root".to_owned(),
+        ));
+    }
+    for protected in PROTECTED_WORKSPACE_ROOTS {
+        if resolved.starts_with(protected) {
+            return Err(DowaiError::Path(format!(
+                "Workspace outside authorized root: {} is a protected system location",
+                resolved.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub fn create_project(workspace: &Path, name: &str) -> Result<PathBuf> {
     validate_project_name(name)?;
+    validate_workspace_root(workspace)?;
     let root = workspace.join("projects").join(name);
     if root.exists() {
         return Err(DowaiError::Config(format!(
