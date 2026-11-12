@@ -1,6 +1,7 @@
 mod audit;
 mod cancel;
 mod config;
+pub mod config_catalog;
 mod error;
 mod planner;
 mod project;

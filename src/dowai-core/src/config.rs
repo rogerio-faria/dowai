@@ -6,8 +6,6 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-const SECTIONS: &[&str] = &["execution", "templates", "security", "ai", "sessions"];
-
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProfileTlsMode {
@@ -197,7 +195,7 @@ pub fn resolve_effective_configuration(
         merge_layer(&mut effective, &project_layer, "project", "", &mut origins);
     }
 
-    apply_admin_ceilings(&mut effective, &admin_values, "", &mut origins);
+    apply_admin_ceilings(&mut effective, &admin_values, &mut origins);
 
     Ok(json!({
         "schema_version": 2,
@@ -231,36 +229,7 @@ pub fn admin_config_path() -> Option<PathBuf> {
 }
 
 fn configuration_defaults() -> Value {
-    json!({
-        "execution": {
-            "default_mode": "automatic",
-            "default_profile": null,
-            "stop_on_error": true,
-            "allow_manual_mode": true,
-            "max_call_depth": 16,
-            "max_invocations_per_run": 1000
-        },
-        "templates": {
-            "strict_undefined": true,
-            "allow_dowai_if_alias": true,
-            "max_nesting_depth": 32
-        },
-        "security": {
-            "allow_external_writes": false,
-            "require_approval_for_destructive": true,
-            "allowed_paths": [],
-            "allowed_hosts": [],
-            "allowed_profiles": []
-        },
-        "ai": {
-            "enabled": false,
-            "allow_data_rows": false
-        },
-        "sessions": {
-            "conflict_policy": "error",
-            "wait_process_timeout_seconds": 300
-        }
-    })
+    crate::config_catalog::defaults()
 }
 
 /// AC032: one configuration format per scope. The JSON file is the only format read; a YAML
@@ -481,7 +450,7 @@ fn validate_layer(layer: &Map<String, Value>, path: &Path) -> Result<()> {
         if key == "schema_version" {
             continue;
         }
-        if !SECTIONS.contains(&key.as_str()) {
+        if !crate::config_catalog::sections().contains(&key.as_str()) {
             return Err(config_error(
                 path,
                 &format!("Unknown configuration section '{key}'"),
@@ -507,44 +476,20 @@ fn validate_setting(section: &str, setting: &str, value: &Value, path: &Path) ->
     if value.is_null() {
         return Ok(());
     }
-    let valid = match (section, setting) {
-        ("execution", "default_mode") => {
-            matches!(value.as_str(), Some("automatic" | "manual"))
-        }
-        ("execution", "default_profile") => value
-            .as_str()
-            .is_some_and(|profile| !profile.trim().is_empty()),
-        ("execution", "stop_on_error" | "allow_manual_mode")
-        | ("templates", "strict_undefined" | "allow_dowai_if_alias")
-        | ("security", "allow_external_writes" | "require_approval_for_destructive")
-        | ("ai", "enabled" | "allow_data_rows") => value.is_boolean(),
-        ("execution", "max_call_depth" | "max_invocations_per_run")
-        | ("templates", "max_nesting_depth") => value.as_u64().is_some_and(|number| number > 0),
-        // AC040: last-writer-wins is deliberately not offered; "wait_process" serialises
-        // runs on one session through an exclusive per-session lock.
-        ("sessions", "conflict_policy") => {
-            matches!(value.as_str(), Some("error" | "wait_process"))
-        }
-        ("sessions", "wait_process_timeout_seconds") => value
-            .as_u64()
-            .is_some_and(|seconds| (1..=86_400).contains(&seconds)),
-        ("security", "allowed_paths" | "allowed_hosts" | "allowed_profiles") => value
-            .as_array()
-            .is_some_and(|values| values.iter().all(Value::is_string)),
-        _ => {
-            return Err(config_error(
-                path,
-                &format!("Unknown configuration setting '{section}.{setting}'"),
-            ))
-        }
-    };
-    if !valid {
+    let Some(parameter) = crate::config_catalog::find(section, setting) else {
         return Err(config_error(
             path,
-            &format!("Invalid value for configuration setting '{section}.{setting}'"),
+            &format!("Unknown configuration setting '{section}.{setting}'"),
         ));
-    }
-    Ok(())
+    };
+    parameter.validate(value).map_err(|expectation| {
+        config_error(
+            path,
+            &format!(
+                "Invalid value for configuration setting '{section}.{setting}': expected {expectation}"
+            ),
+        )
+    })
 }
 
 fn merge_layer(
@@ -591,63 +536,57 @@ fn collect_origins(
 fn apply_admin_ceilings(
     effective: &mut Value,
     admin: &Map<String, Value>,
-    parent: &str,
     origins: &mut BTreeMap<String, String>,
 ) {
-    for (key, admin_value) in admin {
-        if key == "schema_version" || admin_value.is_null() {
+    use crate::config_catalog::{Ceiling, PARAMETERS};
+
+    for parameter in PARAMETERS {
+        let Some(ceiling) = admin
+            .get(parameter.section)
+            .and_then(Value::as_object)
+            .and_then(|section| section.get(parameter.name))
+            .filter(|value| !value.is_null())
+        else {
             continue;
-        }
-        let path = join_path(parent, key);
-        if let (Some(effective_object), Some(admin_object)) = (
-            effective.get_mut(key).and_then(Value::as_object_mut),
-            admin_value.as_object(),
-        ) {
-            for (setting, ceiling) in admin_object {
-                let effective_value = effective_object.get_mut(setting);
-                let Some(effective_value) = effective_value else {
-                    continue;
-                };
-                let should_restrict = match (key.as_str(), setting.as_str()) {
-                    ("security", "allow_external_writes") | ("execution", "allow_manual_mode") => {
-                        ceiling.as_bool() == Some(false) && effective_value.as_bool() == Some(true)
-                    }
-                    ("security", "require_approval_for_destructive") => {
-                        ceiling.as_bool() == Some(true) && effective_value.as_bool() == Some(false)
-                    }
-                    ("execution", "max_call_depth" | "max_invocations_per_run")
-                    | ("templates", "max_nesting_depth") => {
-                        match (effective_value.as_u64(), ceiling.as_u64()) {
-                            (Some(value), Some(maximum)) => value > maximum,
-                            _ => false,
-                        }
-                    }
-                    ("security", "allowed_paths" | "allowed_hosts" | "allowed_profiles") => {
-                        match (effective_value.as_array(), ceiling.as_array()) {
-                            (Some(values), Some(allowed)) => {
-                                let intersection = values
-                                    .iter()
-                                    .filter(|value| allowed.contains(value))
-                                    .cloned()
-                                    .collect::<Vec<_>>();
-                                if &intersection != values {
-                                    *effective_value = Value::Array(intersection);
-                                    origins.insert(
-                                        join_path(&path, setting),
-                                        "admin_ceiling".to_owned(),
-                                    );
-                                }
-                                false
-                            }
-                            _ => false,
-                        }
-                    }
-                    _ => false,
-                };
-                if should_restrict {
-                    *effective_value = ceiling.clone();
-                    origins.insert(join_path(&path, setting), "admin_ceiling".to_owned());
+        };
+        let Some(current) = effective
+            .get(parameter.section)
+            .and_then(|section| section.get(parameter.name))
+            .cloned()
+        else {
+            continue;
+        };
+        let restricted = match parameter.ceiling {
+            Ceiling::None => None,
+            Ceiling::Maximum => match (current.as_f64(), ceiling.as_f64()) {
+                (Some(value), Some(maximum)) if value > maximum => Some(ceiling.clone()),
+                _ => None,
+            },
+            Ceiling::DenyIfAdminFalse => (ceiling.as_bool() == Some(false)
+                && current.as_bool() == Some(true))
+            .then_some(Value::Bool(false)),
+            Ceiling::RequireIfAdminTrue => (ceiling.as_bool() == Some(true)
+                && current.as_bool() == Some(false))
+            .then_some(Value::Bool(true)),
+            Ceiling::Allowlist => match (current.as_array(), ceiling.as_array()) {
+                (Some(values), Some(allowed)) => {
+                    let intersection = values
+                        .iter()
+                        .filter(|value| allowed.contains(value))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    (&intersection != values).then_some(Value::Array(intersection))
                 }
+                _ => None,
+            },
+        };
+        if let Some(value) = restricted {
+            if let Some(section) = effective
+                .get_mut(parameter.section)
+                .and_then(Value::as_object_mut)
+            {
+                section.insert(parameter.name.to_owned(), value);
+                origins.insert(parameter.key(), "admin_ceiling".to_owned());
             }
         }
     }

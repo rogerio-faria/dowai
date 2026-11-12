@@ -4,74 +4,792 @@
   "title": "DOWAI effective configuration output",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "effective", "origins", "sources"],
+  "required": [
+    "schema_version",
+    "effective",
+    "origins",
+    "sources"
+  ],
   "properties": {
-    "schema_version": { "const": 2 },
+    "schema_version": {
+      "const": 2
+    },
     "effective": {
       "type": "object",
       "additionalProperties": false,
+      "required": [
+        "runtime",
+        "execution",
+        "templates",
+        "security",
+        "plugins",
+        "logging",
+        "lineage",
+        "ai",
+        "sessions",
+        "database",
+        "python",
+        "state"
+      ],
       "properties": {
+        "runtime": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "max_parallel_nodes",
+            "max_worker_processes",
+            "max_threads",
+            "max_cpu_percent",
+            "max_memory_mb",
+            "max_inflight_bytes",
+            "queue_capacity",
+            "shutdown_grace_seconds"
+          ],
+          "properties": {
+            "max_parallel_nodes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 256,
+              "default": 4,
+              "x-unit": "nós"
+            },
+            "max_worker_processes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 64,
+              "default": 4,
+              "x-unit": "processos"
+            },
+            "max_threads": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 256,
+              "default": 8,
+              "x-unit": "threads"
+            },
+            "max_cpu_percent": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 100,
+              "x-unit": "% de CPU"
+            },
+            "max_memory_mb": {
+              "type": "integer",
+              "minimum": 64,
+              "maximum": 1048576,
+              "default": 2048,
+              "x-unit": "MiB"
+            },
+            "max_inflight_bytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1099511627776,
+              "default": 134217728,
+              "x-unit": "bytes"
+            },
+            "queue_capacity": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000000,
+              "default": 1000,
+              "x-unit": "itens"
+            },
+            "shutdown_grace_seconds": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 600,
+              "default": 10,
+              "x-unit": "s"
+            }
+          }
+        },
         "execution": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["default_mode", "default_profile", "stop_on_error", "allow_manual_mode", "max_call_depth", "max_invocations_per_run"],
+          "required": [
+            "default_mode",
+            "default_profile",
+            "stop_on_error",
+            "allow_manual_mode",
+            "max_call_depth",
+            "max_invocations_per_run",
+            "node_timeout_seconds",
+            "run_timeout_seconds",
+            "retry_max_attempts",
+            "retry_backoff_ms",
+            "retry_jitter"
+          ],
           "properties": {
-            "default_mode": { "enum": ["automatic", "manual"] },
-            "default_profile": { "type": ["string", "null"], "minLength": 1 },
-            "stop_on_error": { "type": "boolean" },
-            "allow_manual_mode": { "type": "boolean" },
-            "max_call_depth": { "type": "integer", "minimum": 1 },
-            "max_invocations_per_run": { "type": "integer", "minimum": 1 }
+            "default_mode": {
+              "enum": [
+                "automatic",
+                "manual"
+              ],
+              "default": "automatic",
+              "x-unit": ""
+            },
+            "default_profile": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "minLength": 1,
+              "default": null,
+              "x-unit": "nome do perfil"
+            },
+            "stop_on_error": {
+              "type": "boolean",
+              "default": true,
+              "x-unit": ""
+            },
+            "allow_manual_mode": {
+              "type": "boolean",
+              "default": true,
+              "x-unit": ""
+            },
+            "max_call_depth": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 256,
+              "default": 16,
+              "x-unit": "níveis"
+            },
+            "max_invocations_per_run": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100000,
+              "default": 1000,
+              "x-unit": "invocações"
+            },
+            "node_timeout_seconds": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 86400,
+              "default": 3600,
+              "x-unit": "s"
+            },
+            "run_timeout_seconds": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 604800,
+              "default": 86400,
+              "x-unit": "s"
+            },
+            "retry_max_attempts": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10,
+              "default": 1,
+              "x-unit": "tentativas totais, incluindo a primeira"
+            },
+            "retry_backoff_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 600000,
+              "default": 1000,
+              "x-unit": "ms"
+            },
+            "retry_jitter": {
+              "type": "boolean",
+              "default": true,
+              "x-unit": ""
+            }
           }
         },
         "templates": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["strict_undefined", "allow_dowai_if_alias", "max_nesting_depth"],
+          "required": [
+            "strict_undefined",
+            "allow_dowai_if_alias",
+            "max_nesting_depth",
+            "max_render_bytes",
+            "allowed_macros"
+          ],
           "properties": {
-            "strict_undefined": { "type": "boolean" },
-            "allow_dowai_if_alias": { "type": "boolean" },
-            "max_nesting_depth": { "type": "integer", "minimum": 1 }
+            "strict_undefined": {
+              "type": "boolean",
+              "default": true,
+              "x-unit": ""
+            },
+            "allow_dowai_if_alias": {
+              "type": "boolean",
+              "default": true,
+              "x-unit": ""
+            },
+            "max_nesting_depth": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 64,
+              "default": 32,
+              "x-unit": "níveis"
+            },
+            "max_render_bytes": {
+              "type": "integer",
+              "minimum": 1024,
+              "maximum": 104857600,
+              "default": 1048576,
+              "x-unit": "bytes"
+            },
+            "allowed_macros": {
+              "type": "array",
+              "maxItems": 0,
+              "default": [],
+              "x-unit": "nomes; nesta versão só lista vazia (ADR 0004)"
+            }
           }
         },
         "security": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["allow_external_writes", "require_approval_for_destructive", "allowed_paths", "allowed_hosts", "allowed_profiles"],
+          "required": [
+            "allow_external_writes",
+            "require_approval_for_destructive",
+            "allow_insecure_tls",
+            "allowed_paths",
+            "allowed_hosts",
+            "allowed_profiles"
+          ],
           "properties": {
-            "allow_external_writes": { "type": "boolean" },
-            "require_approval_for_destructive": { "type": "boolean" },
-            "allowed_paths": { "type": "array", "items": { "type": "string" } },
-            "allowed_hosts": { "type": "array", "items": { "type": "string" } },
-            "allowed_profiles": { "type": "array", "items": { "type": "string" } }
+            "allow_external_writes": {
+              "type": "boolean",
+              "default": false,
+              "x-unit": ""
+            },
+            "require_approval_for_destructive": {
+              "type": "boolean",
+              "default": true,
+              "x-unit": ""
+            },
+            "allow_insecure_tls": {
+              "type": "boolean",
+              "default": false,
+              "x-unit": ""
+            },
+            "allowed_paths": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "default": [],
+              "x-unit": "caminhos"
+            },
+            "allowed_hosts": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "default": [],
+              "x-unit": "hosts"
+            },
+            "allowed_profiles": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "default": [],
+              "x-unit": "perfis"
+            }
+          }
+        },
+        "plugins": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "require_manifest",
+            "allow_local_override",
+            "max_parallel_calls",
+            "default_timeout_seconds",
+            "allow_network",
+            "allow_filesystem",
+            "require_idempotency_key"
+          ],
+          "properties": {
+            "require_manifest": {
+              "type": "boolean",
+              "default": true,
+              "x-unit": ""
+            },
+            "allow_local_override": {
+              "type": "boolean",
+              "default": true,
+              "x-unit": ""
+            },
+            "max_parallel_calls": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 64,
+              "default": 4,
+              "x-unit": "chamadas"
+            },
+            "default_timeout_seconds": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 86400,
+              "default": 300,
+              "x-unit": "s"
+            },
+            "allow_network": {
+              "type": "boolean",
+              "default": false,
+              "x-unit": ""
+            },
+            "allow_filesystem": {
+              "type": "boolean",
+              "default": false,
+              "x-unit": ""
+            },
+            "require_idempotency_key": {
+              "type": "boolean",
+              "default": true,
+              "x-unit": ""
+            }
+          }
+        },
+        "logging": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "level",
+            "audit_enabled",
+            "retention_days",
+            "rotation_max_mb",
+            "compression",
+            "redaction_enabled",
+            "console_format"
+          ],
+          "properties": {
+            "level": {
+              "enum": [
+                "ERROR",
+                "WARNING",
+                "INFO",
+                "DEBUG"
+              ],
+              "default": "INFO",
+              "x-unit": ""
+            },
+            "audit_enabled": {
+              "const": true,
+              "default": true,
+              "x-unit": "AUDIT essencial: sempre true"
+            },
+            "retention_days": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 3650,
+              "default": 90,
+              "x-unit": "dias"
+            },
+            "rotation_max_mb": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10240,
+              "default": 64,
+              "x-unit": "MiB"
+            },
+            "compression": {
+              "enum": [
+                "none",
+                "gzip"
+              ],
+              "default": "gzip",
+              "x-unit": ""
+            },
+            "redaction_enabled": {
+              "type": "boolean",
+              "default": true,
+              "x-unit": ""
+            },
+            "console_format": {
+              "enum": [
+                "text",
+                "json"
+              ],
+              "default": "text",
+              "x-unit": ""
+            }
+          }
+        },
+        "lineage": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "enabled",
+            "emit_mode",
+            "output_path",
+            "namespace",
+            "fail_on_emit_error"
+          ],
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false,
+              "x-unit": ""
+            },
+            "emit_mode": {
+              "enum": [
+                "disabled",
+                "file"
+              ],
+              "default": "disabled",
+              "x-unit": ""
+            },
+            "output_path": {
+              "type": "string",
+              "minLength": 1,
+              "default": "lineage/openlineage.jsonl",
+              "x-unit": "caminho relativo ao projeto"
+            },
+            "namespace": {
+              "type": "string",
+              "minLength": 1,
+              "default": "dowai",
+              "x-unit": ""
+            },
+            "fail_on_emit_error": {
+              "type": "boolean",
+              "default": false,
+              "x-unit": ""
+            }
           }
         },
         "ai": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["enabled", "allow_data_rows"],
+          "required": [
+            "enabled",
+            "default_profile",
+            "max_tokens",
+            "max_cost_per_run",
+            "timeout_seconds",
+            "allow_data_rows",
+            "redaction",
+            "profiles"
+          ],
           "properties": {
-            "enabled": { "type": "boolean" },
-            "allow_data_rows": { "type": "boolean" }
+            "enabled": {
+              "type": "boolean",
+              "default": false,
+              "x-unit": ""
+            },
+            "default_profile": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "minLength": 1,
+              "default": null,
+              "x-unit": "nome do perfil"
+            },
+            "max_tokens": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000000,
+              "default": 4096,
+              "x-unit": "tokens"
+            },
+            "max_cost_per_run": {
+              "type": "number",
+              "minimum": 0,
+              "default": 0.0,
+              "x-unit": "unidade monetária do provedor; 0 = nenhum custo permitido"
+            },
+            "timeout_seconds": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 600,
+              "default": 60,
+              "x-unit": "s"
+            },
+            "allow_data_rows": {
+              "type": "boolean",
+              "default": false,
+              "x-unit": ""
+            },
+            "redaction": {
+              "type": "boolean",
+              "default": true,
+              "x-unit": ""
+            },
+            "profiles": {
+              "type": "object",
+              "default": {},
+              "x-unit": "perfis de IA (objeto)"
+            }
+          }
+        },
+        "sessions": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "conflict_policy",
+            "wait_process_timeout_seconds",
+            "ttl_seconds",
+            "max_variables",
+            "max_value_bytes",
+            "max_context_bytes",
+            "allow_resume",
+            "persist_state"
+          ],
+          "properties": {
+            "conflict_policy": {
+              "enum": [
+                "error",
+                "wait_process"
+              ],
+              "default": "error",
+              "x-unit": ""
+            },
+            "wait_process_timeout_seconds": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 86400,
+              "default": 300,
+              "x-unit": "s"
+            },
+            "ttl_seconds": {
+              "type": "integer",
+              "minimum": 60,
+              "maximum": 31536000,
+              "default": 86400,
+              "x-unit": "s"
+            },
+            "max_variables": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100000,
+              "default": 1000,
+              "x-unit": "variáveis"
+            },
+            "max_value_bytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10485760,
+              "default": 65536,
+              "x-unit": "bytes"
+            },
+            "max_context_bytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 104857600,
+              "default": 1048576,
+              "x-unit": "bytes"
+            },
+            "allow_resume": {
+              "type": "boolean",
+              "default": true,
+              "x-unit": ""
+            },
+            "persist_state": {
+              "type": "boolean",
+              "default": true,
+              "x-unit": ""
+            }
+          }
+        },
+        "database": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "pool_max_connections",
+            "connect_timeout_seconds",
+            "query_timeout_seconds",
+            "fetch_batch_rows",
+            "write_batch_rows",
+            "max_transfer_bytes",
+            "tls_required"
+          ],
+          "properties": {
+            "pool_max_connections": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 4,
+              "x-unit": "conexões"
+            },
+            "connect_timeout_seconds": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 600,
+              "default": 10,
+              "x-unit": "s"
+            },
+            "query_timeout_seconds": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 86400,
+              "default": 1800,
+              "x-unit": "s"
+            },
+            "fetch_batch_rows": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000000,
+              "default": 10000,
+              "x-unit": "linhas"
+            },
+            "write_batch_rows": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000000,
+              "default": 10000,
+              "x-unit": "linhas"
+            },
+            "max_transfer_bytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1099511627776,
+              "default": 1073741824,
+              "x-unit": "bytes"
+            },
+            "tls_required": {
+              "type": "boolean",
+              "default": true,
+              "x-unit": ""
+            }
+          }
+        },
+        "python": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "dependency_lock_required",
+            "install_tool",
+            "venv_path",
+            "max_threads",
+            "resource_enforcement"
+          ],
+          "properties": {
+            "dependency_lock_required": {
+              "type": "boolean",
+              "default": true,
+              "x-unit": ""
+            },
+            "install_tool": {
+              "enum": [
+                "uv"
+              ],
+              "default": "uv",
+              "x-unit": ""
+            },
+            "venv_path": {
+              "type": "string",
+              "minLength": 1,
+              "default": ".venv",
+              "x-unit": "caminho relativo ao projeto"
+            },
+            "max_threads": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 256,
+              "default": 4,
+              "x-unit": "threads"
+            },
+            "resource_enforcement": {
+              "enum": [
+                "best_effort",
+                "require"
+              ],
+              "default": "best_effort",
+              "x-unit": ""
+            }
+          }
+        },
+        "state": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "backend",
+            "path",
+            "busy_timeout_ms",
+            "checkpoint_policy",
+            "retention_days"
+          ],
+          "properties": {
+            "backend": {
+              "enum": [
+                "sqlite"
+              ],
+              "default": "sqlite",
+              "x-unit": ""
+            },
+            "path": {
+              "type": "string",
+              "minLength": 1,
+              "default": "state/dowai.sqlite",
+              "x-unit": "caminho relativo ao projeto"
+            },
+            "busy_timeout_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 600000,
+              "default": 5000,
+              "x-unit": "ms"
+            },
+            "checkpoint_policy": {
+              "enum": [
+                "after_commit"
+              ],
+              "default": "after_commit",
+              "x-unit": ""
+            },
+            "retention_days": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 3650,
+              "default": 90,
+              "x-unit": "dias"
+            }
           }
         }
-      },
-      "required": ["execution", "templates", "security", "ai"]
+      }
     },
     "origins": {
       "type": "object",
-      "additionalProperties": { "type": "string" }
+      "additionalProperties": {
+        "type": "string"
+      }
     },
     "sources": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["engine_defaults", "user", "workspace", "project", "admin"],
+      "required": [
+        "engine_defaults",
+        "user",
+        "workspace",
+        "project",
+        "admin"
+      ],
       "properties": {
-        "engine_defaults": { "const": "active" },
-        "user": { "enum": ["loaded", "not_loaded"] },
-        "workspace": { "enum": ["loaded", "not_loaded"] },
-        "project": { "enum": ["loaded", "not_loaded"] },
-        "admin": { "enum": ["loaded", "not_loaded"] }
+        "engine_defaults": {
+          "const": "active"
+        },
+        "user": {
+          "enum": [
+            "loaded",
+            "not_loaded"
+          ]
+        },
+        "workspace": {
+          "enum": [
+            "loaded",
+            "not_loaded"
+          ]
+        },
+        "project": {
+          "enum": [
+            "loaded",
+            "not_loaded"
+          ]
+        },
+        "admin": {
+          "enum": [
+            "loaded",
+            "not_loaded"
+          ]
+        }
       }
     }
   }
