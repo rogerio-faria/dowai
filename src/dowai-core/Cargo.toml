@@ -13,6 +13,6 @@ uuid.workspace = true
 sha2 = "0.11"
 rustpython-parser = "0.4"
 rustpython-ast = { version = "0.4", features = ["visitor"] }
+jsonschema.workspace = true
 
 [dev-dependencies]
-jsonschema.workspace = true

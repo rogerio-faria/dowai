@@ -7,6 +7,7 @@ mod error;
 mod outbox;
 pub mod package_policy;
 mod planner;
+pub mod plugin_manifest;
 mod project;
 mod python_ast;
 mod runs;
