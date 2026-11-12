@@ -670,9 +670,10 @@ impl<'a> Cursor<'a> {
         self.skip_whitespace();
         if self.input[self.position..].starts_with(expected) {
             self.position += expected.len();
-            if self.peek_char().map_or(true, |character| {
-                !character.is_ascii_alphanumeric() && character != '_'
-            }) {
+            if self
+                .peek_char()
+                .is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_')
+            {
                 return Ok(());
             }
         }
@@ -723,7 +724,7 @@ impl<'a> Cursor<'a> {
             || !name
                 .chars()
                 .next()
-                .map_or(false, |first| first.is_ascii_alphabetic() || first == '_')
+                .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
         {
             return Err(template_error(
                 "variable name must be a string or identifier",

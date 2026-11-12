@@ -66,15 +66,13 @@ pub fn plan(project_root: &Path, targets: &[String], mode: ExecutionMode) -> Res
         .into_iter()
         .map(|model| (model.id.clone(), model))
         .collect();
-    if models_by_id.is_empty() {
-        if targets.iter().any(|target| target == "all") {
-            return Ok(ExecutionPlan {
-                schema_version: 2,
-                execution_mode: mode.as_str().to_owned(),
-                nodes: Vec::new(),
-                warnings: Vec::new(),
-            });
-        }
+    if models_by_id.is_empty() && targets.iter().any(|target| target == "all") {
+        return Ok(ExecutionPlan {
+            schema_version: 2,
+            execution_mode: mode.as_str().to_owned(),
+            nodes: Vec::new(),
+            warnings: Vec::new(),
+        });
     }
 
     let mut models_by_name: HashMap<String, Vec<String>> = HashMap::new();
