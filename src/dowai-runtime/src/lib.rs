@@ -10,6 +10,7 @@ use dowai_postgres::{
     quote_identifier, AdapterError, Materialization as PostgresMaterialization, PgProfile,
     PostgresAdapter, TlsMode,
 };
+use retry::{run_with_retry, wait_unless_cancelled, RetryPolicy};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -21,6 +22,7 @@ use uuid::Uuid;
 mod auditor;
 mod executor;
 mod python_runtime;
+mod retry;
 
 #[derive(Clone, Debug)]
 pub struct RunRequest {
@@ -647,6 +649,7 @@ fn execute_run(
         ))
     })?;
     let configuration = effective_configuration(&root)?;
+    let retry_policy = RetryPolicy::from_configuration(&configuration)?;
     let mode = resolve_execution_mode(&configuration, request.mode)?;
     trace.execution_mode = Some(mode.as_str().to_owned());
     trace.audit.mode = Some(mode.as_str().to_owned());
@@ -838,7 +841,8 @@ fn execute_run(
             relations.clone(),
             sql_relations,
         ));
-        let mut adapter = PostgresAdapter::connect(&postgres_profile(profile))
+        let pg_profile = postgres_profile(profile);
+        let mut adapter = PostgresAdapter::connect(&pg_profile)
             .map_err(|error| DowaiError::Connection(error.to_string()))?;
         let mut completed_nodes = Vec::with_capacity(execution_plan.nodes.len());
         for (index, node) in execution_plan.nodes.iter().enumerate() {
@@ -872,69 +876,30 @@ fn execute_run(
                 });
                 continue;
             }
-            let node_started = Instant::now();
-            let sql_invocation_id = Uuid::new_v4().to_string();
-            trace
-                .audit
-                .node_started(&sql_invocation_id, &node.id, model_hash(&root, node));
-            let step = (|| {
-                let (prepared, next_variables) =
-                    render_sql_node(&root, node, &variables, &template_options, &relations)?;
-                if prepared.sql.trim().is_empty() {
-                    return Err(DowaiError::Template(format!(
-                        "{} renders to an empty SQL statement",
-                        prepared.id
-                    )));
-                }
-                store.validate_variables(&next_variables)?;
-                adapter
-                    .materialize_cancellable(
-                        &prepared.relation,
-                        match prepared.materialization {
-                            Materialization::Table => PostgresMaterialization::Table,
-                            Materialization::View => PostgresMaterialization::View,
-                        },
-                        &prepared.sql,
-                        allow_replace,
-                        &|| cancel.is_cancelled(),
-                    )
-                    .map_err(map_execution_error)?;
-                Ok((prepared, next_variables))
-            })();
-            match step {
-                Ok((prepared, next_variables)) => {
-                    trace
-                        .audit
-                        .external_write(&sql_invocation_id, &node.id, &prepared.relation);
-                    trace
-                        .audit
-                        .node_finished(&sql_invocation_id, &node.id, None);
-                    trace.node(
-                        sql_invocation_id,
-                        node,
-                        mode,
-                        "SUCCEEDED",
-                        node_started,
-                        None,
-                    );
-                    variables = next_variables;
-                    completed_nodes.push(RunNodeResult {
-                        id: prepared.id,
-                        relation: prepared.relation,
-                        materialization: match prepared.materialization {
-                            Materialization::Table => "table",
-                            Materialization::View => "view",
-                        }
-                        .to_owned(),
-                        status: "SUCCEEDED".to_owned(),
-                    });
-                }
+            let hash = model_hash(&root, node);
+            let rendered = render_sql_node(&root, node, &variables, &template_options, &relations)
+                .and_then(|(prepared, next_variables)| {
+                    if prepared.sql.trim().is_empty() {
+                        return Err(DowaiError::Template(format!(
+                            "{} renders to an empty SQL statement",
+                            prepared.id
+                        )));
+                    }
+                    store.validate_variables(&next_variables)?;
+                    Ok((prepared, next_variables))
+                });
+            let (prepared, next_variables) = match rendered {
+                Ok(rendered) => rendered,
                 Err(error) => {
+                    // Rendering failed before any attempt: the node is journaled once.
+                    let invocation_id = Uuid::new_v4().to_string();
+                    let node_started = Instant::now();
+                    trace.audit.node_started(&invocation_id, &node.id, hash);
                     trace
                         .audit
-                        .node_finished(&sql_invocation_id, &node.id, Some(&error));
+                        .node_finished(&invocation_id, &node.id, Some(&error));
                     trace.node(
-                        sql_invocation_id,
+                        invocation_id,
                         node,
                         mode,
                         node_failure_status(&error),
@@ -945,7 +910,42 @@ fn execute_run(
                     trace.skip(&execution_plan.nodes[index + 1..], mode);
                     return Err(error);
                 }
+            };
+            let materialization = match prepared.materialization {
+                Materialization::Table => PostgresMaterialization::Table,
+                Materialization::View => PostgresMaterialization::View,
+            };
+            if let Err(error) = materialize_with_retry(
+                &mut adapter,
+                &pg_profile,
+                node,
+                hash,
+                mode,
+                trace,
+                retry_policy,
+                cancel,
+                SqlWrite {
+                    relation: &prepared.relation,
+                    materialization,
+                    sql: &prepared.sql,
+                    allow_replace,
+                },
+            ) {
+                trace.python = std::mem::take(&mut executor.invocations);
+                trace.skip(&execution_plan.nodes[index + 1..], mode);
+                return Err(error);
             }
+            variables = next_variables;
+            completed_nodes.push(RunNodeResult {
+                id: prepared.id,
+                relation: prepared.relation,
+                materialization: match prepared.materialization {
+                    Materialization::Table => "table",
+                    Materialization::View => "view",
+                }
+                .to_owned(),
+                status: "SUCCEEDED".to_owned(),
+            });
         }
         let session = match prior_session {
             Some(session) => session,
@@ -988,7 +988,8 @@ fn execute_run(
         )));
     }
     store.validate_variables(&prepared.variables)?;
-    let mut adapter = PostgresAdapter::connect(&postgres_profile(profile))
+    let pg_profile = postgres_profile(profile);
+    let mut adapter = PostgresAdapter::connect(&pg_profile)
         .map_err(|error| DowaiError::Connection(error.to_string()))?;
     let allow_replace = replacement_approval(&configuration, request.confirm_destructive)?;
     let mut completed_nodes = Vec::with_capacity(prepared.nodes.len());
@@ -1001,53 +1002,27 @@ fn execute_run(
             Materialization::Table => PostgresMaterialization::Table,
             Materialization::View => PostgresMaterialization::View,
         };
-        let node_started = Instant::now();
         // `prepared.nodes` mirrors `execution_plan.nodes` one to one.
         let plan_node = &execution_plan.nodes[index];
-        let sql_invocation_id = Uuid::new_v4().to_string();
-        trace.audit.node_started(
-            &sql_invocation_id,
-            &plan_node.id,
+        if let Err(error) = materialize_with_retry(
+            &mut adapter,
+            &pg_profile,
+            plan_node,
             model_hash(&root, plan_node),
-        );
-        if let Err(error) = adapter
-            .materialize_cancellable(
-                &node.relation,
+            mode,
+            trace,
+            retry_policy,
+            cancel,
+            SqlWrite {
+                relation: &node.relation,
                 materialization,
-                &node.sql,
+                sql: &node.sql,
                 allow_replace,
-                &|| cancel.is_cancelled(),
-            )
-            .map_err(map_execution_error)
-        {
-            trace
-                .audit
-                .node_finished(&sql_invocation_id, &plan_node.id, Some(&error));
-            trace.node(
-                sql_invocation_id,
-                plan_node,
-                mode,
-                node_failure_status(&error),
-                node_started,
-                Some(&error),
-            );
+            },
+        ) {
             trace.skip(&execution_plan.nodes[index + 1..], mode);
             return Err(error);
         }
-        trace
-            .audit
-            .external_write(&sql_invocation_id, &plan_node.id, &node.relation);
-        trace
-            .audit
-            .node_finished(&sql_invocation_id, &plan_node.id, None);
-        trace.node(
-            sql_invocation_id,
-            plan_node,
-            mode,
-            "SUCCEEDED",
-            node_started,
-            None,
-        );
         completed_nodes.push(RunNodeResult {
             id: node.id.clone(),
             relation: node.relation.clone(),
@@ -1544,6 +1519,7 @@ fn map_execution_error(error: AdapterError) -> DowaiError {
             DowaiError::Policy("TLS may only be disabled for a local PostgreSQL host".to_owned())
         }
         AdapterError::QueryFailed
+        | AdapterError::TransientFailure
         | AdapterError::UnsupportedRelationType
         | AdapterError::MultipleStatements => DowaiError::Execution(error.to_string()),
         AdapterError::Cancelled => DowaiError::cancelled(),
@@ -1551,6 +1527,90 @@ fn map_execution_error(error: AdapterError) -> DowaiError {
         | AdapterError::TlsConfigurationFailed
         | AdapterError::ConnectionFailed => DowaiError::Connection(error.to_string()),
     }
+}
+
+/// One SQL materialization of a node, already rendered.
+struct SqlWrite<'a> {
+    relation: &'a str,
+    materialization: PostgresMaterialization,
+    sql: &'a str,
+    allow_replace: bool,
+}
+
+/// Runs one SQL node under the retry policy (ENT-037, ADR 0005). Each attempt has its own
+/// invocation id, audit events and journal entry: a failed attempt is journaled as `FAILED`
+/// and the last attempt carries the node's outcome. A lost connection is re-established before
+/// the next attempt. Only transient failures are repeated.
+#[allow(clippy::too_many_arguments)]
+fn materialize_with_retry(
+    adapter: &mut PostgresAdapter,
+    profile: &PgProfile,
+    node: &PlanNode,
+    hash: Option<String>,
+    mode: ExecutionMode,
+    trace: &mut Trace,
+    policy: RetryPolicy,
+    cancel: &CancellationToken,
+    write: SqlWrite<'_>,
+) -> Result<()> {
+    let outcome = run_with_retry(
+        policy,
+        |error: &AdapterError| error.is_transient(),
+        |_attempt| {
+            let invocation_id = Uuid::new_v4().to_string();
+            let started = Instant::now();
+            trace
+                .audit
+                .node_started(&invocation_id, &node.id, hash.clone());
+            let connected = if adapter.is_closed() {
+                PostgresAdapter::connect(profile).map(|fresh| *adapter = fresh)
+            } else {
+                Ok(())
+            };
+            let result = connected.and_then(|()| {
+                adapter.materialize_cancellable(
+                    write.relation,
+                    write.materialization,
+                    write.sql,
+                    write.allow_replace,
+                    &|| cancel.is_cancelled(),
+                )
+            });
+            match &result {
+                Ok(()) => {
+                    trace
+                        .audit
+                        .external_write(&invocation_id, &node.id, write.relation);
+                    trace.audit.node_finished(&invocation_id, &node.id, None);
+                    trace.node(invocation_id, node, mode, "SUCCEEDED", started, None);
+                }
+                Err(error) => {
+                    let mapped = map_execution_error(*error);
+                    trace
+                        .audit
+                        .node_finished(&invocation_id, &node.id, Some(&mapped));
+                    trace.node(
+                        invocation_id,
+                        node,
+                        mode,
+                        node_failure_status(&mapped),
+                        started,
+                        Some(&mapped),
+                    );
+                }
+            }
+            result
+        },
+        |delay| wait_unless_cancelled(delay, cancel),
+        || Uuid::new_v4().as_u128() as u64,
+    );
+    outcome.map_err(|error| {
+        if cancel.is_cancelled() {
+            DowaiError::cancelled()
+        } else {
+            map_execution_error(error)
+        }
+    })
 }
 
 const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(50);

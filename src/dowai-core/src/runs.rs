@@ -383,8 +383,13 @@ impl RunStore {
                 .map_err(state_error)?;
             Ok(nodes)
         };
-        let failed_nodes = nodes_with_status("FAILED")?;
         let succeeded_nodes = nodes_with_status("SUCCEEDED")?;
+        // A node retried by ENT-037 leaves FAILED attempts behind; once a later attempt
+        // succeeded, the node is not failed.
+        let failed_nodes: Vec<String> = nodes_with_status("FAILED")?
+            .into_iter()
+            .filter(|node| !succeeded_nodes.contains(node))
+            .collect();
         let requested_targets =
             match row.4 {
                 Some(text) => Some(serde_json::from_str::<Vec<String>>(&text).map_err(|_| {
@@ -1035,6 +1040,28 @@ mod tests {
             call_type: call_type.to_owned(),
             ..invocation(id, None, status)
         }
+    }
+
+    #[test]
+    fn retry_source_ignores_failed_attempts_of_a_node_that_later_succeeded() {
+        // ENT-037: a transient failure is journaled per attempt; the node's final attempt wins.
+        let fixture = Fixture::new();
+        let id = "33333333-3333-4333-8333-333333333333";
+        let record = run(id, 1_700_000_000_000, "FAILED");
+        fixture
+            .store
+            .record(
+                &record,
+                &[
+                    failed_invocation("r1", "recovered.sql", "FAILED", "static"),
+                    failed_invocation("r2", "recovered.sql", "SUCCEEDED", "static"),
+                    failed_invocation("x1", "broken.sql", "FAILED", "static"),
+                    failed_invocation("x2", "broken.sql", "FAILED", "static"),
+                ],
+            )
+            .expect("record");
+        let source = fixture.store.retry_source(id).expect("retry source");
+        assert_eq!(source.failed_nodes, ["broken.sql"]);
     }
 
     #[test]

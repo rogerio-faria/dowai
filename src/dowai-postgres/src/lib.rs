@@ -98,6 +98,16 @@ pub enum AdapterError {
     QueryFailed,
     /// The caller cancelled the operation; the transaction was rolled back.
     Cancelled,
+    /// Transient failure (ADR 0005 R2): lost connection, lock or statement timeout, deadlock or
+    /// serialization failure. The transaction was rolled back, so nothing was applied.
+    TransientFailure,
+}
+
+impl AdapterError {
+    /// `true` only for failures the runtime may retry (ENT-037).
+    pub fn is_transient(self) -> bool {
+        matches!(self, Self::TransientFailure)
+    }
 }
 
 impl std::fmt::Display for AdapterError {
@@ -126,6 +136,9 @@ impl std::fmt::Display for AdapterError {
             }
             Self::ConnectionFailed => formatter.write_str("PostgreSQL connection failed"),
             Self::QueryFailed => formatter.write_str("PostgreSQL query failed"),
+            Self::TransientFailure => {
+                formatter.write_str("PostgreSQL transient failure; the operation may be retried")
+            }
             Self::Cancelled => formatter.write_str("PostgreSQL operation cancelled"),
         }
     }
@@ -152,6 +165,11 @@ pub struct PostgresAdapter {
 }
 
 impl PostgresAdapter {
+    /// `true` once the connection is gone and the adapter must reconnect before reuse.
+    pub fn is_closed(&self) -> bool {
+        self.client.is_closed()
+    }
+
     pub fn connect(profile: &PgProfile) -> Result<Self, AdapterError> {
         profile.validate()?;
         let password = profile.resolve_password()?;
@@ -284,16 +302,13 @@ impl PostgresAdapter {
             return Err(AdapterError::QueryFailed);
         }
         let quoted = quote_identifier(relation)?;
-        let mut transaction = self
-            .client
-            .transaction()
-            .map_err(|_| AdapterError::QueryFailed)?;
+        let mut transaction = self.client.transaction().map_err(classify_failure)?;
         let existing = transaction
             .query_opt(
                 "SELECT c.relkind::text FROM pg_class c WHERE c.oid = to_regclass($1)",
                 &[&quoted],
             )
-            .map_err(|_| AdapterError::QueryFailed)?
+            .map_err(classify_failure)?
             .map(|row| row.get::<_, String>(0));
         ensure_destructive_approval(existing.is_some(), allow_replace)?;
         if let Some(kind) = existing {
@@ -304,7 +319,7 @@ impl PostgresAdapter {
             };
             transaction
                 .execute(&format!("DROP {drop_kind} {quoted}"), &[])
-                .map_err(|_| AdapterError::QueryFailed)?;
+                .map_err(classify_failure)?;
         }
         let create = match materialization {
             Materialization::Table => "TABLE",
@@ -312,8 +327,8 @@ impl PostgresAdapter {
         };
         transaction
             .batch_execute(&format!("CREATE {create} {quoted} AS {query}"))
-            .map_err(|_| AdapterError::QueryFailed)?;
-        transaction.commit().map_err(|_| AdapterError::QueryFailed)
+            .map_err(classify_failure)?;
+        transaction.commit().map_err(classify_failure)
     }
 
     /// Like [`Self::materialize`], but a watcher sends a PostgreSQL cancel request as soon
@@ -354,7 +369,9 @@ impl PostgresAdapter {
             result
         });
         match result {
-            Err(AdapterError::QueryFailed) if cancelled() => Err(AdapterError::Cancelled),
+            Err(AdapterError::QueryFailed | AdapterError::TransientFailure) if cancelled() => {
+                Err(AdapterError::Cancelled)
+            }
             other => other,
         }
     }
@@ -396,6 +413,27 @@ impl PostgresAdapter {
             .map_err(|_| AdapterError::QueryFailed)?;
         Ok(true)
     }
+}
+
+/// Maps a failure of a materialization statement. Transient kinds are retryable only because
+/// the materialization runs in one transaction that rolls back on failure.
+fn classify_failure(error: postgres::Error) -> AdapterError {
+    if error.is_closed()
+        || error
+            .code()
+            .is_some_and(|state| is_transient_sqlstate(state.code()))
+    {
+        AdapterError::TransientFailure
+    } else {
+        AdapterError::QueryFailed
+    }
+}
+
+/// SQLSTATE codes of transient failures: serialization failure (40001), deadlock (40P01),
+/// lock not available (55P03), statement timeout / query canceled (57014) and the connection
+/// exception class (08xxx). Other codes are permanent (for example 42P01, 23505).
+pub fn is_transient_sqlstate(code: &str) -> bool {
+    matches!(code, "40001" | "40P01" | "55P03" | "57014") || code.starts_with("08")
 }
 
 fn ensure_destructive_approval(relation_exists: bool, approved: bool) -> Result<(), AdapterError> {

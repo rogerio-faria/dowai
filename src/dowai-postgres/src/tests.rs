@@ -1,6 +1,6 @@
 use super::{
-    ensure_destructive_approval, ensure_single_statement, quote_identifier, AdapterError,
-    PgProfile, TlsMode,
+    ensure_destructive_approval, ensure_single_statement, is_transient_sqlstate, quote_identifier,
+    AdapterError, PgProfile, TlsMode,
 };
 
 fn profile(host: &str) -> PgProfile {
@@ -157,4 +157,17 @@ fn statement_guard_rejects_multiple_statements_and_nontrivial_tail() {
             Err(AdapterError::MultipleStatements)
         ));
     }
+}
+
+#[test]
+fn only_transient_sqlstates_are_retryable() {
+    for code in ["40001", "40P01", "55P03", "57014", "08006", "08003"] {
+        assert!(is_transient_sqlstate(code), "{code} must be transient");
+    }
+    for code in ["42P01", "23505", "42601", "28P01", "53100"] {
+        assert!(!is_transient_sqlstate(code), "{code} must be permanent");
+    }
+    assert!(AdapterError::TransientFailure.is_transient());
+    assert!(!AdapterError::QueryFailed.is_transient());
+    assert!(!AdapterError::Cancelled.is_transient());
 }
