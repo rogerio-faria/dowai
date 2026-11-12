@@ -54,7 +54,7 @@ pub fn render_template(
     variables: &BTreeMap<String, Value>,
     options: &TemplateOptions,
 ) -> Result<TemplateRender> {
-    let tokens = tokenize(source)?;
+    let tokens = tokenize(source, false)?;
     let mut parser = Parser {
         tokens,
         position: 0,
@@ -114,7 +114,9 @@ fn template_error(message: impl Into<String>) -> DowaiError {
     DowaiError::Template(message.into())
 }
 
-fn tokenize(source: &str) -> Result<Vec<Token>> {
+/// `plan_errors` reports malformed `ref()`/`source()`/`config()` macros as plan
+/// errors (`DOWAI_PLAN_INVALID`); the renderer keeps `DOWAI_TEMPLATE_INVALID`.
+fn tokenize(source: &str, plan_errors: bool) -> Result<Vec<Token>> {
     let mut tokens = Vec::new();
     let mut position = 0;
     while position < source.len() {
@@ -159,6 +161,11 @@ fn tokenize(source: &str) -> Result<Vec<Token>> {
             None if is_alias && is_static_macro_call(content) => {
                 push_text(&mut tokens, &source[next..full_end])
             }
+            None if plan_errors && is_alias && is_reference_call(content) => {
+                return Err(DowaiError::Model(format!(
+                    "invalid reference macro '{content}': ref(), source() and config() require literal string arguments"
+                )))
+            }
             None => return Err(template_error("unsupported or unsafe template expression")),
         }
         position = full_end;
@@ -174,6 +181,12 @@ fn push_text(tokens: &mut Vec<Token>, text: &str) {
             tokens.push(Token::Text(text.to_owned()));
         }
     }
+}
+
+fn is_reference_call(expression: &str) -> bool {
+    ["ref(", "source(", "config("]
+        .iter()
+        .any(|prefix| expression.starts_with(prefix))
 }
 
 fn is_static_macro_call(expression: &str) -> bool {
@@ -344,7 +357,7 @@ fn validate_static_sources(
     relations: &BTreeMap<String, String>,
     max_nesting: usize,
 ) -> Result<()> {
-    let tokens = tokenize(source)?;
+    let tokens = tokenize(source, false)?;
     let mut parser = Parser {
         tokens,
         position: 0,
@@ -396,6 +409,148 @@ fn validate_static_sources(
     }
 
     validate_nodes(&nodes, relations)
+}
+
+/// Static dependency declared by a SQL model through the template grammar.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StaticSqlReference {
+    Ref(String),
+    Source { source: String, table: String },
+}
+
+/// Extract `ref()` and `source()` calls from a SQL model using the same template
+/// tree that the renderer uses. SQL comments are masked first, so references in
+/// comments are not dependencies; expressions outside the allowlist (including
+/// dynamic arguments, operators, and loops) are rejected by the tokenizer.
+/// Both branches of a conditional contribute references (conservative union).
+pub fn static_sql_references(source: &str, max_nesting: usize) -> Result<Vec<StaticSqlReference>> {
+    let masked = mask_sql_comments(source)?;
+    let tokens = tokenize(&masked, true)?;
+    let mut parser = Parser {
+        tokens,
+        position: 0,
+        max_nesting,
+    };
+    let (nodes, stop) = parser.parse_sequence(0)?;
+    if stop.is_some() {
+        return Err(template_error("unexpected conditional closing tag"));
+    }
+    let mut references = Vec::new();
+    collect_static_references(&nodes, &mut references)?;
+    Ok(references)
+}
+
+fn collect_static_references(
+    nodes: &[Node],
+    references: &mut Vec<StaticSqlReference>,
+) -> Result<()> {
+    for node in nodes {
+        match node {
+            Node::Text(text) => {
+                let mut position = 0;
+                while let Some(opening_offset) = text[position..].find("{{") {
+                    let opening = position + opening_offset;
+                    let content_start = opening + 2;
+                    let close_offset = text[content_start..]
+                        .find("}}")
+                        .ok_or_else(|| template_error("static SQL macro is missing '}}'"))?;
+                    let close = content_start + close_offset;
+                    match parse_static_macro(text[content_start..close].trim())? {
+                        StaticMacro::Ref(name) => references.push(StaticSqlReference::Ref(name)),
+                        StaticMacro::Source(source, table) => {
+                            references.push(StaticSqlReference::Source { source, table })
+                        }
+                        StaticMacro::Config(_) => {}
+                    }
+                    position = close + 2;
+                }
+            }
+            Node::Conditional {
+                branches,
+                otherwise,
+            } => {
+                for (_, branch) in branches {
+                    collect_static_references(branch, references)?;
+                }
+                collect_static_references(otherwise, references)?;
+            }
+            Node::Define { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+/// Replace SQL comments (`--`, `#`, `/* */`) with a single space. Template
+/// delimiters (`{{ }}`, `{% %}`, `{# #}`) and SQL string literals are copied
+/// without comment detection, so `'--'` does not hide the following text.
+fn mask_sql_comments(source: &str) -> Result<String> {
+    let bytes = source.as_bytes();
+    let mut output = String::with_capacity(source.len());
+    let mut copied = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        if starts_with(bytes, index, b"{{") || starts_with(bytes, index, b"{%") {
+            let close: &[u8] = if bytes[index + 1] == b'{' {
+                b"}}"
+            } else {
+                b"%}"
+            };
+            index = find_after(bytes, index + 2, close).unwrap_or(bytes.len());
+            continue;
+        }
+        if starts_with(bytes, index, b"{#") {
+            index = find_after(bytes, index + 2, b"#}")
+                .ok_or_else(|| template_error("template comment is missing '#}'"))?;
+            continue;
+        }
+        let current = bytes[index];
+        if current == b'\'' || current == b'"' || current == b'`' {
+            index += 1;
+            while index < bytes.len() && bytes[index] != current {
+                if bytes[index] == b'\\' && current != b'`' {
+                    index += 1;
+                }
+                index += 1;
+            }
+            index += 1;
+            continue;
+        }
+        let comment_end = if starts_with(bytes, index, b"--") || current == b'#' {
+            Some(
+                bytes[index..]
+                    .iter()
+                    .position(|byte| *byte == b'\n')
+                    .map_or(bytes.len(), |offset| index + offset),
+            )
+        } else if starts_with(bytes, index, b"/*") {
+            Some(find_after(bytes, index + 2, b"*/").unwrap_or(bytes.len()))
+        } else {
+            None
+        };
+        if let Some(end) = comment_end {
+            output.push_str(&source[copied..index]);
+            output.push(' ');
+            copied = end;
+            index = end;
+            continue;
+        }
+        index += 1;
+    }
+    output.push_str(&source[copied..]);
+    Ok(output)
+}
+
+fn starts_with(source: &[u8], index: usize, token: &[u8]) -> bool {
+    source
+        .get(index..index + token.len())
+        .is_some_and(|slice| slice == token)
+}
+
+/// Index just past the first occurrence of `end` at or after `from`.
+fn find_after(bytes: &[u8], from: usize, end: &[u8]) -> Option<usize> {
+    (from..bytes.len())
+        .find(|&index| starts_with(bytes, index, end))
+        .map(|index| index + end.len())
 }
 
 pub fn source_relation_key(source: &str, table: &str) -> String {

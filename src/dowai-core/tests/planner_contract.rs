@@ -495,3 +495,116 @@ fn project_relative_model_paths_work_with_nested_custom_models_directory() {
 
     assert_eq!(plan.nodes[0].id, "base.sql");
 }
+
+#[test]
+fn sql_references_in_both_conditional_branches_are_static_dependencies() {
+    let project = TestProject::new();
+    project.write_model("a.sql", "select 1 as id");
+    project.write_model("b.sql", "select 2 as id");
+    project.write_model(
+        "consumer.sql",
+        "{% if var('enabled') %}select * from {{ ref('a') }}{% else %}select * from {{ ref('b') }}{% endif %}",
+    );
+
+    let plan = plan(
+        project.path(),
+        &["consumer.sql".into()],
+        ExecutionMode::Automatic,
+    )
+    .expect("conditional references form a conservative union");
+
+    let consumer = plan
+        .nodes
+        .iter()
+        .find(|node| node.id == "consumer.sql")
+        .expect("consumer is planned");
+    assert_eq!(consumer.depends_on, ["a.sql", "b.sql"]);
+}
+
+#[test]
+fn sql_reference_macros_with_dynamic_or_extra_arguments_fail_planning() {
+    let cases = [
+        "select * from {{ ref('a') ~ 'b' }}",
+        "select * from {{ ref('a'), ref('b') }}",
+        "select * from {{ ref('a', 'b') }}",
+        "select * from {{ ref(model_name) }}",
+        "select * from {{ source('s') }}",
+    ];
+    for body in cases {
+        let project = TestProject::new();
+        project.write_model("a.sql", "select 1 as id");
+        project.write_model("consumer.sql", body);
+
+        let error = plan(
+            project.path(),
+            &["consumer.sql".into()],
+            ExecutionMode::Automatic,
+        )
+        .expect_err("dynamic or malformed reference must be refused");
+
+        assert_eq!(error.code(), "DOWAI_PLAN_INVALID", "case: {body}");
+    }
+}
+
+#[test]
+fn unsafe_template_expressions_are_refused_by_the_template_grammar() {
+    let cases = [
+        "select * from {{ __import__('os').system('id') }}",
+        "select * from {{ config.__class__ }}",
+        "{% for item in ref('a') %}select 1{% endfor %}",
+    ];
+    for body in cases {
+        let project = TestProject::new();
+        project.write_model("a.sql", "select 1 as id");
+        project.write_model("consumer.sql", body);
+
+        let error = plan(
+            project.path(),
+            &["consumer.sql".into()],
+            ExecutionMode::Automatic,
+        )
+        .expect_err("unsafe template expression must be refused");
+
+        assert_eq!(error.code(), "DOWAI_TEMPLATE_INVALID", "case: {body}");
+    }
+}
+
+#[test]
+fn sql_comments_are_masked_without_hiding_later_references() {
+    let project = TestProject::new();
+    project.write_model("source.sql", "select 1 as id");
+    project.write_model(
+        "daily.sql",
+        "/* {{ ref('missing') }} */ select '--' as marker, {{ ref('source') }} as id -- don't {{ ref('missing') }}\nfrom dual",
+    );
+
+    let plan = plan(
+        project.path(),
+        &["daily.sql".into()],
+        ExecutionMode::Automatic,
+    )
+    .expect("only the executable reference is a dependency");
+
+    let daily = plan
+        .nodes
+        .iter()
+        .find(|node| node.id == "daily.sql")
+        .expect("daily is planned");
+    assert_eq!(daily.depends_on, ["source.sql"]);
+}
+
+#[test]
+fn sql_source_declarations_are_not_plan_dependencies() {
+    let project = TestProject::new();
+    project.write_model("daily.sql", "select * from {{ source('raw', 'events') }}");
+
+    let plan = plan(
+        project.path(),
+        &["daily.sql".into()],
+        ExecutionMode::Automatic,
+    )
+    .expect("sources are validated by the runtime, not planned as models");
+
+    assert_eq!(plan.nodes.len(), 1);
+    assert!(plan.nodes[0].depends_on.is_empty());
+}

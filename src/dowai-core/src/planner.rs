@@ -1,3 +1,4 @@
+use crate::templates::{static_sql_references, StaticSqlReference};
 use crate::{load_project, render_template, DowaiError, Result, TemplateOptions};
 use serde::Serialize;
 use serde_json::Value;
@@ -345,18 +346,44 @@ fn resolve_targets(
 }
 
 fn extract_dependencies(model_id: &str, body: &str) -> Result<Vec<String>> {
-    let tokens = tokenize(body);
-    let is_python = Path::new(model_id)
+    if is_python_model(model_id) {
+        return extract_python_dependencies(model_id, body);
+    }
+    let references =
+        static_sql_references(body, TemplateOptions::default().max_nesting).map_err(|error| {
+            match error {
+                DowaiError::Model(message) => DowaiError::Model(format!("{model_id}: {message}")),
+                DowaiError::Template(message) => {
+                    DowaiError::Template(format!("{model_id}: {message}"))
+                }
+                other => other,
+            }
+        })?;
+    Ok(references
+        .into_iter()
+        .filter_map(|reference| match reference {
+            StaticSqlReference::Ref(name) => Some(name),
+            StaticSqlReference::Source { .. } => None,
+        })
+        .collect())
+}
+
+fn is_python_model(model_id: &str) -> bool {
+    Path::new(model_id)
         .extension()
         .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("py"));
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("py"))
+}
+
+fn extract_python_dependencies(model_id: &str, body: &str) -> Result<Vec<String>> {
+    let tokens = tokenize(body);
     let mut dependencies = Vec::new();
     let mut index = 0;
     while index < tokens.len() {
         let call_name = match &tokens[index] {
             Token::Identifier(name)
                 if (name == "ref" || name == "depends_on")
-                    && (!is_python || is_env_method_call(&tokens, index)) =>
+                    && is_env_method_call(&tokens, index) =>
             {
                 Some(name)
             }
