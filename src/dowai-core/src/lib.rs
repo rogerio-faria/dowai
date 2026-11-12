@@ -3,6 +3,7 @@ mod cancel;
 pub mod compatibility;
 mod config;
 pub mod config_catalog;
+pub mod data_dictionary;
 mod error;
 pub mod operational_log;
 mod outbox;
@@ -29,6 +30,10 @@ pub use config::{
     admin_config_path, check_configuration_formats, load_workspace_profile, migrate_legacy_yaml,
     resolve_effective_configuration, user_config_path, MigrationReport, ProfileTlsMode,
     WorkspaceProfile,
+};
+pub use data_dictionary::{
+    dictionary_paths_from, load_dictionary, merge as merge_dictionaries, parse_dictionary,
+    Dictionary, DictionaryOrigin, DictionaryPaths, MergedDictionary, MergedMetric, Metric,
 };
 pub use error::{exit_codes, DowaiError, Result};
 pub use operational_log::{
