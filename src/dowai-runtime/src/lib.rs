@@ -22,8 +22,6 @@ mod auditor;
 mod executor;
 mod python_runtime;
 
-const SESSION_TTL: Duration = Duration::from_secs(86_400);
-
 #[derive(Clone, Debug)]
 pub struct RunRequest {
     pub targets: Vec<String>,
@@ -692,7 +690,8 @@ fn execute_run(
     let store = SessionStore::for_user_state(
         default_session_path()
             .ok_or_else(|| DowaiError::State("No user state directory is available".to_owned()))?,
-    );
+    )
+    .with_session_limits(dowai_core::session_limits_from_config(&configuration)?);
     let prior_session = match request.session_id.as_deref() {
         Some(session_id) => {
             let metadata = store.get(session_id)?;
@@ -771,7 +770,7 @@ fn execute_run(
         trace.python = invocations.clone();
         let session = match prior_session {
             Some(session) => session,
-            None => store.create(&root, SESSION_TTL)?,
+            None => store.create(&root, dowai_core::session_ttl_from_config(&configuration)?)?,
         };
         trace.audit.session_id = Some(session.session_id.clone());
         publish_variables(
@@ -950,7 +949,7 @@ fn execute_run(
         }
         let session = match prior_session {
             Some(session) => session,
-            None => store.create(&root, SESSION_TTL)?,
+            None => store.create(&root, dowai_core::session_ttl_from_config(&configuration)?)?,
         };
         trace.audit.session_id = Some(session.session_id.clone());
         publish_variables(
@@ -1063,7 +1062,7 @@ fn execute_run(
 
     let session = match prior_session {
         Some(session) => session,
-        None => store.create(&root, SESSION_TTL)?,
+        None => store.create(&root, dowai_core::session_ttl_from_config(&configuration)?)?,
     };
     trace.audit.session_id = Some(session.session_id.clone());
     publish_variables(

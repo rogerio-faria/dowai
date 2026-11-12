@@ -1,10 +1,11 @@
 use clap::{Args, Parser, Subcommand};
 use dowai_core::{
     admin_config_path, create_project, default_run_store_path, default_session_store_path,
-    filter_invocations, invocation_depths, plan, resolve_effective_configuration, user_config_path,
-    validate_project_with_configuration, CancellationToken, DowaiError, ExecutionMode,
-    InvocationEntry, LogLevel, Result, RevisionSnapshot, RunDetail, RunStore, RunSummary,
-    SessionMetadata, SessionStore, TemplateOptions,
+    filter_invocations, invocation_depths, plan, resolve_effective_configuration,
+    session_ttl_from_config, user_config_path, validate_project_with_configuration,
+    CancellationToken, DowaiError, ExecutionMode, InvocationEntry, LogLevel, Result,
+    RevisionSnapshot, RunDetail, RunStore, RunSummary, SessionMetadata, SessionStore,
+    TemplateOptions,
 };
 use dowai_runtime::{
     check_postgres_connection, check_python_runtime, check_python_sdk, declared_default_profile,
@@ -15,9 +16,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
 
-const DEFAULT_SESSION_TTL_SECONDS: u64 = 86_400;
 const DEFAULT_RUNS_LIMIT: usize = 20;
 
 #[derive(Debug, Parser)]
@@ -865,10 +864,12 @@ fn dispatch_session(command: SessionCommand, store: &SessionStore) -> Result<Opt
                 Some(path) => path,
                 None => find_project_root(&std::env::current_dir()?)?,
             };
-            let session = store.create(
+            let configuration = resolve_effective_configuration(
                 &project_root,
-                Duration::from_secs(DEFAULT_SESSION_TTL_SECONDS),
+                user_config_path().as_deref(),
+                admin_config_path().as_deref(),
             )?;
+            let session = store.create(&project_root, session_ttl_from_config(&configuration)?)?;
             if json {
                 Ok(Some(session_json(&session, &RevisionSnapshot::default())))
             } else {

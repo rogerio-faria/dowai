@@ -125,7 +125,7 @@ impl AuditEvent {
 }
 
 /// Operating-system account name only (no host, home path or other identity data).
-fn actor() -> String {
+pub(crate) fn actor() -> String {
     ["USER", "LOGNAME", "USERNAME"]
         .iter()
         .filter_map(|name| std::env::var(name).ok())

@@ -1,3 +1,4 @@
+use crate::audit::{AuditEvent, AuditLog};
 use crate::{load_project, DowaiError, Result};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
@@ -12,7 +13,7 @@ const DEFAULT_MAX_VARIABLES: usize = 1_000;
 const DEFAULT_MAX_VALUE_BYTES: usize = 65_536;
 const DEFAULT_MAX_CONTEXT_BYTES: usize = 16 * 1024 * 1024;
 /// Current `PRAGMA user_version` of the session database.
-pub const SESSION_SCHEMA_VERSION: i64 = 1;
+pub const SESSION_SCHEMA_VERSION: i64 = 2;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Serialize)]
@@ -67,6 +68,39 @@ pub struct SessionStore {
     path: PathBuf,
     limits: SessionLimits,
     secure_parent: bool,
+    /// Operating-system account that owns the sessions this store can reach. Sessions
+    /// created by another owner are reported as not found.
+    owner: String,
+}
+
+/// Operating-system account of the current process (same source as the audit `actor`).
+pub fn current_owner() -> String {
+    crate::audit::actor()
+}
+
+/// Reads `sessions.*` limits from a resolved effective configuration.
+pub fn session_limits_from_config(configuration: &Value) -> Result<SessionLimits> {
+    let sessions = &configuration["effective"]["sessions"];
+    let field = |name: &str| -> Result<usize> {
+        sessions[name]
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| DowaiError::Config(format!("Effective sessions.{name} is invalid")))
+    };
+    Ok(SessionLimits {
+        max_variables: field("max_variables")?,
+        max_value_bytes: field("max_value_bytes")?,
+        max_context_bytes: field("max_context_bytes")?,
+    })
+}
+
+/// Reads `sessions.ttl_seconds` from a resolved effective configuration.
+pub fn session_ttl_from_config(configuration: &Value) -> Result<Duration> {
+    configuration["effective"]["sessions"]["ttl_seconds"]
+        .as_u64()
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .ok_or_else(|| DowaiError::Config("Effective sessions.ttl_seconds is invalid".to_owned()))
 }
 
 impl SessionStore {
@@ -79,6 +113,7 @@ impl SessionStore {
             path: path.into(),
             limits,
             secure_parent: false,
+            owner: current_owner(),
         }
     }
 
@@ -87,7 +122,21 @@ impl SessionStore {
             path: path.into(),
             limits: SessionLimits::default(),
             secure_parent: true,
+            owner: current_owner(),
         }
+    }
+
+    /// Replaces the session limits (for example, the values from `sessions.*` configuration).
+    pub fn with_session_limits(mut self, limits: SessionLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// Acts as another operating-system account. Used to verify that sessions of other
+    /// owners are refused; production code keeps the current account.
+    pub fn with_owner(mut self, owner: impl Into<String>) -> Self {
+        self.owner = owner.into();
+        self
     }
 
     pub fn create(&self, project_root: &Path, ttl: Duration) -> Result<SessionMetadata> {
@@ -116,13 +165,14 @@ impl SessionStore {
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
-            "INSERT INTO sessions (id, project_root, created_at_ms, updated_at_ms, expires_at_ms, status)
-             VALUES (?1, ?2, ?3, ?3, ?4, 'ACTIVE')",
+            "INSERT INTO sessions (id, project_root, created_at_ms, updated_at_ms, expires_at_ms, status, owner)
+             VALUES (?1, ?2, ?3, ?3, ?4, 'ACTIVE', ?5)",
             params![
                 metadata.session_id,
                 metadata.project_root.to_string_lossy(),
                 metadata.created_at_ms,
-                metadata.expires_at_ms
+                metadata.expires_at_ms,
+                self.owner
             ],
         )?;
         transaction.commit()?;
@@ -131,14 +181,14 @@ impl SessionStore {
 
     pub fn get(&self, session_id: &str) -> Result<SessionMetadata> {
         let connection = self.connect()?;
-        let metadata = read_metadata(&connection, session_id)?;
+        let metadata = read_metadata(&connection, session_id, &self.owner)?;
         ensure_active(&metadata)?;
         Ok(metadata)
     }
 
     pub fn snapshot(&self, session_id: &str) -> Result<BTreeMap<String, Value>> {
         let connection = self.connect()?;
-        let metadata = read_metadata(&connection, session_id)?;
+        let metadata = read_metadata(&connection, session_id, &self.owner)?;
         ensure_active(&metadata)?;
         let mut statement = connection.prepare(
             "SELECT variable_key, value_json FROM session_variables
@@ -160,7 +210,7 @@ impl SessionStore {
 
     pub fn snapshot_versioned(&self, session_id: &str) -> Result<VersionedSnapshot> {
         let connection = self.connect()?;
-        let metadata = read_metadata(&connection, session_id)?;
+        let metadata = read_metadata(&connection, session_id, &self.owner)?;
         ensure_active(&metadata)?;
         let mut statement = connection.prepare(
             "SELECT variable_key, value_json, revision FROM session_variables
@@ -188,7 +238,7 @@ impl SessionStore {
     /// Revisions only (no values), read in one transaction-consistent snapshot.
     pub fn revision_snapshot(&self, session_id: &str) -> Result<RevisionSnapshot> {
         let connection = self.connect()?;
-        let metadata = read_metadata(&connection, session_id)?;
+        let metadata = read_metadata(&connection, session_id, &self.owner)?;
         ensure_active(&metadata)?;
         let variable_revision: i64 = connection.query_row(
             "SELECT variable_revision FROM sessions WHERE id = ?1",
@@ -212,7 +262,7 @@ impl SessionStore {
 
     pub fn variable_names(&self, session_id: &str) -> Result<Vec<String>> {
         let connection = self.connect()?;
-        let metadata = read_metadata(&connection, session_id)?;
+        let metadata = read_metadata(&connection, session_id, &self.owner)?;
         ensure_active(&metadata)?;
         let mut statement = connection.prepare(
             "SELECT variable_key FROM session_variables
@@ -237,7 +287,7 @@ impl SessionStore {
 
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let metadata = read_metadata(&transaction, session_id)?;
+        let metadata = read_metadata(&transaction, session_id, &self.owner)?;
         ensure_active(&metadata)?;
         let current: Option<String> = transaction
             .query_row(
@@ -339,7 +389,7 @@ impl SessionStore {
         // IMMEDIATE takes the write lock before the revision check, so check and write are
         // one atomic step: a concurrent publisher either committed before (conflict) or waits.
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let metadata = read_metadata(&transaction, session_id)?;
+        let metadata = read_metadata(&transaction, session_id, &self.owner)?;
         ensure_active(&metadata)?;
         let mut stored = BTreeMap::new();
         let mut current_revisions = BTreeMap::new();
@@ -418,7 +468,7 @@ impl SessionStore {
         validate_variable_key(key)?;
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let metadata = read_metadata(&transaction, session_id)?;
+        let metadata = read_metadata(&transaction, session_id, &self.owner)?;
         ensure_active(&metadata)?;
         let removed = transaction.execute(
             "DELETE FROM session_variables WHERE session_id = ?1 AND variable_key = ?2",
@@ -437,7 +487,7 @@ impl SessionStore {
     pub fn end(&self, session_id: &str) -> Result<()> {
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let metadata = read_metadata(&transaction, session_id)?;
+        let metadata = read_metadata(&transaction, session_id, &self.owner)?;
         ensure_active(&metadata)?;
         transaction.execute(
             "UPDATE sessions SET status = 'ENDED', updated_at_ms = ?2 WHERE id = ?1",
@@ -496,15 +546,11 @@ impl SessionStore {
                    PRIMARY KEY (session_id, variable_key)
                  );
                  CREATE INDEX IF NOT EXISTS sessions_status_expiry
-                   ON sessions(status, expires_at_ms);
-                 UPDATE sessions SET status = 'EXPIRED',
-                   updated_at_ms = unixepoch('subsec') * 1000
-                   WHERE status = 'ACTIVE' AND expires_at_ms <= unixepoch('subsec') * 1000;
-                 DELETE FROM session_variables
-                   WHERE session_id IN (SELECT id FROM sessions WHERE status != 'ACTIVE');",
+                   ON sessions(status, expires_at_ms);",
             )
             .map_err(state_error)?;
-        migrate(&mut connection)?;
+        migrate(&mut connection, &self.owner)?;
+        expire_sessions(&mut connection, &self.path)?;
         set_private_file_permissions(&self.path)?;
         Ok(connection)
     }
@@ -587,7 +633,7 @@ fn next_revision(transaction: &Connection, session_id: &str) -> Result<i64> {
 }
 
 /// Upgrades a pre-versioned database (`user_version` 0) in one IMMEDIATE transaction.
-fn migrate(connection: &mut Connection) -> Result<()> {
+fn migrate(connection: &mut Connection, owner: &str) -> Result<()> {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(state_error)?;
@@ -606,6 +652,9 @@ fn migrate(connection: &mut Connection) -> Result<()> {
     let version: i64 = transaction
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(state_error)?;
+    if version >= SESSION_SCHEMA_VERSION {
+        return Ok(());
+    }
     if version == 0 {
         for (table, column, definition) in [
             (
@@ -632,10 +681,23 @@ fn migrate(connection: &mut Connection) -> Result<()> {
                     WHERE session_variables.session_id = sessions.id), 0);",
             )
             .map_err(state_error)?;
+    }
+    // v2: sessions belong to an owner. Pre-v2 sessions live in the caller's own state file,
+    // so they are attributed to the account that performs the migration.
+    if !has_column(&transaction, "sessions", "owner")? {
         transaction
-            .execute_batch(&format!("PRAGMA user_version = {SESSION_SCHEMA_VERSION}"))
+            .execute_batch("ALTER TABLE sessions ADD COLUMN owner TEXT")
             .map_err(state_error)?;
     }
+    transaction
+        .execute(
+            "UPDATE sessions SET owner = ?1 WHERE owner IS NULL",
+            [owner],
+        )
+        .map_err(state_error)?;
+    transaction
+        .execute_batch(&format!("PRAGMA user_version = {SESSION_SCHEMA_VERSION}"))
+        .map_err(state_error)?;
     transaction.commit().map_err(state_error)?;
     Ok(())
 }
@@ -652,12 +714,64 @@ fn has_column(connection: &Connection, table: &str, column: &str) -> Result<bool
     Ok(names.iter().any(|name| name == column))
 }
 
-fn read_metadata(connection: &Connection, session_id: &str) -> Result<SessionMetadata> {
+/// Marks ACTIVE sessions past their expiry as EXPIRED, deletes their variables and appends one
+/// `session.expired` audit record per session. Audit is written before the commit: if it fails,
+/// nothing is removed and the next access retries the sweep (no silent loss).
+fn expire_sessions(connection: &mut Connection, storage_path: &Path) -> Result<()> {
+    let now = now_ms()?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(state_error)?;
+    let expired: Vec<String> = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT id FROM sessions WHERE status = 'ACTIVE' AND expires_at_ms <= ?1 ORDER BY id",
+            )
+            .map_err(state_error)?;
+        let ids = statement
+            .query_map([now], |row| row.get::<_, String>(0))
+            .map_err(state_error)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(state_error)?;
+        ids
+    };
+    if !expired.is_empty() {
+        let log = AuditLog::new(storage_path.with_file_name("audit.jsonl"));
+        for session_id in &expired {
+            let mut event = AuditEvent::new("session.expired", "");
+            event.session_id = Some(session_id.clone());
+            event.result = Some("variables_removed".to_owned());
+            log.append(&event)?;
+            transaction
+                .execute(
+                    "UPDATE sessions SET status = 'EXPIRED', updated_at_ms = ?2 WHERE id = ?1",
+                    params![session_id, now],
+                )
+                .map_err(state_error)?;
+            transaction
+                .execute(
+                    "DELETE FROM session_variables WHERE session_id = ?1",
+                    [session_id],
+                )
+                .map_err(state_error)?;
+        }
+    }
+    transaction.commit().map_err(state_error)?;
+    Ok(())
+}
+
+/// Looks a session up for `owner` only. Sessions of other owners look exactly like missing
+/// ones, so their existence is not disclosed.
+fn read_metadata(
+    connection: &Connection,
+    session_id: &str,
+    owner: &str,
+) -> Result<SessionMetadata> {
     connection
         .query_row(
             "SELECT id, project_root, created_at_ms, expires_at_ms, status
-             FROM sessions WHERE id = ?1",
-            [session_id],
+             FROM sessions WHERE id = ?1 AND owner = ?2",
+            params![session_id, owner],
             |row| {
                 Ok(SessionMetadata {
                     session_id: row.get(0)?,
@@ -743,6 +857,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use uuid::Uuid;
 
     struct Fixture {
         workspace: PathBuf,
@@ -868,6 +983,136 @@ mod tests {
             })
             .expect("count stored variables");
         assert_eq!(variable_count, 0);
+    }
+
+    #[test]
+    fn sessions_of_another_owner_are_refused_like_missing_ones() {
+        let fixture = Fixture::new(SessionLimits::default());
+        let id = session_with(&fixture, &[("token", json!("private"))]);
+        let intruder =
+            SessionStore::with_limits(fixture.store.path.clone(), SessionLimits::default())
+                .with_owner("outro-usuario-de-teste");
+
+        let foreign = intruder.get(&id).expect_err("foreign get");
+        let missing = intruder
+            .get(&Uuid::new_v4().to_string())
+            .expect_err("missing get");
+        assert_eq!(foreign.to_string(), missing.to_string());
+        assert!(intruder.snapshot(&id).is_err());
+        assert!(intruder.snapshot_versioned(&id).is_err());
+        assert!(intruder.revision_snapshot(&id).is_err());
+        assert!(intruder.variable_names(&id).is_err());
+        assert!(intruder
+            .set_variable(&id, "token", &json!("stolen"))
+            .is_err());
+        assert!(intruder
+            .commit_variables(
+                &id,
+                &changes(&[("token", json!("stolen"))]),
+                &BTreeMap::new(),
+                &origin("x")
+            )
+            .is_err());
+        assert!(intruder.unset_variable(&id, "token").is_err());
+        assert!(intruder.end(&id).is_err());
+
+        // The owner keeps full access and the session was not ended by the intruder.
+        assert_eq!(
+            fixture.store.snapshot(&id).expect("owner snapshot"),
+            [("token".to_owned(), json!("private"))].into()
+        );
+    }
+
+    #[test]
+    fn expired_session_is_removed_once_and_recorded_in_audit() {
+        let fixture = Fixture::new(SessionLimits::default());
+        let session = fixture
+            .store
+            .create(fixture.project_root(), Duration::from_millis(400))
+            .expect("create session");
+        fixture
+            .store
+            .set_variable(&session.session_id, "token", &json!("private"))
+            .expect("set variable");
+        std::thread::sleep(Duration::from_millis(600));
+
+        assert!(fixture.store.get(&session.session_id).is_err());
+        assert!(fixture.store.snapshot(&session.session_id).is_err());
+
+        let events = crate::audit::AuditLog::new(fixture.workspace.join("state/audit.jsonl"))
+            .read_all()
+            .expect("audit log");
+        let expired: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event.event == "session.expired"
+                    && event.session_id.as_deref() == Some(session.session_id.as_str())
+            })
+            .collect();
+        assert_eq!(expired.len(), 1, "one audit record per expired session");
+        assert!(!format!("{:?}", expired[0]).contains("private"));
+    }
+
+    #[test]
+    fn limits_are_enforced_on_commit_without_partial_writes() {
+        let fixture = Fixture::new(SessionLimits {
+            max_variables: 2,
+            max_value_bytes: 16,
+            max_context_bytes: 10,
+        });
+        let id = session_with(&fixture, &[("a", json!(1))]);
+        let base = fixture
+            .store
+            .snapshot_versioned(&id)
+            .expect("base")
+            .revisions;
+
+        // max_value_bytes: 18 encoded bytes > 16.
+        assert!(fixture
+            .store
+            .commit_variables(
+                &id,
+                &changes(&[("b", json!("abcdefghijklmn"))]),
+                &base,
+                &origin("v")
+            )
+            .is_err());
+        // max_context_bytes: 1 + 11 = 12 > 10 (value itself is within max_value_bytes).
+        assert!(fixture
+            .store
+            .commit_variables(
+                &id,
+                &changes(&[("b", json!("abcdefghi"))]),
+                &base,
+                &origin("c")
+            )
+            .is_err());
+        // max_variables: 3 keys > 2 once merged with the stored snapshot.
+        assert!(fixture
+            .store
+            .commit_variables(
+                &id,
+                &changes(&[("b", json!(2)), ("c", json!(3))]),
+                &base,
+                &origin("n")
+            )
+            .is_err());
+        assert_eq!(fixture.store.variable_names(&id).expect("names"), vec!["a"]);
+    }
+
+    #[test]
+    fn context_limit_is_enforced_on_set_variable() {
+        let fixture = Fixture::new(SessionLimits {
+            max_variables: 10,
+            max_value_bytes: 64,
+            max_context_bytes: 10,
+        });
+        let id = session_with(&fixture, &[("a", json!(1))]);
+        assert!(fixture
+            .store
+            .set_variable(&id, "b", &json!("abcdefghi"))
+            .is_err());
+        assert_eq!(fixture.store.variable_names(&id).expect("names"), vec!["a"]);
     }
 
     fn origin(tag: &str) -> VariableOrigin {

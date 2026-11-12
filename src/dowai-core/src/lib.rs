@@ -34,8 +34,9 @@ pub use runs::{
     RUN_SCHEMA_VERSION,
 };
 pub use sessions::{
-    default_session_store_path, RevisionSnapshot, SessionLimits, SessionLock, SessionMetadata,
-    SessionStore, VariableOrigin, VersionedSnapshot,
+    current_owner, default_session_store_path, session_limits_from_config, session_ttl_from_config,
+    RevisionSnapshot, SessionLimits, SessionLock, SessionMetadata, SessionStore, VariableOrigin,
+    VersionedSnapshot,
 };
 pub use templates::{
     render_sql_model, render_template, source_relation_key, Materialization, RenderedSqlModel,
