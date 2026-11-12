@@ -949,7 +949,7 @@ fn stop_worker(child: &mut Child) -> Result<()> {
     Ok(())
 }
 
-fn apply_worker_environment(command: &mut Command) {
+pub(crate) fn apply_worker_environment(command: &mut Command) {
     command.env_clear();
     for name in ["PATH", "SystemRoot", "WINDIR", "TEMP", "TMP"] {
         if let Some(value) = std::env::var_os(name) {
@@ -998,39 +998,39 @@ fn configure_memory_limit(command: &mut Command, memory_bytes: Option<u64>) {
 fn configure_memory_limit(_command: &mut Command, _memory_bytes: Option<u64>) {}
 
 #[cfg(unix)]
-fn configure_process_group(command: &mut Command) {
+pub(crate) fn configure_process_group(command: &mut Command) {
     use std::os::unix::process::CommandExt;
     command.process_group(0);
 }
 
 #[cfg(not(unix))]
-fn configure_process_group(_command: &mut Command) {}
+pub(crate) fn configure_process_group(_command: &mut Command) {}
 
 #[cfg(unix)]
-struct ProcessTree {
+pub(crate) struct ProcessTree {
     process_group: i32,
 }
 
 #[cfg(unix)]
-fn attach_process_tree(child: &mut Child) -> Result<ProcessTree> {
+pub(crate) fn attach_process_tree(child: &mut Child) -> Result<ProcessTree> {
     let process_group = i32::try_from(child.id())
         .map_err(|_| python_failure("Invalid Python worker process identifier"))?;
     Ok(ProcessTree { process_group })
 }
 
 #[cfg(unix)]
-fn terminate_process_tree(tree: &ProcessTree, child: &mut Child) -> Result<()> {
+pub(crate) fn terminate_process_tree(tree: &ProcessTree, child: &mut Child) -> Result<()> {
     terminate_group(tree)?;
     terminate_child(child)
 }
 
 #[cfg(unix)]
-fn terminate_descendants(tree: &ProcessTree) -> Result<()> {
+pub(crate) fn terminate_descendants(tree: &ProcessTree) -> Result<()> {
     terminate_group(tree)
 }
 
 #[cfg(windows)]
-struct ProcessTree(windows_sys::Win32::Foundation::HANDLE);
+pub(crate) struct ProcessTree(windows_sys::Win32::Foundation::HANDLE);
 
 #[cfg(windows)]
 impl Drop for ProcessTree {
@@ -1042,7 +1042,7 @@ impl Drop for ProcessTree {
 }
 
 #[cfg(windows)]
-fn attach_process_tree(child: &mut Child) -> Result<ProcessTree> {
+pub(crate) fn attach_process_tree(child: &mut Child) -> Result<ProcessTree> {
     use std::mem::size_of;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::System::JobObjects::{
@@ -1079,7 +1079,7 @@ fn attach_process_tree(child: &mut Child) -> Result<ProcessTree> {
 }
 
 #[cfg(windows)]
-fn terminate_process_tree(tree: &ProcessTree, _child: &mut Child) -> Result<()> {
+pub(crate) fn terminate_process_tree(tree: &ProcessTree, _child: &mut Child) -> Result<()> {
     let terminated =
         unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(tree.0, 1) };
     if terminated == 0 {
@@ -1091,7 +1091,7 @@ fn terminate_process_tree(tree: &ProcessTree, _child: &mut Child) -> Result<()> 
 }
 
 #[cfg(windows)]
-fn terminate_descendants(tree: &ProcessTree) -> Result<()> {
+pub(crate) fn terminate_descendants(tree: &ProcessTree) -> Result<()> {
     let terminated =
         unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(tree.0, 0) };
     if terminated == 0 {
@@ -1103,15 +1103,15 @@ fn terminate_descendants(tree: &ProcessTree) -> Result<()> {
 }
 
 #[cfg(not(any(unix, windows)))]
-struct ProcessTree;
+pub(crate) struct ProcessTree;
 
 #[cfg(not(any(unix, windows)))]
-fn attach_process_tree(_child: &mut Child) -> Result<ProcessTree> {
+pub(crate) fn attach_process_tree(_child: &mut Child) -> Result<ProcessTree> {
     Ok(ProcessTree)
 }
 
 #[cfg(not(any(unix, windows)))]
-fn terminate_process_tree(_tree: &ProcessTree, child: &mut Child) -> Result<()> {
+pub(crate) fn terminate_process_tree(_tree: &ProcessTree, child: &mut Child) -> Result<()> {
     child
         .kill()
         .map_err(|_| python_failure("Could not terminate the timed-out Python worker"))?;
@@ -1119,7 +1119,7 @@ fn terminate_process_tree(_tree: &ProcessTree, child: &mut Child) -> Result<()> 
 }
 
 #[cfg(not(any(unix, windows)))]
-fn terminate_descendants(_tree: &ProcessTree) -> Result<()> {
+pub(crate) fn terminate_descendants(_tree: &ProcessTree) -> Result<()> {
     Ok(())
 }
 

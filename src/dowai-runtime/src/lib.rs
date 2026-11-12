@@ -10,6 +10,7 @@ use dowai_postgres::{
     quote_identifier, AdapterError, Materialization as PostgresMaterialization, PgProfile,
     PostgresAdapter, TlsMode,
 };
+pub use plugin_exec::{execute_plugin, PluginExecution};
 use retry::{run_with_retry, wait_unless_cancelled, RetryPolicy};
 use serde::Serialize;
 use serde_json::Value;
@@ -21,6 +22,7 @@ use uuid::Uuid;
 
 mod auditor;
 mod executor;
+mod plugin_exec;
 mod python_runtime;
 mod resources;
 mod retry;

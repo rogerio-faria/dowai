@@ -62,6 +62,37 @@ class FakeEngineTests(unittest.TestCase):
         self.assertEqual(result.execution_mode, "manual")
         self.assertEqual(result.nodes, ({"id": "ok.py"},))
 
+    def test_plugin_run_builds_the_cli_arguments(self):
+        payload = self.client.plugin_run(
+            "email.send", {"to": "a@example.com", "n": 1}, idempotency_key="alert-1"
+        )
+        self.assertEqual(
+            payload["echo"],
+            [
+                "plugins",
+                "run",
+                "email.send",
+                "--input",
+                '{"to": "a@example.com", "n": 1}',
+                "--idempotency-key",
+                "alert-1",
+                "--json",
+            ],
+        )
+
+    def test_plugin_run_without_input_or_key_sends_an_empty_object(self):
+        payload = self.client.plugin_run("email.send")
+        self.assertEqual(
+            payload["echo"], ["plugins", "run", "email.send", "--input", "{}", "--json"]
+        )
+
+    def test_plugin_run_rejects_bad_arguments_before_running_the_engine(self):
+        for target, args in [("--json", {}), ("email.send", [1]), ("email.send", {"a": {1, 2}})]:
+            with self.subTest(target=target), self.assertRaises(ValueError):
+                self.client.plugin_run(target, args)
+        with self.assertRaises(ValueError):
+            self.client.plugin_run("email.send", {}, idempotency_key="--x")
+
     def test_plan_passes_project_dir_and_returns_the_engine_payload(self):
         payload = self.client.plan(["ok.py"], manual=True)
         self.assertEqual(

@@ -67,6 +67,22 @@ pub struct AuditEvent {
     pub result: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
+    /// Plugin ID, `plugin.executed` only (ENT-107).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_method: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_sha256: Option<String>,
+    /// Global plugin replaced by a local override: origin, version and manifest hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaced_origin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaced_plugin_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaced_manifest_sha256: Option<String>,
 }
 
 impl AuditEvent {
@@ -120,6 +136,13 @@ impl AuditEvent {
             rows: self.rows,
             result: clean(&self.result),
             error_code: sanitize_code(self.error_code.as_deref()),
+            plugin_id: clean(&self.plugin_id),
+            plugin_method: clean(&self.plugin_method),
+            plugin_version: clean(&self.plugin_version),
+            manifest_sha256: clean(&self.manifest_sha256),
+            replaced_origin: clean(&self.replaced_origin),
+            replaced_plugin_version: clean(&self.replaced_plugin_version),
+            replaced_manifest_sha256: clean(&self.replaced_manifest_sha256),
         }
     }
 }

@@ -1,42 +1,53 @@
-"""Plugin call facade (ENT-106): `env.plugins.run("ns.m")` and `env.plugins.ns.m()`.
+"""Plugin call facade (ENT-106, ENT-107): `env.plugins.run("ns.m", **kwargs)` and
+`env.plugins.ns.m(**kwargs)`.
 
-Both forms go through one resolution path, `resolve`, which asks the engine's single resolver
-(`dowai plugins resolve`). Resolution never imports or executes plugin code. Plugin execution is a
-separate task: a call that passes keyword arguments is resolved first and then refused with
-`DOWAI_PLUGIN_EXECUTION_UNAVAILABLE`, so arguments are never dropped silently.
+Both forms go through one path, `run`, which asks the engine to execute the plugin
+(`dowai plugins run`). The engine resolves the target first, runs the entrypoint in an isolated
+subprocess and returns its result envelope unchanged, so the result equals the CLI's. Keyword
+arguments become the JSON input of the entrypoint; `idempotency_key` is reserved for the engine
+and is not passed to the plugin. `resolve` only resolves and never executes plugin code.
 """
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Callable
 from typing import Any
 
-from ._errors import DowaiExecutionError
-
 _TARGET_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*\.[A-Za-z_][A-Za-z0-9_-]*$")
 
 Resolver = Callable[[str], dict[str, Any]]
+Runner = Callable[[str, dict[str, Any], str | None], dict[str, Any]]
+
+
+def _check_target(target: str) -> None:
+    if not isinstance(target, str) or not _TARGET_PATTERN.match(target):
+        raise ValueError("target must have the form namespace.method")
 
 
 class PluginCalls:
     """Facade returned by `Env.plugins`. Attribute access builds the namespace path."""
 
-    def __init__(self, resolve: Resolver) -> None:
+    def __init__(self, resolve: Resolver, run: Runner) -> None:
         self._resolve = resolve
+        self._run = run
 
-    def run(self, target: str, **kwargs: Any) -> dict[str, Any]:
-        """Resolves `namespace.method`; returns the engine's resolution."""
-        if not isinstance(target, str) or not _TARGET_PATTERN.match(target):
-            raise ValueError("target must have the form namespace.method")
-        resolution = self._resolve(target)
-        if kwargs:
-            raise DowaiExecutionError(
-                "DOWAI_PLUGIN_EXECUTION_UNAVAILABLE",
-                f"Plugin {target} was resolved but not executed: plugin execution is not "
-                "available yet.",
-            )
-        return resolution
+    def resolve(self, target: str) -> dict[str, Any]:
+        """Resolves `namespace.method`; returns the engine's resolution without executing."""
+        _check_target(target)
+        return self._resolve(target)
+
+    def run(
+        self, target: str, /, *, idempotency_key: str | None = None, **kwargs: Any
+    ) -> dict[str, Any]:
+        """Executes `namespace.method` with `kwargs` as JSON input; returns the engine's result."""
+        _check_target(target)
+        try:
+            json.dumps(kwargs)
+        except (TypeError, ValueError) as error:
+            raise ValueError("plugin arguments must be JSON-serializable") from error
+        return self._run(target, dict(kwargs), idempotency_key)
 
     def __getattr__(self, namespace: str) -> "_PluginNamespace":
         if namespace.startswith("_"):

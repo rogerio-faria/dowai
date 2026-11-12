@@ -131,6 +131,32 @@ class DowaiClient:
         """
         return self._payload(["plugins", "resolve", _text(target, "target"), "--json"])
 
+    def plugin_run(
+        self,
+        target: str,
+        input: Mapping[str, Any] | None = None,
+        *,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Executes `namespace.method` and returns the engine's result envelope.
+
+        Runs `dowai plugins run <target> --input <json> [--idempotency-key <key>] --json`
+        (ENT-107). `input` is a JSON object passed as keyword arguments to the entrypoint.
+        """
+        if input is None:
+            input = {}
+        if not isinstance(input, Mapping):
+            raise ValueError("input must be a mapping")
+        try:
+            text = json.dumps(dict(input), ensure_ascii=False)
+        except (TypeError, ValueError) as error:
+            raise ValueError("input must be JSON-serializable") from error
+        arguments = ["plugins", "run", _text(target, "target"), "--input", text]
+        if idempotency_key is not None:
+            arguments += ["--idempotency-key", _text(idempotency_key, "idempotency_key")]
+        arguments.append("--json")
+        return self._payload(arguments)
+
     def _result(self, arguments: list[str]) -> RunResult:
         code, payload = self._execute(arguments)
         status = payload.get("status")

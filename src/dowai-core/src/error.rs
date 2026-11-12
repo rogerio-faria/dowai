@@ -22,6 +22,12 @@ pub mod exit_codes {
     pub const CANCELLED: i32 = 130;
 }
 
+/// Plugin refusals caused by the caller's input, not by the plugin run (exit code 2).
+const INVALID_INPUT_PLUGIN_CODES: [&str; 2] = [
+    "DOWAI_PLUGIN_INPUT_INVALID",
+    "DOWAI_PLUGIN_IDEMPOTENCY_KEY_REQUIRED",
+];
+
 #[derive(Debug)]
 pub enum DowaiError {
     Config(String),
@@ -64,6 +70,12 @@ pub enum DowaiError {
         code: &'static str,
         message: String,
     },
+    /// Plugin execution refusals and failures, each with its own stable `DOWAI_PLUGIN_*` code
+    /// (ENT-107). The message never carries free text produced by the plugin.
+    Plugin {
+        code: &'static str,
+        message: String,
+    },
     Io(std::io::Error),
 }
 
@@ -98,6 +110,7 @@ impl DowaiError {
             Self::NotImplemented(_) => "DOWAI_NOT_IMPLEMENTED",
             Self::DatasetAccess { code, .. } => code,
             Self::Retry { code, .. } => code,
+            Self::Plugin { code, .. } => code,
             Self::Io(_) => "DOWAI_IO_ERROR",
         }
     }
@@ -117,6 +130,10 @@ impl DowaiError {
             | Self::Validation { .. }
             | Self::Retry { .. }
             | Self::Io(_) => ec::INVALID_INPUT,
+            Self::Plugin { code, .. } if INVALID_INPUT_PLUGIN_CODES.contains(code) => {
+                ec::INVALID_INPUT
+            }
+            Self::Plugin { .. } => ec::EXECUTION_FAILED,
             Self::Path(_) | Self::Policy(_) => ec::POLICY_DENIED,
             Self::Connection(_) => ec::CONNECTION_FAILED,
             Self::Execution(_)
@@ -156,6 +173,7 @@ impl DowaiError {
             | Self::Cancelled(message)
             | Self::NotImplemented(message)
             | Self::DatasetAccess { message, .. }
+            | Self::Plugin { message, .. }
             | Self::Retry { message, .. } => message.clone(),
             Self::Validation { message, .. } => message.clone(),
             Self::Io(error) => error.to_string(),
@@ -278,6 +296,20 @@ mod tests {
                     message: String::new(),
                 },
                 exit_codes::INVALID_INPUT,
+            ),
+            (
+                DowaiError::Plugin {
+                    code: "DOWAI_PLUGIN_INPUT_INVALID",
+                    message: String::new(),
+                },
+                exit_codes::INVALID_INPUT,
+            ),
+            (
+                DowaiError::Plugin {
+                    code: "DOWAI_PLUGIN_TIMEOUT",
+                    message: String::new(),
+                },
+                exit_codes::EXECUTION_FAILED,
             ),
             (
                 DowaiError::Io(std::io::Error::other("test")),

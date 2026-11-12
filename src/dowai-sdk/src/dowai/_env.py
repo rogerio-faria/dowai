@@ -125,12 +125,18 @@ class Env:
 
     @property
     def plugins(self) -> PluginCalls:
-        """Plugin calls resolved by the bound runtime (ENT-106). Nothing is executed here."""
-        return PluginCalls(self._resolve_plugin)
+        """Plugin calls executed by the bound runtime (ENT-106, ENT-107)."""
+        return PluginCalls(self._resolve_plugin, self._run_plugin)
 
     def _resolve_plugin(self, target: str) -> dict[str, Any]:
         operation = self._backend_operation("plugin_resolve")
         return operation(target)
+
+    def _run_plugin(
+        self, target: str, input: dict[str, Any], idempotency_key: str | None
+    ) -> dict[str, Any]:
+        operation = self._backend_operation("plugin_run")
+        return operation(target, input, idempotency_key=idempotency_key)
 
     def _backend_operation(self, name: str) -> Any:
         backend = self._require_backend(name)

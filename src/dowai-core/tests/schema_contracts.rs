@@ -121,6 +121,7 @@ fn audit_lines_written_by_the_engine_match_the_events_contract() {
         "external.write",
         "python.invocation",
         "policy.denied",
+        "plugin.executed",
         "run.finished",
     ] {
         let mut event = AuditEvent::new(name, run_id).at_ms(1_700_000_000_123);
@@ -135,11 +136,18 @@ fn audit_lines_written_by_the_engine_match_the_events_contract() {
         event.variables = Some(vec!["stage".to_owned()]);
         event.rows = Some(3);
         event.error_code = Some("DOWAI_PYTHON_FAILED".to_owned());
+        event.plugin_id = Some("email".to_owned());
+        event.plugin_method = Some("send".to_owned());
+        event.plugin_version = Some("1.0.0".to_owned());
+        event.manifest_sha256 = Some(hash.clone());
+        event.replaced_origin = Some("global".to_owned());
+        event.replaced_plugin_version = Some("0.9.0".to_owned());
+        event.replaced_manifest_sha256 = Some(hash.clone());
         log.append(&event).expect("append audit event");
     }
     let text = fs::read_to_string(&path).expect("read audit log");
     let lines: Vec<&str> = text.lines().collect();
-    assert_eq!(lines.len(), 8);
+    assert_eq!(lines.len(), 9);
     for line in lines {
         let instance: Value = serde_json::from_str(line).expect("audit line is JSON");
         let errors: Vec<String> = schema

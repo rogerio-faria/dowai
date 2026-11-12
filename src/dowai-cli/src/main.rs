@@ -1,8 +1,8 @@
 use clap::{Args, Parser, Subcommand};
 use dowai_core::{
-    admin_config_path, check_compatibility, create_project, default_run_store_path,
-    default_session_store_path, discover, filter_invocations, find_plugins, invocation_depths,
-    plan, plugin_json, plugin_list_json, plugin_roots_from, resolve_call,
+    admin_config_path, check_compatibility, create_project, default_audit_log_path,
+    default_run_store_path, default_session_store_path, discover, filter_invocations, find_plugins,
+    invocation_depths, plan, plugin_json, plugin_list_json, plugin_roots_from, resolve_call,
     resolve_effective_configuration, resolved_call_json, session_ttl_from_config, user_config_path,
     validate_project_with_configuration, CancellationToken, CompatibilityReport,
     CompatibilityStatus, DowaiError, ExecutionMode, InvocationEntry, LogLevel, PluginCatalog,
@@ -11,8 +11,8 @@ use dowai_core::{
 };
 use dowai_runtime::{
     check_postgres_connection, check_python_runtime, check_python_sdk, declared_default_profile,
-    prepare_postgres_plan, retry_run_detailed_with_cancel, run_postgres_detailed_with_cancel,
-    RetryRequest, RunRequest, RunResult,
+    execute_plugin, prepare_postgres_plan, retry_run_detailed_with_cancel,
+    run_postgres_detailed_with_cancel, PluginExecution, RetryRequest, RunRequest, RunResult,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -74,8 +74,8 @@ enum Command {
         #[command(subcommand)]
         command: CompatibilityCommand,
     },
-    /// List and inspect plugins of the project and of the workspace (ENT-053). Only manifests
-    /// are read; no plugin code is imported or executed.
+    /// List, inspect, resolve and run plugins of the project and of the workspace (ENT-053,
+    /// ENT-107). `list`, `info` and `resolve` only read manifests; only `run` executes plugin code.
     Plugins {
         #[command(subcommand)]
         command: PluginsCommand,
@@ -110,6 +110,18 @@ enum PluginsCommand {
     /// plugin code is imported or executed. Override follows `plugins.allow_local_override`.
     Resolve {
         target: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run `namespace.method` after resolving it (ENT-107): isolated subprocess, manifest
+    /// timeout, AUDIT entry and idempotency through the outbox. `--input` is a JSON object that
+    /// becomes the keyword arguments of the entrypoint.
+    Run {
+        target: String,
+        #[arg(long)]
+        input: Option<String>,
+        #[arg(long)]
+        idempotency_key: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -775,7 +787,8 @@ fn wants_json(command: &Command) -> bool {
         Command::Plugins { command } => match command {
             PluginsCommand::List { json, .. }
             | PluginsCommand::Info { json, .. }
-            | PluginsCommand::Resolve { json, .. } => *json,
+            | PluginsCommand::Resolve { json, .. }
+            | PluginsCommand::Run { json, .. } => *json,
         },
     }
 }
@@ -823,18 +836,8 @@ fn dispatch_plugins(command: PluginsCommand) -> Result<Option<Value>> {
             Ok(None)
         }
         PluginsCommand::Resolve { target, json } => {
-            let config_root = find_config_root(&std::env::current_dir()?);
-            let configuration = resolve_effective_configuration(
-                &config_root,
-                user_config_path().as_deref(),
-                admin_config_path().as_deref(),
-            )?;
-            let allow_local_override = configuration["effective"]["plugins"]
-                ["allow_local_override"]
-                .as_bool()
-                .unwrap_or(false);
             let catalog = discover(&roots, PluginScope::All)?;
-            let call = resolve_call(&catalog, &target, allow_local_override)?;
+            let call = resolve_call(&catalog, &target, plugins_allow_local_override()?)?;
             let resolved = resolved_call_json(&call);
             if json {
                 return Ok(Some(resolved));
@@ -845,6 +848,81 @@ fn dispatch_plugins(command: PluginsCommand) -> Result<Option<Value>> {
             );
             Ok(None)
         }
+        PluginsCommand::Run {
+            target,
+            input,
+            idempotency_key,
+            json,
+        } => {
+            // Resolution comes first: an unresolved target never reaches the executor.
+            let catalog = discover(&roots, PluginScope::All)?;
+            let call = resolve_call(&catalog, &target, plugins_allow_local_override()?)?;
+            let input = parse_plugin_input(input.as_deref())?;
+            let project_dir = roots
+                .project
+                .as_deref()
+                .and_then(Path::parent)
+                .ok_or_else(|| {
+                    DowaiError::Config(
+                        "Configure python.interpreter with the project's virtual environment"
+                            .to_owned(),
+                    )
+                })?;
+            let interpreter = check_python_runtime(project_dir)?.ok_or_else(|| {
+                DowaiError::Config(
+                    "Configure python.interpreter with the project's virtual environment"
+                        .to_owned(),
+                )
+            })?;
+            let store = default_run_store_path().map(RunStore::for_user_state);
+            let audit = default_audit_log_path().map(dowai_core::AuditLog::for_user_state);
+            let result = execute_plugin(&PluginExecution {
+                call: &call,
+                interpreter: &interpreter,
+                input,
+                idempotency_key: idempotency_key.as_deref(),
+                store: store.as_ref(),
+                audit: audit.as_ref(),
+            })?;
+            if json {
+                return Ok(Some(result));
+            }
+            println!(
+                "{}: {}",
+                result["target"].as_str().unwrap_or_default(),
+                result["status"].as_str().unwrap_or_default()
+            );
+            if !result["result"].is_null() {
+                println!("{}", result["result"]);
+            }
+            Ok(None)
+        }
+    }
+}
+
+/// `plugins.allow_local_override` of the effective configuration (ENT-054).
+fn plugins_allow_local_override() -> Result<bool> {
+    let config_root = find_config_root(&std::env::current_dir()?);
+    let configuration = resolve_effective_configuration(
+        &config_root,
+        user_config_path().as_deref(),
+        admin_config_path().as_deref(),
+    )?;
+    Ok(
+        configuration["effective"]["plugins"]["allow_local_override"]
+            .as_bool()
+            .unwrap_or(false),
+    )
+}
+
+/// `--input` as a JSON text; absent means an empty object. The executor requires an object.
+fn parse_plugin_input(text: Option<&str>) -> Result<Value> {
+    match text {
+        None => Ok(json!({})),
+        Some(text) => serde_json::from_str(text).map_err(|_| DowaiError::Plugin {
+            code: "DOWAI_PLUGIN_INPUT_INVALID",
+            message: "--input is not valid JSON".to_owned(),
+        }),
     }
 }
 

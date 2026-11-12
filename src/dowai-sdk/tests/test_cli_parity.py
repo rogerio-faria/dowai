@@ -78,7 +78,37 @@ class CliParityTests(unittest.TestCase):
             f"open({str(cls.plugin_sentinel)!r}, 'w').write('imported')\n"
             "def send(**kwargs):\n    return None\n"
         )
+        # ENT-107: plugins that are executed. `echo` is pure; `notify` has an external effect and
+        # requires an idempotency key (the effect is a line appended to `effects.log`).
+        cls.effects = root / "effects.log"
+        cls._write_plugin("echo", "def run(**kwargs):\n    return {'echo': kwargs}\n", False)
+        cls._write_plugin(
+            "notify",
+            f"def run(**kwargs):\n    open({str(cls.effects)!r}, 'a').write('x')\n"
+            "    return {'sent': True}\n",
+            True,
+        )
         cls.client = DowaiClient(cls.project, binary=cls.binary)
+
+    @classmethod
+    def _write_plugin(cls, plugin_id, source, effects):
+        plugin_dir = cls.project / "plugins" / plugin_id
+        plugin_dir.mkdir(parents=True)
+        (plugin_dir / "plugin.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "id": plugin_id,
+                    "version": "1.0.0",
+                    "entrypoints": {"run": "main:run"},
+                    "permissions": {"network": [], "filesystem": [], "secrets": []},
+                    "timeout_seconds": 30,
+                    "side_effects": effects,
+                    "idempotency_key_required": effects,
+                }
+            )
+        )
+        (plugin_dir / "main.py").write_text(source)
 
     @classmethod
     def tearDownClass(cls):
@@ -166,15 +196,45 @@ class CliParityTests(unittest.TestCase):
         self.assertEqual(cli["entrypoint"], "sender:send")
         self.assertEqual(self.client.plugin_resolve("email.send"), cli)
         env = Env(backend=self.client)
-        self.assertEqual(env.plugins.run("email.send"), cli)
-        self.assertEqual(env.plugins.email.send(), cli)
+        self.assertEqual(env.plugins.resolve("email.send"), cli)
         self.assertFalse(self.plugin_sentinel.exists(), "resolution must not import the plugin")
+
+    def test_plugin_execution_result_is_identical_on_every_path(self):
+        cli = self.cli_json(["plugins", "run", "echo.run", "--input", '{"a": 1}'])
+        self.assertEqual(cli["status"], "SUCCEEDED")
+        self.assertEqual(cli["result"], {"echo": {"a": 1}})
+        self.assertEqual(self.client.plugin_run("echo.run", {"a": 1}), cli)
+        env = Env(backend=self.client)
+        self.assertEqual(env.plugins.run("echo.run", a=1), cli)
+        self.assertEqual(env.plugins.echo.run(a=1), cli)
+
+    def test_plugin_idempotency_is_identical_on_every_path(self):
+        args = ["plugins", "run", "notify.run", "--idempotency-key", "sdk-parity"]
+        first = self.cli_json(args)
+        self.assertEqual(first["status"], "SUCCEEDED")
+        # The same key through the client and the facade is a duplicate: same envelope as the CLI.
+        duplicate = self.cli_json(args)
+        self.assertEqual(duplicate["status"], "DUPLICATE")
+        self.assertEqual(
+            self.client.plugin_run("notify.run", idempotency_key="sdk-parity"), duplicate
+        )
+        env = Env(backend=self.client)
+        self.assertEqual(env.plugins.notify.run(idempotency_key="sdk-parity"), duplicate)
+        self.assertEqual(self.effects.read_text(), "x", "the effect ran exactly once")
+
+    def test_plugin_key_required_has_the_same_code_as_the_cli(self):
+        code, cli = self.cli(["plugins", "run", "notify.run", "--json"])
+        self.assertEqual(code, 2)
+        with self.assertRaises(DowaiExecutionError) as context:
+            Env(backend=self.client).plugins.notify.run()
+        self.assertEqual(context.exception.code, cli["error_code"])
+        self.assertEqual(context.exception.code, "DOWAI_PLUGIN_IDEMPOTENCY_KEY_REQUIRED")
 
     def test_undeclared_plugin_method_raises_the_same_code_as_the_cli(self):
         code, cli = self.cli(["plugins", "resolve", "email.delete", "--json"])
         self.assertNotEqual(code, 0)
         with self.assertRaises(DowaiExecutionError) as context:
-            Env(backend=self.client).plugins.email.delete()
+            Env(backend=self.client).plugins.run("email.delete")
         self.assertEqual(context.exception.code, cli["error_code"])
         self.assertEqual(context.exception.code, "DOWAI_CONFIG_INVALID")
 

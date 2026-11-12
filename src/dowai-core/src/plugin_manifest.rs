@@ -167,6 +167,25 @@ pub fn extract_signatures(
     Ok(signatures)
 }
 
+/// Resolve o entrypoint `module:function` para o arquivo do módulo e o nome da função, sem
+/// importar nada. O arquivo é recusado se escapar do diretório do plugin (symlink ou traversal,
+/// `DOWAI_POLICY_PATH`). Retorna o caminho canônico do arquivo e a função (ENT-107).
+pub fn resolve_entrypoint_file(
+    plugin_dir: &Path,
+    method: &str,
+    entrypoint: &str,
+) -> Result<(PathBuf, String, String)> {
+    let Some((module, function)) = entrypoint.split_once(':') else {
+        return Err(DowaiError::Validation {
+            message: format!("entrypoint {method} sem separador ':'"),
+            report: json!({ "method": method }),
+        });
+    };
+    let relative = resolve_module(plugin_dir, method, module)?;
+    let canonical = fs::canonicalize(plugin_dir.join(relative))?;
+    Ok((canonical, module.to_owned(), function.to_owned()))
+}
+
 fn signature_for(plugin_dir: &Path, method: &str, entrypoint: &str) -> Result<PluginSignature> {
     let Some((module, function)) = entrypoint.split_once(':') else {
         return Err(DowaiError::Validation {
