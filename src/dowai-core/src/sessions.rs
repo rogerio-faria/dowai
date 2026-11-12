@@ -48,6 +48,14 @@ pub struct VersionedSnapshot {
     pub revisions: BTreeMap<String, i64>,
 }
 
+/// Revision metadata of a session: the session-wide counter and each key's revision.
+/// Never carries values, so it is safe to show (`session show --json`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RevisionSnapshot {
+    pub variable_revision: i64,
+    pub revisions: BTreeMap<String, i64>,
+}
+
 /// Who published a variable revision. Never carries values.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VariableOrigin {
@@ -175,6 +183,31 @@ impl SessionStore {
             snapshot.revisions.insert(key, revision);
         }
         Ok(snapshot)
+    }
+
+    /// Revisions only (no values), read in one transaction-consistent snapshot.
+    pub fn revision_snapshot(&self, session_id: &str) -> Result<RevisionSnapshot> {
+        let connection = self.connect()?;
+        let metadata = read_metadata(&connection, session_id)?;
+        ensure_active(&metadata)?;
+        let variable_revision: i64 = connection.query_row(
+            "SELECT variable_revision FROM sessions WHERE id = ?1",
+            [session_id],
+            |row| row.get(0),
+        )?;
+        let mut statement = connection.prepare(
+            "SELECT variable_key, revision FROM session_variables
+             WHERE session_id = ?1 ORDER BY variable_key",
+        )?;
+        let revisions = statement
+            .query_map([session_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<std::result::Result<BTreeMap<_, _>, _>>()?;
+        Ok(RevisionSnapshot {
+            variable_revision,
+            revisions,
+        })
     }
 
     pub fn variable_names(&self, session_id: &str) -> Result<Vec<String>> {
@@ -1061,6 +1094,62 @@ mod tests {
             )
             .expect("origin columns");
         assert_eq!((run.as_str(), invocation.as_str()), ("run-z", "inv-z"));
+    }
+
+    #[test]
+    fn committed_publication_advances_revisions_and_a_discarded_one_leaves_them_unchanged() {
+        let fixture = Fixture::new(SessionLimits::default());
+        let id = session_with(&fixture, &[("hot", json!(0)), ("cold", json!(0))]);
+        let before = fixture.store.revision_snapshot(&id).expect("revisions");
+        let base = fixture.store.snapshot_versioned(&id).expect("base");
+
+        // Commit em sucesso: a revisão global avança e só a chave publicada muda de revisão.
+        fixture
+            .store
+            .commit_variables(
+                &id,
+                &changes(&[("cold", json!(1))]),
+                &base.revisions,
+                &origin("ok"),
+            )
+            .expect("publish");
+        let committed = fixture.store.revision_snapshot(&id).expect("revisions");
+        assert!(committed.variable_revision > before.variable_revision);
+        assert_eq!(committed.revisions["cold"], committed.variable_revision);
+        assert_eq!(committed.revisions["hot"], before.revisions["hot"]);
+
+        // Descarte por conflito: outro escritor move `hot`; a publicação com base antiga falha
+        // e não altera nenhuma revisão nem o contador da sessão.
+        fixture
+            .store
+            .set_variable(&id, "hot", &json!("other"))
+            .expect("other writer");
+        let before_discard = fixture.store.revision_snapshot(&id).expect("revisions");
+        let error = fixture
+            .store
+            .commit_variables(
+                &id,
+                &changes(&[("cold", json!(2)), ("hot", json!(2))]),
+                &base.revisions,
+                &origin("late"),
+            )
+            .expect_err("stale base conflicts");
+        assert_eq!(error.code(), "DOWAI_SESSION_CONFLICT");
+        assert_eq!(
+            fixture.store.revision_snapshot(&id).expect("revisions"),
+            before_discard
+        );
+    }
+
+    #[test]
+    fn revision_snapshot_exposes_revisions_without_values() {
+        let fixture = Fixture::new(SessionLimits::default());
+        let id = session_with(&fixture, &[("secret_token", json!("must not appear"))]);
+        let snapshot = fixture.store.revision_snapshot(&id).expect("revisions");
+        assert_eq!(snapshot.variable_revision, 1);
+        assert_eq!(snapshot.revisions.len(), 1);
+        assert_eq!(snapshot.revisions["secret_token"], 1);
+        assert!(!format!("{snapshot:?}").contains("must not appear"));
     }
 
     #[test]

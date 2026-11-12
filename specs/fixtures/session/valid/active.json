@@ -5,5 +5,13 @@
   "project_root": "/home/admin/projetos/exemplo",
   "created_at_ms": 1700000000000,
   "expires_at_ms": 1700003600000,
-  "variable_names": ["stage", "limite"]
+  "variable_names": [
+    "stage",
+    "limite"
+  ],
+  "variable_revision": 2,
+  "variable_revisions": {
+    "stage": 1,
+    "limite": 2
+  }
 }

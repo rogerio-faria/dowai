@@ -3,8 +3,8 @@ use dowai_core::{
     admin_config_path, create_project, default_run_store_path, default_session_store_path,
     filter_invocations, invocation_depths, plan, resolve_effective_configuration, user_config_path,
     validate_project_with_configuration, CancellationToken, DowaiError, ExecutionMode,
-    InvocationEntry, LogLevel, Result, RunDetail, RunStore, RunSummary, SessionMetadata,
-    SessionStore, TemplateOptions,
+    InvocationEntry, LogLevel, Result, RevisionSnapshot, RunDetail, RunStore, RunSummary,
+    SessionMetadata, SessionStore, TemplateOptions,
 };
 use dowai_runtime::{
     check_postgres_connection, check_python_runtime, check_python_sdk, declared_default_profile,
@@ -870,7 +870,7 @@ fn dispatch_session(command: SessionCommand, store: &SessionStore) -> Result<Opt
                 Duration::from_secs(DEFAULT_SESSION_TTL_SECONDS),
             )?;
             if json {
-                Ok(Some(session_json(&session, Vec::new())))
+                Ok(Some(session_json(&session, &RevisionSnapshot::default())))
             } else {
                 println!("Session started: {}", session.session_id);
                 println!("Project: {}", session.project_root.display());
@@ -879,14 +879,16 @@ fn dispatch_session(command: SessionCommand, store: &SessionStore) -> Result<Opt
         }
         SessionCommand::Show { session_id, json } => {
             let session = store.get(&session_id)?;
-            let variable_names = store.variable_names(&session_id)?;
+            // Revisions only: values never reach the output (they may be secrets).
+            let revisions = store.revision_snapshot(&session_id)?;
             if json {
-                Ok(Some(session_json(&session, variable_names)))
+                Ok(Some(session_json(&session, &revisions)))
             } else {
                 println!("Session: {}", session.session_id);
                 println!("Status: {}", session.status);
                 println!("Project: {}", session.project_root.display());
-                println!("Variables: {}", variable_names.len());
+                println!("Variables: {}", revisions.revisions.len());
+                println!("Variable revision: {}", revisions.variable_revision);
                 Ok(None)
             }
         }
@@ -906,7 +908,7 @@ fn dispatch_session(command: SessionCommand, store: &SessionStore) -> Result<Opt
     }
 }
 
-fn session_json(session: &SessionMetadata, variable_names: Vec<String>) -> Value {
+fn session_json(session: &SessionMetadata, revisions: &RevisionSnapshot) -> Value {
     json!({
         "schema_version": 2,
         "status": session.status,
@@ -914,7 +916,9 @@ fn session_json(session: &SessionMetadata, variable_names: Vec<String>) -> Value
         "project_root": session.project_root,
         "created_at_ms": session.created_at_ms,
         "expires_at_ms": session.expires_at_ms,
-        "variable_names": variable_names
+        "variable_names": revisions.revisions.keys().collect::<Vec<_>>(),
+        "variable_revision": revisions.variable_revision,
+        "variable_revisions": revisions.revisions
     })
 }
 
@@ -1145,6 +1149,11 @@ mod tests {
         .expect("JSON response");
 
         assert_eq!(shown["variable_names"], serde_json::json!(["secret_token"]));
+        assert_eq!(shown["variable_revision"], serde_json::json!(1));
+        assert_eq!(
+            shown["variable_revisions"],
+            serde_json::json!({ "secret_token": 1 })
+        );
         assert!(shown.to_string().find("must not appear").is_none());
         let ended = dispatch_session(
             SessionCommand::End {

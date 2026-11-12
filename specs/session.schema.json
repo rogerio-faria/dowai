@@ -13,30 +13,71 @@
         "project_root",
         "created_at_ms",
         "expires_at_ms",
-        "variable_names"
+        "variable_names",
+        "variable_revision",
+        "variable_revisions"
       ],
       "properties": {
-        "schema_version": { "const": 2 },
-        "status": { "const": "ACTIVE" },
-        "session_id": { "type": "string", "format": "uuid" },
-        "project_root": { "type": "string" },
-        "created_at_ms": { "type": "integer", "minimum": 0 },
-        "expires_at_ms": { "type": "integer", "minimum": 0 },
+        "schema_version": {
+          "const": 2
+        },
+        "status": {
+          "const": "ACTIVE"
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "project_root": {
+          "type": "string"
+        },
+        "created_at_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "expires_at_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
         "variable_names": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "uniqueItems": true
+        },
+        "variable_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "variable_revisions": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          }
         }
       }
     },
     {
       "type": "object",
       "additionalProperties": false,
-      "required": ["schema_version", "status", "session_id"],
+      "required": [
+        "schema_version",
+        "status",
+        "session_id"
+      ],
       "properties": {
-        "schema_version": { "const": 2 },
-        "status": { "const": "ENDED" },
-        "session_id": { "type": "string", "format": "uuid" }
+        "schema_version": {
+          "const": 2
+        },
+        "status": {
+          "const": "ENDED"
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        }
       }
     }
   ]
