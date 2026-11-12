@@ -105,6 +105,11 @@ class CliParityTests(unittest.TestCase):
         self.assertEqual(sdk.error_code, "DOWAI_PYTHON_FAILED")
         self.assertNotIn("private detail", sdk.message or "")
         self.assertNotIn("private detail", cli["message"])
+        # ENT-015: a failed run that started reports its run_id on both paths. Each path runs
+        # its own run, so the identifiers differ; both must name a FAILED run in the journal.
+        self.assertTrue(cli["run_id"] and sdk.run_id)
+        self.assertEqual(self.cli_json(["runs", "show", cli["run_id"]])["run"]["status"], "FAILED")
+        self.assertEqual(self.cli_json(["runs", "show", sdk.run_id])["run"]["status"], "FAILED")
 
     def test_retry_refusal_has_the_same_code_on_both_paths(self):
         code, cli = self.cli(["retry", UNKNOWN_RUN, "--json"])
@@ -113,6 +118,9 @@ class CliParityTests(unittest.TestCase):
         self.assertEqual(sdk.error_code, cli["error_code"])
         self.assertEqual(sdk.error_code, "DOWAI_RUN_NOT_FOUND")
         self.assertEqual(sdk.status, cli["status"])
+        # A refusal starts no run, so neither path reports a run_id.
+        self.assertNotIn("run_id", cli)
+        self.assertIsNone(sdk.run_id)
 
     def test_retry_of_a_failed_run_matches_the_cli(self):
         self.client.run(["fail.py"])

@@ -17,7 +17,12 @@
         "status": { "enum": ["FAILED", "CANCELLED"] },
         "error_code": { "type": "string", "pattern": "^DOWAI_[A-Z0-9_]+$", "maxLength": 64 },
         "message": { "type": "string" },
-        "details": { "type": ["object", "null"] }
+        "details": { "type": ["object", "null"] },
+        "run_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Present only when the failure belongs to a run that started (ENT-015)."
+        }
       }
     },
     "configMigrated": {

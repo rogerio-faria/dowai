@@ -20,6 +20,10 @@ arguments = sys.argv[1:]
 if arguments[:1] == ["retry"] and "--failed-only" not in arguments:
     print(json.dumps({{"status": "FAILED", "error_code": "DOWAI_RUN_NOT_FOUND",
                       "message": "No run", "schema_version": 2, "details": None}}))
+elif arguments[:1] == ["run"] and "broken.py" in arguments:
+    print(json.dumps({{"status": "FAILED", "error_code": "DOWAI_PYTHON_FAILED",
+                      "message": "Python model failed", "schema_version": 2, "details": None,
+                      "run_id": "r"}}))
 elif arguments[:1] == ["run"]:
     print(json.dumps({{"status": "SUCCEEDED", "schema_version": 2, "session_id": "s",
                       "run_id": "r", "invocation_id": "i", "execution_mode": "manual",
@@ -62,6 +66,15 @@ class FakeEngineTests(unittest.TestCase):
         self.assertTrue(result.failed)
         self.assertEqual(result.error_code, "DOWAI_RUN_NOT_FOUND")
         self.assertEqual(result.message, "No run")
+
+    def test_failed_run_keeps_the_run_id_the_engine_reported(self):
+        result = self.client.run(["broken.py"])
+        self.assertTrue(result.failed)
+        self.assertEqual(result.run_id, "r")
+        self.assertEqual(result.error_code, "DOWAI_PYTHON_FAILED")
+        with self.assertRaises(DowaiExecutionError) as context:
+            result.raise_for_error()
+        self.assertEqual(context.exception.run_id, "r")
 
     def test_variables_are_sent_as_one_json_argument(self):
         payload = self.client.logs("11111111-1111-4111-8111-111111111111", node="ok.py")

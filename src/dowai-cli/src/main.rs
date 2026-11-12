@@ -7,8 +7,8 @@ use dowai_core::{
     SessionStore, TemplateOptions,
 };
 use dowai_runtime::{
-    check_postgres_connection, prepare_postgres_plan, retry_run_with_cancel,
-    run_postgres_with_cancel, RetryRequest, RunRequest, RunResult,
+    check_postgres_connection, prepare_postgres_plan, retry_run_detailed_with_cancel,
+    run_postgres_detailed_with_cancel, RetryRequest, RunRequest, RunResult,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -205,7 +205,7 @@ struct RunArgs {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let json_output = wants_json(&cli.command);
-    match dispatch(cli.command) {
+    match execute(cli.command) {
         Ok(Some(value)) => match serde_json::to_string_pretty(&value) {
             Ok(output) => {
                 println!("{output}");
@@ -217,23 +217,51 @@ fn main() -> ExitCode {
             }
         },
         Ok(None) => ExitCode::SUCCESS,
-        Err(error) => {
+        Err(failure) => {
+            let CliFailure { error, run_id } = failure;
             if json_output {
-                println!(
-                    "{}",
-                    json!({
-                        "schema_version": 2,
-                        "status": if error.is_cancelled() { "CANCELLED" } else { "FAILED" },
-                        "error_code": error.code(),
-                        "message": error.message(),
-                        "details": error.details()
-                    })
-                );
+                let mut envelope = json!({
+                    "schema_version": 2,
+                    "status": if error.is_cancelled() { "CANCELLED" } else { "FAILED" },
+                    "error_code": error.code(),
+                    "message": error.message(),
+                    "details": error.details()
+                });
+                // Only a run that started has an identifier (ENT-015).
+                if let Some(run_id) = run_id {
+                    envelope["run_id"] = json!(run_id);
+                }
+                println!("{envelope}");
             } else {
                 eprintln!("{error}");
             }
             ExitCode::from(error.exit_code() as u8)
         }
+    }
+}
+
+/// A failed CLI command. `run_id` is set only when the failure belongs to a run that started.
+#[derive(Debug)]
+struct CliFailure {
+    error: DowaiError,
+    run_id: Option<String>,
+}
+
+impl From<DowaiError> for CliFailure {
+    fn from(error: DowaiError) -> Self {
+        Self {
+            error,
+            run_id: None,
+        }
+    }
+}
+
+/// Entry point for `main`: `run` and `retry` keep the run identifier of a failed run.
+fn execute(command: Command) -> std::result::Result<Option<Value>, CliFailure> {
+    match command {
+        Command::Run(args) => run_command(args),
+        Command::Retry(args) => retry_command(args),
+        other => dispatch(other).map_err(CliFailure::from),
     }
 }
 
@@ -455,51 +483,70 @@ fn dispatch(command: Command) -> Result<Option<Value>> {
                 }
             }
         },
-        Command::Retry(args) => {
-            let project_dir = find_project_root(&std::env::current_dir()?)?;
-            let variables = parse_vars(args.vars.as_deref())?;
-            let cancel = install_cancel_handler()?;
-            let result = retry_run_with_cancel(
-                &project_dir,
-                &args.run_id,
-                RetryRequest {
-                    failed_only: args.failed_only,
-                    variables,
-                    confirm_destructive: args.yes,
-                },
-                &cancel,
-            )?;
-            run_result_output(result, args.json)
-        }
-        Command::Run(args) => {
-            if args.full_refresh {
-                return Err(DowaiError::NotImplemented(
-                    "The separate full-refresh operation is not implemented yet".to_owned(),
-                ));
-            }
-            let project_dir = find_project_root(&std::env::current_dir()?)?;
-            // SIGINT/SIGTERM (Ctrl+C on Windows) only flip the token; the runtime stops
-            // the Python process tree and cancels any running SQL, then reports exit 130.
-            let cancel = install_cancel_handler()?;
-            let result = run_postgres_with_cancel(
-                &project_dir,
-                RunRequest {
-                    targets: args.targets,
-                    mode: if args.manual {
-                        Some(ExecutionMode::Manual)
-                    } else {
-                        None
-                    },
-                    profile: args.profile,
-                    session_id: args.session,
-                    variables: parse_vars(args.vars.as_deref())?,
-                    confirm_destructive: args.yes,
-                },
-                &cancel,
-            )?;
-            run_result_output(result, args.json)
-        }
+        // Reached only through `execute`, which handles these two commands with run ids.
+        Command::Retry(args) => retry_command(args).map_err(|failure| failure.error),
+        Command::Run(args) => run_command(args).map_err(|failure| failure.error),
     }
+}
+
+fn retry_command(args: RetryArgs) -> std::result::Result<Option<Value>, CliFailure> {
+    let project_dir = find_project_root(&current_dir()?)?;
+    let variables = parse_vars(args.vars.as_deref())?;
+    let cancel = install_cancel_handler()?;
+    let result = retry_run_detailed_with_cancel(
+        &project_dir,
+        &args.run_id,
+        RetryRequest {
+            failed_only: args.failed_only,
+            variables,
+            confirm_destructive: args.yes,
+        },
+        &cancel,
+    )
+    .map_err(|failure| CliFailure {
+        error: failure.error,
+        run_id: failure.run_id,
+    })?;
+    run_result_output(result, args.json).map_err(CliFailure::from)
+}
+
+fn run_command(args: RunArgs) -> std::result::Result<Option<Value>, CliFailure> {
+    if args.full_refresh {
+        return Err(DowaiError::NotImplemented(
+            "The separate full-refresh operation is not implemented yet".to_owned(),
+        )
+        .into());
+    }
+    let project_dir = find_project_root(&current_dir()?)?;
+    // SIGINT/SIGTERM (Ctrl+C on Windows) only flip the token; the runtime stops
+    // the Python process tree and cancels any running SQL, then reports exit 130.
+    let cancel = install_cancel_handler()?;
+    let result = run_postgres_detailed_with_cancel(
+        &project_dir,
+        RunRequest {
+            targets: args.targets,
+            mode: if args.manual {
+                Some(ExecutionMode::Manual)
+            } else {
+                None
+            },
+            profile: args.profile,
+            session_id: args.session,
+            variables: parse_vars(args.vars.as_deref())?,
+            confirm_destructive: args.yes,
+        },
+        &cancel,
+    )
+    .map_err(|failure| CliFailure {
+        error: failure.error,
+        run_id: failure.run_id,
+    })?;
+    run_result_output(result, args.json).map_err(CliFailure::from)
+}
+
+/// Current directory as a CLI error when it is unavailable.
+fn current_dir() -> Result<PathBuf> {
+    std::env::current_dir().map_err(DowaiError::from)
 }
 
 /// Cancellation token wired to SIGINT/SIGTERM (Ctrl+C on Windows).

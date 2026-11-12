@@ -137,6 +137,8 @@ class DowaiClient:
             )
         return RunResult(
             status=status if status in _ENVELOPE_STATUSES else "FAILED",
+            # Present only when the failed run started (ENT-015); same value as the CLI.
+            run_id=payload.get("run_id"),
             error_code=payload.get("error_code") or "DOWAI_CLI_FAILED",
             message=payload.get("message") or "dowai failed",
         )

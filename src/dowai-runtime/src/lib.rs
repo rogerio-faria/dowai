@@ -153,6 +153,24 @@ pub fn run_postgres_with_cancel(
     request: RunRequest,
     cancel: &CancellationToken,
 ) -> Result<RunResult> {
+    run_postgres_detailed_with_cancel(project_dir, request, cancel).map_err(|failure| failure.error)
+}
+
+/// A run that did not succeed. `run_id` is set when the run started (ENT-015): the CLI and the
+/// SDK report it so the failure can be found in the journal. It is `None` when the request
+/// was refused before any run existed (for example, a retry refusal).
+#[derive(Debug)]
+pub struct RunFailure {
+    pub run_id: Option<String>,
+    pub error: DowaiError,
+}
+
+/// Same as [`run_postgres_with_cancel`], but a failure keeps the `run_id` of the started run.
+pub fn run_postgres_detailed_with_cancel(
+    project_dir: &Path,
+    request: RunRequest,
+    cancel: &CancellationToken,
+) -> std::result::Result<RunResult, RunFailure> {
     run_selected(project_dir, request, None, cancel)
 }
 
@@ -176,6 +194,37 @@ pub fn retry_run_with_cancel(
     request: RetryRequest,
     cancel: &CancellationToken,
 ) -> Result<RunResult> {
+    retry_run_detailed_with_cancel(project_dir, run_id, request, cancel)
+        .map_err(|failure| failure.error)
+}
+
+/// Same as [`retry_run_with_cancel`], but a failure of the new run keeps its `run_id`. A
+/// refusal is returned with `run_id` `None`, because no new run was started.
+pub fn retry_run_detailed_with_cancel(
+    project_dir: &Path,
+    run_id: &str,
+    request: RetryRequest,
+    cancel: &CancellationToken,
+) -> std::result::Result<RunResult, RunFailure> {
+    let (run, selection) = match prepare_retry(project_dir, run_id, request) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            return Err(RunFailure {
+                run_id: None,
+                error,
+            })
+        }
+    };
+    run_selected(project_dir, run, selection, cancel)
+}
+
+/// Checks a retry request and returns the run it starts, with the selection of nodes. Every
+/// refusal happens here, before any run exists.
+fn prepare_retry(
+    project_dir: &Path,
+    run_id: &str,
+    request: RetryRequest,
+) -> Result<(RunRequest, Option<Vec<String>>)> {
     let path = default_run_store_path()
         .ok_or_else(|| DowaiError::State("No user state directory is available".to_owned()))?;
     let source = RunStore::for_user_state(path).retry_source(run_id)?;
@@ -249,8 +298,7 @@ pub fn retry_run_with_cancel(
     } else {
         None
     };
-    run_selected(
-        project_dir,
+    Ok((
         RunRequest {
             targets,
             mode,
@@ -260,8 +308,7 @@ pub fn retry_run_with_cancel(
             confirm_destructive: request.confirm_destructive,
         },
         selection,
-        cancel,
-    )
+    ))
 }
 
 /// Runs `request`, keeping only the plan nodes named in `selection` when given.
@@ -270,7 +317,7 @@ fn run_selected(
     request: RunRequest,
     selection: Option<Vec<String>>,
     cancel: &CancellationToken,
-) -> Result<RunResult> {
+) -> std::result::Result<RunResult, RunFailure> {
     let started_ms = current_time_ms();
     let started = Instant::now();
     let run_id = Uuid::new_v4().to_string();
@@ -336,7 +383,10 @@ fn run_selected(
             if audit_failed {
                 eprintln!("Warning: the audit trail could not be written");
             }
-            Err(error)
+            Err(RunFailure {
+                run_id: Some(run_id),
+                error,
+            })
         }
     }
 }
@@ -1463,16 +1513,19 @@ fn default_session_path() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{prepare_postgres_plan, run_postgres, RunRequest};
+    use super::{
+        prepare_postgres_plan, run_postgres, run_postgres_detailed_with_cancel, RunRequest,
+    };
     use dowai_core::{
-        create_project, plan, ExecutionMode, Materialization, ProfileTlsMode, TemplateOptions,
-        WorkspaceProfile,
+        create_project, plan, CancellationToken, ExecutionMode, Materialization, ProfileTlsMode,
+        TemplateOptions, WorkspaceProfile,
     };
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use uuid::Uuid;
 
     struct Fixture(PathBuf);
 
@@ -1783,7 +1836,7 @@ mod tests {
         )
         .expect("write workspace config");
 
-        let error = run_postgres(
+        let failure = run_postgres_detailed_with_cancel(
             fixture.path(),
             RunRequest {
                 targets: vec!["test.sql".to_owned()],
@@ -1793,12 +1846,20 @@ mod tests {
                 variables: BTreeMap::new(),
                 confirm_destructive: false,
             },
+            &CancellationToken::new(),
         )
         .expect_err("missing password must stop the run before connecting");
-        assert_eq!(error.code(), "DOWAI_CONNECTION_FAILED");
-        assert!(!error
+        assert_eq!(failure.error.code(), "DOWAI_CONNECTION_FAILED");
+        assert!(!failure
+            .error
             .to_string()
             .contains("DOWAI_RUNTIME_TEST_MISSING_PASSWORD"));
+        // ENT-015: the run started, so its identifier is reported with the failure.
+        let run_id = failure.run_id.expect("a started run reports its run_id");
+        assert!(
+            Uuid::parse_str(&run_id).is_ok(),
+            "run_id is a UUID: {run_id}"
+        );
     }
 
     #[test]

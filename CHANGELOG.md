@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Report the `run_id` of a run that started and then failed, in the `--json`
+  envelope of `dowai run` and `dowai retry` and in the Python SDK result. The field
+  is optional and absent when no run started (ENT-015).
 - Add an initial Rust workspace with project initialization, validation,
   offline model planning, manual-order diagnostics, and versioned JSON output.
 - Resolve implemented configuration layers in order with field origins and
