@@ -1,4 +1,4 @@
-use crate::python_ast::static_env_dependencies;
+use crate::python_ast::{static_env_dependencies, static_env_run_targets};
 use crate::templates::{static_sql_references, StaticSqlReference};
 use crate::{load_project, render_template, sha256_hex, DowaiError, Result, TemplateOptions};
 use serde::Serialize;
@@ -46,6 +46,8 @@ struct Model {
     id: String,
     path: PathBuf,
     dependencies: BTreeSet<String>,
+    /// Chamadas `env.run` identificadas por AST (ENT-103); `None` = alvo dinâmico.
+    env_runs: Vec<Option<String>>,
     sha256: String,
 }
 
@@ -100,10 +102,16 @@ pub fn plan(project_root: &Path, targets: &[String], mode: ExecutionMode) -> Res
             let id = resolve_reference(&dependency, &models_by_id, &models_by_name)?;
             ids.insert(id);
         }
+        let env_runs = if is_python_model(&model.id) {
+            static_env_run_targets(&model.id, &body)?
+        } else {
+            Vec::new()
+        };
         resolved.insert(
             model.id.clone(),
             Model {
                 dependencies: ids,
+                env_runs,
                 sha256,
                 ..model.clone()
             },
@@ -126,7 +134,10 @@ pub fn plan(project_root: &Path, targets: &[String], mode: ExecutionMode) -> Res
         ExecutionMode::Automatic => topological_order(&target_ids, &selected, &resolved)?,
         ExecutionMode::Manual => target_ids.clone(),
     };
-    let warnings = manual_warnings(&ordered_ids, &selected, &resolved, mode);
+    let mut warnings = manual_warnings(&ordered_ids, &selected, &resolved, mode);
+    warnings.extend(env_run_warnings(&ordered_ids, &resolved));
+    warnings.sort();
+    warnings.dedup();
     let nodes = ordered_ids
         .iter()
         .map(|id| {
@@ -253,6 +264,7 @@ fn discover_models(models_dir: &Path) -> Result<Vec<Model>> {
                 id: path_string(relative),
                 path,
                 dependencies: BTreeSet::new(),
+                env_runs: Vec::new(),
                 sha256: String::new(),
             })
         })
@@ -542,6 +554,27 @@ fn manual_warnings(
                         "{id} depends on {dependency}; manual mode does not reorder or run predecessors"
                     ));
                 }
+            }
+        }
+    }
+    warnings.into_iter().collect()
+}
+
+/// Avisos para `env.run` (ENT-103): chamadas imperativas não criam aresta no DAG nem
+/// alteram a ordem ou o conjunto de nós; apenas são informadas no plano, em ordem determinística.
+fn env_run_warnings(ordered_ids: &[String], models: &BTreeMap<String, Model>) -> Vec<String> {
+    let mut warnings = BTreeSet::new();
+    for id in ordered_ids {
+        if let Some(model) = models.get(id) {
+            for target in &model.env_runs {
+                warnings.insert(match target {
+                    Some(name) => format!(
+                        "{id} calls env.run(\"{name}\"); imperative call is not a DAG dependency and does not change the plan"
+                    ),
+                    None => format!(
+                        "{id} calls env.run() with a dynamic target; imperative call is not a DAG dependency and does not change the plan"
+                    ),
+                });
             }
         }
     }

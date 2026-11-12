@@ -17,6 +17,23 @@ const STATIC_REFERENCES: [&str; 2] = ["ref", "depends_on"];
 /// Retorna os nomes de modelos declarados de forma estática por `env.ref`/`env.depends_on`,
 /// na ordem em que aparecem no código-fonte.
 pub fn static_env_dependencies(model_id: &str, source: &str) -> Result<Vec<String>> {
+    Ok(collect(model_id, source)?.dependencies)
+}
+
+/// Retorna, na ordem do código-fonte, cada chamada `env.run(...)` identificada por AST (ENT-103).
+///
+/// `Some(alvo)` quando o primeiro argumento é um literal string; `None` quando o alvo é dinâmico.
+/// Essas chamadas nunca são dependências estáticas: servem apenas para avisos no plano.
+pub fn static_env_run_targets(model_id: &str, source: &str) -> Result<Vec<Option<String>>> {
+    Ok(collect(model_id, source)?.runs)
+}
+
+struct Collected {
+    dependencies: Vec<String>,
+    runs: Vec<Option<String>>,
+}
+
+fn collect(model_id: &str, source: &str) -> Result<Collected> {
     let parsed = parse(source, Mode::Module, model_id).map_err(|error| {
         DowaiError::Model(format!(
             "{model_id}: código Python não pôde ser analisado por AST sem execução: {}",
@@ -32,6 +49,7 @@ pub fn static_env_dependencies(model_id: &str, source: &str) -> Result<Vec<Strin
     let mut collector = Collector {
         model_id,
         dependencies: Vec::new(),
+        runs: Vec::new(),
         error: None,
     };
     for statement in module.body {
@@ -39,13 +57,17 @@ pub fn static_env_dependencies(model_id: &str, source: &str) -> Result<Vec<Strin
     }
     match collector.error {
         Some(error) => Err(error),
-        None => Ok(collector.dependencies),
+        None => Ok(Collected {
+            dependencies: collector.dependencies,
+            runs: collector.runs,
+        }),
     }
 }
 
 struct Collector<'a> {
     model_id: &'a str,
     dependencies: Vec<String>,
+    runs: Vec<Option<String>>,
     error: Option<DowaiError>,
 }
 
@@ -81,6 +103,16 @@ impl Visitor for Collector<'_> {
             match method {
                 Some(method) if STATIC_REFERENCES.contains(&method) => {
                     self.static_reference(method, &call)
+                }
+                Some("run") => {
+                    let target = match call.args.first() {
+                        Some(Expr::Constant(constant)) => match &constant.value {
+                            Constant::Str(name) => Some(name.clone()),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    self.runs.push(target);
                 }
                 Some(_) => {}
                 None if is_getattr_on_env(&call) => self

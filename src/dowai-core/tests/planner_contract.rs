@@ -736,3 +736,80 @@ fn dynamic_refs_in_either_conditional_branch_fail_planning() {
         assert_eq!(error.code(), "DOWAI_PLAN_INVALID", "body: {body}");
     }
 }
+
+#[test]
+fn env_run_literal_emits_plan_warning_without_changing_nodes() {
+    let project = TestProject::new();
+    project.write_model("called.sql", "select 1 as id");
+    project.write_model(
+        "caller.py",
+        "def model(env):\n    env.run(\"called.sql\")\n",
+    );
+
+    let automatic = plan(
+        project.path(),
+        &["caller.py".into()],
+        ExecutionMode::Automatic,
+    )
+    .expect("env.run literal must not fail planning");
+    assert_eq!(
+        automatic
+            .nodes
+            .iter()
+            .map(|node| node.id.as_str())
+            .collect::<Vec<_>>(),
+        ["caller.py"]
+    );
+    assert_eq!(
+        automatic.warnings,
+        vec![
+            "caller.py calls env.run(\"called.sql\"); imperative call is not a DAG dependency and does not change the plan"
+        ]
+    );
+
+    let manual = plan(project.path(), &["caller.py".into()], ExecutionMode::Manual)
+        .expect("env.run literal must not fail manual planning");
+    assert_eq!(manual.nodes.len(), 1);
+    assert_eq!(manual.warnings, automatic.warnings);
+}
+
+#[test]
+fn env_run_dynamic_target_is_warned_and_does_not_fail_the_plan() {
+    let project = TestProject::new();
+    project.write_model("called.sql", "select 1 as id");
+    project.write_model(
+        "caller.py",
+        "def model(env):\n    target = 'called.sql'\n    env.run(target)\n",
+    );
+
+    let plan = plan(
+        project.path(),
+        &["caller.py".into()],
+        ExecutionMode::Automatic,
+    )
+    .expect("dynamic env.run argument is not a static dependency");
+
+    assert_eq!(plan.nodes.len(), 1);
+    assert!(plan.nodes[0].depends_on.is_empty());
+    assert_eq!(plan.warnings.len(), 1);
+    assert!(plan.warnings[0].starts_with("caller.py calls env.run() with a dynamic target"));
+}
+
+#[test]
+fn plan_without_env_run_has_no_env_run_warnings() {
+    let project = TestProject::new();
+    project.write_model("source.sql", "select 1 as id");
+    project.write_model(
+        "consumer.py",
+        "def model(env):\n    env.ref('source.sql')\n",
+    );
+
+    let plan = plan(
+        project.path(),
+        &["consumer.py".into()],
+        ExecutionMode::Automatic,
+    )
+    .expect("plan without env.run");
+
+    assert!(plan.warnings.is_empty());
+}
