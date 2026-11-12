@@ -49,6 +49,7 @@
       "description": "Variable names only, never values."
     },
     "rows": { "type": "integer", "minimum": 0 },
+    "duration_ms": { "type": "integer", "minimum": 0 },
     "result": { "type": "string", "maxLength": 256 },
     "error_code": {
       "type": "string",

@@ -4,13 +4,24 @@
 //! turn it off. A failed write never changes the run outcome; it is remembered in
 //! `failed` and reported once as a sanitized warning by the caller.
 
+use crate::InvocationRecord;
 use dowai_core::{default_audit_log_path, AuditEvent, AuditLog, DowaiError};
+use std::collections::HashMap;
+use std::time::Instant;
+
+/// Milliseconds elapsed since `since`, saturating at `u64::MAX`.
+fn elapsed_ms(since: Instant) -> u64 {
+    u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
 
 pub(crate) struct Auditor {
     log: Option<AuditLog>,
     run_id: String,
     root_invocation_id: String,
     started_ms: i64,
+    started: Instant,
+    /// Start instant of each node invocation not yet finished (keyed by invocation ID).
+    node_clocks: HashMap<String, Instant>,
     started_emitted: bool,
     pub(crate) failed: bool,
     pub(crate) session_id: Option<String>,
@@ -36,6 +47,8 @@ impl Auditor {
             run_id: run_id.to_owned(),
             root_invocation_id: root_invocation_id.to_owned(),
             started_ms,
+            started: Instant::now(),
+            node_clocks: HashMap::new(),
             started_emitted: false,
             session_id,
             project,
@@ -86,6 +99,8 @@ impl Auditor {
         node_id: &str,
         script_hash: Option<String>,
     ) {
+        self.node_clocks
+            .insert(invocation_id.to_owned(), Instant::now());
         let mut event = self.event("node.started");
         event.invocation_id = Some(invocation_id.to_owned());
         event.attempt_id = Some(invocation_id.to_owned());
@@ -108,6 +123,7 @@ impl Auditor {
         event.parent_invocation_id = Some(self.root_invocation_id.clone());
         event.node_id = Some(node_id.to_owned());
         event.call_type = Some("static".to_owned());
+        event.duration_ms = self.node_clocks.remove(invocation_id).map(elapsed_ms);
         event.result = Some(result_label(error).to_owned());
         event.error_code = error.map(|error| error.code().to_owned());
         self.emit(&event);
@@ -131,23 +147,16 @@ impl Auditor {
         self.emit(&event);
     }
 
-    pub(crate) fn python_invocation(
-        &mut self,
-        invocation_id: &str,
-        parent_invocation_id: &str,
-        call_type: &str,
-        target: &str,
-        status: &str,
-        error_code: Option<&str>,
-    ) {
+    pub(crate) fn python_invocation(&mut self, record: &InvocationRecord) {
         let mut event = self.event("python.invocation");
-        event.invocation_id = Some(invocation_id.to_owned());
-        event.attempt_id = Some(invocation_id.to_owned());
-        event.parent_invocation_id = Some(parent_invocation_id.to_owned());
-        event.call_type = Some(call_type.to_owned());
-        event.node_id = Some(target.to_owned());
-        event.result = Some(status.to_owned());
-        event.error_code = error_code.map(str::to_owned);
+        event.invocation_id = Some(record.invocation_id.clone());
+        event.attempt_id = Some(record.invocation_id.clone());
+        event.parent_invocation_id = Some(record.parent_invocation_id.clone());
+        event.call_type = Some(record.call_type.clone());
+        event.node_id = Some(record.target.clone());
+        event.duration_ms = Some(record.duration_ms);
+        event.result = Some(record.status.clone());
+        event.error_code = record.error_code.clone();
         self.emit(&event);
     }
 
@@ -164,6 +173,7 @@ impl Auditor {
         let mut event = self.event("run.finished");
         event.invocation_id = Some(self.root_invocation_id.clone());
         event.attempt_id = event.invocation_id.clone();
+        event.duration_ms = Some(elapsed_ms(self.started));
         event.result = Some(result_label(error).to_owned());
         event.error_code = error.map(|error| error.code().to_owned());
         self.emit(&event);

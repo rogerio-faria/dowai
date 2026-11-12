@@ -421,14 +421,7 @@ fn finish_audit(trace: &mut Trace, outcome: &Result<RunResult>) {
         }
     }
     for record in nested.iter().filter(|record| record.call_type != "static") {
-        trace.audit.python_invocation(
-            &record.invocation_id,
-            &record.parent_invocation_id,
-            &record.call_type,
-            &record.target,
-            &record.status,
-            record.error_code.as_deref(),
-        );
+        trace.audit.python_invocation(record);
     }
     if let Ok(result) = outcome {
         trace.audit.session_id = Some(result.session_id.clone());

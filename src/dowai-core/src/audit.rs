@@ -63,6 +63,10 @@ pub struct AuditEvent {
     pub variables: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rows: Option<u64>,
+    /// Elapsed wall-clock milliseconds of the node, invocation or run (plan 12.2).
+    /// Present on `node.finished`, `python.invocation` and `run.finished`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -134,6 +138,7 @@ impl AuditEvent {
                 .as_ref()
                 .map(|names| names.iter().map(|name| bounded(name)).collect()),
             rows: self.rows,
+            duration_ms: self.duration_ms,
             result: clean(&self.result),
             error_code: sanitize_code(self.error_code.as_deref()),
             plugin_id: clean(&self.plugin_id),

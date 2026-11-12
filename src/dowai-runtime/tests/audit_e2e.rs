@@ -383,3 +383,32 @@ fn audit_write_failure_does_not_mask_the_run_outcome() {
         .expect_err("original error preserved");
     assert_eq!(error.code(), "DOWAI_PYTHON_FAILED");
 }
+
+#[test]
+fn node_invocation_and_run_events_carry_durations() {
+    let harness = Harness::new();
+    harness.model("a.py", "def model(env):\n    env.setVar('stage', 'x')\n");
+    harness.run("a.py").expect("run succeeds");
+
+    let events = harness.events();
+    let node_finished: Vec<&AuditEvent> = events
+        .iter()
+        .filter(|event| event.event == "node.finished")
+        .collect();
+    assert_eq!(node_finished.len(), 1, "one static node finished");
+    assert!(
+        node_finished[0].duration_ms.is_some(),
+        "node.finished must carry duration_ms"
+    );
+
+    let run_finished = events
+        .iter()
+        .find(|event| event.event == "run.finished")
+        .expect("run.finished present");
+    assert!(
+        run_finished.duration_ms.is_some(),
+        "run.finished must carry duration_ms"
+    );
+    assert!(run_finished.duration_ms >= node_finished[0].duration_ms);
+    assert!(harness.raw().contains("\"duration_ms\""));
+}
