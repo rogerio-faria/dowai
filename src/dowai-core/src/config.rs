@@ -359,7 +359,7 @@ fn reject_secret_literals(value: &Value, path: &str) -> Result<()> {
                     && matches!(child, Value::String(text) if !text.is_empty())
                 {
                     return Err(DowaiError::Config(format!(
-                        "Literal secret at '{child_path}' is not migrated; use a '*_env' reference or a secret manager"
+                        "Literal secret at '{child_path}' is refused; use a '*_env' reference or a secret manager"
                     )));
                 }
                 reject_secret_literals(child, &child_path)?;
@@ -446,6 +446,11 @@ fn read_json_object(path: &Path, label: &str) -> Result<Map<String, Value>> {
 }
 
 fn validate_layer(layer: &Map<String, Value>, path: &Path) -> Result<()> {
+    // ENT-013: segredo literal não entra em nenhuma camada; a mensagem nomeia a chave, nunca o valor.
+    reject_secret_literals(&Value::Object(layer.clone()), "").map_err(|error| match error {
+        DowaiError::Config(message) => config_error(path, &message),
+        other => other,
+    })?;
     for (key, value) in layer {
         if key == "schema_version" {
             continue;

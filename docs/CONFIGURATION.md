@@ -317,6 +317,32 @@ Unidades e limites aparecem na tabela. Limites mínimos e máximos são inclusiv
 | `state.checkpoint_policy` | `"after_commit"` | enum: `after_commit` | — | — | validado; ainda sem consumo pelo runtime |
 | `state.retention_days` | `90` | inteiro 1–3650 | dias | não pode exceder o teto administrativo | validado; ainda sem consumo pelo runtime |
 
+## Segredos e origem dos valores (ENT-013)
+
+- **Segredo literal não entra em nenhuma camada** (engine, administrador, usuário,
+  workspace ou projeto). Chaves como `password`, `secret`, `token`, `api_key` e `apikey`
+  com valor textual são recusadas com `DOWAI_CONFIG_INVALID`. A mensagem nomeia a chave
+  (`ai.profiles.warehouse.api_key`), nunca o valor, e o erro sai como JSON em stdout.
+- Use referências: `*_env` (nome de variável de ambiente) ou `*_ref` (gerenciador de
+  segredos). Referências são aceitas e aparecem na saída como nome, não como valor.
+- `dowai config show --effective --json` devolve `effective`, `origins` e `sources`. Como
+  segredo literal é recusado antes da saída, não há valor a mascarar; testes sentinela
+  (`tests/config_show.rs` e `dowai-cli/tests/config_show_cli_e2e.rs`) garantem que o valor
+  não aparece em stdout, stderr nem na mensagem de erro.
+
+Valores de `origins` por campo:
+
+| Valor | Significado |
+|---|---|
+| `engine_default` | default do catálogo, nenhuma camada definiu o campo |
+| `admin` | definido pelo arquivo do administrador |
+| `user` | definido pelo arquivo do usuário |
+| `workspace` | definido em `workspace.json` |
+| `project` | definido em `config` de `dowai_project.json` |
+| `admin_ceiling` | valor reduzido por teto administrativo |
+
+Origens são registradas por folha (por exemplo, `ai.profiles.warehouse.api_key_env`).
+
 ## Legacy YAML (AC032)
 
 Each scope uses one format. The JSON file is the only one read.
