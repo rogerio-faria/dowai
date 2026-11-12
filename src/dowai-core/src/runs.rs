@@ -15,7 +15,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 /// Current `PRAGMA user_version` of the run journal database.
-pub const RUN_SCHEMA_VERSION: i64 = 2;
+pub const RUN_SCHEMA_VERSION: i64 = 3;
 pub const MAX_LIST_LIMIT: usize = 1_000;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_TARGET_CHARS: usize = 256;
@@ -435,7 +435,11 @@ impl RunStore {
             connection.execute_batch(SCHEMA_V1).map_err(state_error)?;
         }
         match user_version(&connection)? {
-            1 => migrate_v1_to_v2(&mut connection)?,
+            1 => {
+                migrate_v1_to_v2(&mut connection)?;
+                migrate_v2_to_v3(&mut connection)?;
+            }
+            2 => migrate_v2_to_v3(&mut connection)?,
             RUN_SCHEMA_VERSION => {}
             other => {
                 return Err(DowaiError::State(format!(
@@ -466,6 +470,45 @@ fn migrate_v1_to_v2(connection: &mut Connection) -> Result<()> {
             .map_err(state_error)?;
         transaction
             .execute_batch("PRAGMA user_version = 2;")
+            .map_err(state_error)?;
+    }
+    transaction.commit().map_err(state_error)
+}
+
+/// Schema 3 accepts the `UNCERTAIN` node status (ENT-036, ADR 0005). SQLite cannot alter a
+/// CHECK constraint, so the invocations table is rebuilt inside one transaction and every
+/// existing row is copied unchanged.
+fn migrate_v2_to_v3(connection: &mut Connection) -> Result<()> {
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(state_error)?;
+    if user_version(&transaction)? == 2 {
+        transaction
+            .execute_batch(
+                "ALTER TABLE invocations RENAME TO invocations_schema_v2;
+                 CREATE TABLE invocations (
+                   seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                   invocation_id TEXT NOT NULL,
+                   run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+                   parent_invocation_id TEXT,
+                   kind TEXT NOT NULL CHECK (kind IN ('sql','python')),
+                   target TEXT NOT NULL,
+                   call_type TEXT NOT NULL CHECK (call_type IN ('static','imperative','dependency')),
+                   status TEXT NOT NULL CHECK (status IN
+                     ('PENDING','READY','RUNNING','SUCCEEDED','FAILED','SKIPPED','CANCELLED','UNCERTAIN')),
+                   error_code TEXT,
+                   duration_ms INTEGER NOT NULL CHECK (duration_ms >= 0),
+                   UNIQUE (run_id, invocation_id)
+                 );
+                 INSERT INTO invocations (seq, invocation_id, run_id, parent_invocation_id, kind,
+                   target, call_type, status, error_code, duration_ms)
+                   SELECT seq, invocation_id, run_id, parent_invocation_id, kind,
+                     target, call_type, status, error_code, duration_ms
+                   FROM invocations_schema_v2;
+                 DROP TABLE invocations_schema_v2;
+                 CREATE INDEX invocations_run ON invocations(run_id, seq);
+                 PRAGMA user_version = 3;",
+            )
             .map_err(state_error)?;
     }
     transaction.commit().map_err(state_error)
@@ -831,6 +874,75 @@ mod tests {
     fn invalid_status_is_rejected() {
         let fixture = Fixture::new();
         assert!(fixture.store.record(&run("r", 1, "BOGUS"), &[]).is_err());
+    }
+
+    #[test]
+    fn every_node_status_is_persisted_and_schema_two_migrates_in_place() {
+        let fixture = Fixture::new();
+        fs::create_dir_all(fixture.db().parent().expect("parent")).expect("dir");
+        {
+            // Hand-built schema-2 journal holding one legacy run and invocation.
+            let mut connection = rusqlite::Connection::open(fixture.db()).expect("open");
+            connection.execute_batch(SCHEMA_V1).expect("schema one");
+            migrate_v1_to_v2(&mut connection).expect("schema two");
+        }
+        {
+            let connection = rusqlite::Connection::open(fixture.db()).expect("reopen");
+            connection
+                .execute_batch(
+                    "INSERT INTO runs (run_id, project, status, started_at_ms, finished_at_ms,
+                       started_at, finished_at, duration_ms)
+                     VALUES ('legacy', 'fixture', 'SUCCEEDED', 1, 1, 't', 't', 0);
+                     INSERT INTO invocations (invocation_id, run_id, kind, target, call_type,
+                       status, duration_ms)
+                     VALUES ('legacy-node', 'legacy', 'sql', 'a.sql', 'static', 'SUCCEEDED', 0);",
+                )
+                .expect("legacy rows");
+        }
+        assert_eq!(
+            fixture.store.schema_version().expect("migrate"),
+            RUN_SCHEMA_VERSION
+        );
+
+        let node_statuses = [
+            "PENDING",
+            "RUNNING",
+            "SUCCEEDED",
+            "FAILED",
+            "CANCELLED",
+            "UNCERTAIN",
+        ];
+        let invocations: Vec<NewInvocation> = node_statuses
+            .iter()
+            .enumerate()
+            .map(|(index, status)| invocation(&format!("n{index}"), None, status))
+            .collect();
+        fixture
+            .store
+            .record(&run("new", 2, "FAILED"), &invocations)
+            .expect("all node statuses persist");
+
+        let connection = rusqlite::Connection::open(fixture.db()).expect("inspect");
+        let legacy: String = connection
+            .query_row(
+                "SELECT status FROM invocations WHERE invocation_id = 'legacy-node'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("legacy row survives the rebuild");
+        assert_eq!(legacy, "SUCCEEDED");
+        let uncertain: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM invocations WHERE status = 'UNCERTAIN'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(uncertain, 1);
+        assert!(fixture
+            .store
+            .record(&run("bad", 3, "FAILED"), &[invocation("x", None, "BOGUS")])
+            .is_err());
     }
 
     fn entry(id: &str, parent: Option<&str>, target: &str, status: &str) -> InvocationEntry {

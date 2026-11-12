@@ -8,6 +8,7 @@ use crate::python_runtime::{
     ModelInvocation,
 };
 use crate::{resolve_execution_mode, resolve_python_model_path, InvocationRecord};
+use dowai_core::state::NodeStatus;
 use dowai_core::{
     plan, CancellationToken, DowaiError, ExecutionMode, PlanNode, Result, SessionStore,
 };
@@ -314,7 +315,7 @@ impl<'a> Executor<'a> {
             call_type: call_type.to_owned(),
             target: printable(target),
             mode: mode.as_str().to_owned(),
-            status: "RUNNING".to_owned(),
+            status: advance(NodeStatus::Pending, NodeStatus::Running),
             duration_ms: 0,
             error_code: None,
         });
@@ -324,16 +325,16 @@ impl<'a> Executor<'a> {
         entry.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         match outcome {
             Ok(value) => {
-                entry.status = "SUCCEEDED".to_owned();
+                entry.status = advance(NodeStatus::Running, NodeStatus::Succeeded);
                 (invocation_id, Ok(value))
             }
             Err(error) => {
-                entry.status = if error.is_cancelled() {
-                    "CANCELLED"
+                let next = if error.is_cancelled() {
+                    NodeStatus::Cancelled
                 } else {
-                    "FAILED"
-                }
-                .to_owned();
+                    NodeStatus::Failed
+                };
+                entry.status = advance(NodeStatus::Running, next);
                 entry.error_code = Some(error.code().to_owned());
                 (invocation_id, Err(error))
             }
@@ -574,6 +575,17 @@ impl<'a> Executor<'a> {
 const INVALID_TARGET: &str = "<invalid>";
 
 /// Recorded text: no control characters, bounded length.
+/// Applies one transition of the node state machine and returns the persisted label.
+/// The executor only ever moves `PENDING` -> `RUNNING` -> final, which the machine allows,
+/// so the fallback to `FAILED` is an internal-invariant guard, never a normal path.
+fn advance(current: NodeStatus, next: NodeStatus) -> String {
+    current
+        .transition_to(next)
+        .unwrap_or(NodeStatus::Failed)
+        .as_str()
+        .to_owned()
+}
+
 fn printable(text: &str) -> String {
     text.chars()
         .filter(|character| !character.is_control())
