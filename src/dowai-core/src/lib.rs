@@ -16,7 +16,7 @@ pub use config::{
     resolve_effective_configuration, user_config_path, MigrationReport, ProfileTlsMode,
     WorkspaceProfile,
 };
-pub use error::{DowaiError, Result};
+pub use error::{exit_codes, DowaiError, Result};
 pub use planner::{
     plan, read_planned_model, validate_plan_templates, ExecutionMode, ExecutionPlan, PlanNode,
 };

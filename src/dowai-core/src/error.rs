@@ -3,6 +3,25 @@ use std::fmt;
 
 pub type Result<T> = std::result::Result<T, DowaiError>;
 
+/// Contrato público de exit codes (plano §6.4). Único ponto de definição dos valores;
+/// `DowaiError::exit_code` e a CLI usam estas constantes.
+pub mod exit_codes {
+    /// Sucesso.
+    pub const SUCCESS: i32 = 0;
+    /// Configuração, parser, plano ou entrada inválida (também usado por `clap` para uso incorreto).
+    pub const INVALID_INPUT: i32 = 2;
+    /// Falha de execução de modelo.
+    pub const EXECUTION_FAILED: i32 = 3;
+    /// Falha de conexão externa.
+    pub const CONNECTION_FAILED: i32 = 4;
+    /// Política, permissão ou segurança negada.
+    pub const POLICY_DENIED: i32 = 5;
+    /// Funcionalidade não implementada ou indisponível.
+    pub const NOT_IMPLEMENTED: i32 = 6;
+    /// Cancelamento pelo usuário (SIGINT/SIGTERM ou API).
+    pub const CANCELLED: i32 = 130;
+}
+
 #[derive(Debug)]
 pub enum DowaiError {
     Config(String),
@@ -77,7 +96,9 @@ impl DowaiError {
         }
     }
 
+    /// Exit code público do erro (plano §6.4). Ponto único de mapeamento.
     pub fn exit_code(&self) -> i32 {
+        use exit_codes as ec;
         match self {
             Self::Config(_)
             | Self::ConfigConflict(_)
@@ -87,19 +108,20 @@ impl DowaiError {
             | Self::Cycle(_)
             | Self::Session(_)
             | Self::State(_)
-            | Self::Validation { .. } => 2,
-            Self::Path(_) => 5,
-            Self::Policy(_) => 5,
-            Self::Connection(_) => 4,
-            Self::Execution(_) => 3,
+            | Self::Validation { .. }
+            | Self::Retry { .. }
+            | Self::Io(_) => ec::INVALID_INPUT,
+            Self::Path(_) | Self::Policy(_) => ec::POLICY_DENIED,
+            Self::Connection(_) => ec::CONNECTION_FAILED,
+            Self::Execution(_)
             // A run that lost a write race is a failed run execution (plan 6.4: exit 3).
-            Self::SessionConflict(_) => 3,
-            Self::PythonFailure(_) | Self::PythonTimeout(_) | Self::PythonProtocol(_) => 3,
-            Self::NotImplemented(_) => 6,
-            Self::DatasetAccess { .. } => 3,
-            Self::Retry { .. } => 2,
-            Self::Cancelled(_) => 130,
-            Self::Io(_) => 2,
+            | Self::SessionConflict(_)
+            | Self::PythonFailure(_)
+            | Self::PythonTimeout(_)
+            | Self::PythonProtocol(_)
+            | Self::DatasetAccess { .. } => ec::EXECUTION_FAILED,
+            Self::NotImplemented(_) => ec::NOT_IMPLEMENTED,
+            Self::Cancelled(_) => ec::CANCELLED,
         }
     }
 
@@ -165,5 +187,111 @@ impl From<serde_json::Error> for DowaiError {
 impl From<rusqlite::Error> for DowaiError {
     fn from(error: rusqlite::Error) -> Self {
         Self::State(format!("Session storage operation failed: {error}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{exit_codes, DowaiError};
+
+    #[test]
+    fn every_variant_maps_to_one_contract_code() {
+        let cases: Vec<(DowaiError, i32)> = vec![
+            (DowaiError::Config(String::new()), exit_codes::INVALID_INPUT),
+            (
+                DowaiError::ConfigConflict(String::new()),
+                exit_codes::INVALID_INPUT,
+            ),
+            (
+                DowaiError::LegacyConfigFormat(String::new()),
+                exit_codes::INVALID_INPUT,
+            ),
+            (DowaiError::Path(String::new()), exit_codes::POLICY_DENIED),
+            (DowaiError::Model(String::new()), exit_codes::INVALID_INPUT),
+            (
+                DowaiError::Template(String::new()),
+                exit_codes::INVALID_INPUT,
+            ),
+            (DowaiError::Cycle(String::new()), exit_codes::INVALID_INPUT),
+            (
+                DowaiError::Session(String::new()),
+                exit_codes::INVALID_INPUT,
+            ),
+            (
+                DowaiError::SessionConflict(String::new()),
+                exit_codes::EXECUTION_FAILED,
+            ),
+            (DowaiError::State(String::new()), exit_codes::INVALID_INPUT),
+            (
+                DowaiError::Connection(String::new()),
+                exit_codes::CONNECTION_FAILED,
+            ),
+            (
+                DowaiError::Execution(String::new()),
+                exit_codes::EXECUTION_FAILED,
+            ),
+            (
+                DowaiError::PythonFailure(String::new()),
+                exit_codes::EXECUTION_FAILED,
+            ),
+            (
+                DowaiError::PythonTimeout(String::new()),
+                exit_codes::EXECUTION_FAILED,
+            ),
+            (
+                DowaiError::PythonProtocol(String::new()),
+                exit_codes::EXECUTION_FAILED,
+            ),
+            (DowaiError::Policy(String::new()), exit_codes::POLICY_DENIED),
+            (DowaiError::cancelled(), exit_codes::CANCELLED),
+            (
+                DowaiError::Validation {
+                    message: String::new(),
+                    report: serde_json::Value::Null,
+                },
+                exit_codes::INVALID_INPUT,
+            ),
+            (
+                DowaiError::NotImplemented(String::new()),
+                exit_codes::NOT_IMPLEMENTED,
+            ),
+            (
+                DowaiError::DatasetAccess {
+                    code: "DOWAI_DATASET_TEST",
+                    message: String::new(),
+                },
+                exit_codes::EXECUTION_FAILED,
+            ),
+            (
+                DowaiError::Retry {
+                    code: "DOWAI_RETRY_TEST",
+                    message: String::new(),
+                },
+                exit_codes::INVALID_INPUT,
+            ),
+            (
+                DowaiError::Io(std::io::Error::other("test")),
+                exit_codes::INVALID_INPUT,
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(error.exit_code(), expected, "{}", error.code());
+        }
+    }
+
+    #[test]
+    fn contract_values_match_plan_section_6_4() {
+        assert_eq!(
+            [
+                exit_codes::SUCCESS,
+                exit_codes::INVALID_INPUT,
+                exit_codes::EXECUTION_FAILED,
+                exit_codes::CONNECTION_FAILED,
+                exit_codes::POLICY_DENIED,
+                exit_codes::NOT_IMPLEMENTED,
+                exit_codes::CANCELLED,
+            ],
+            [0, 2, 3, 4, 5, 6, 130]
+        );
     }
 }

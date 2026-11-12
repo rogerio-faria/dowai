@@ -213,7 +213,7 @@ fn main() -> ExitCode {
             }
             Err(error) => {
                 eprintln!("DOWAI_OUTPUT_ERROR: {error}");
-                ExitCode::from(2)
+                ExitCode::from(dowai_core::exit_codes::INVALID_INPUT as u8)
             }
         },
         Ok(None) => ExitCode::SUCCESS,
