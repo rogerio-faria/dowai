@@ -119,6 +119,36 @@ fn resolve_grants(
     })
 }
 
+/// Segredos declarados pelo manifesto e liberados pela política (`plugins.allow_secrets`), lidos
+/// de `DOWAI_SECRET_<NOME>`. Ausência não é erro aqui: o plugin decide se precisa do valor.
+/// Declarado sem política já foi recusado em `resolve_grants`.
+fn resolve_secrets(
+    manifest: &dowai_core::plugin_manifest::PluginManifest,
+    policy: &PluginPolicy,
+) -> serde_json::Map<String, Value> {
+    let mut resolved = serde_json::Map::new();
+    if !policy.allow_secrets {
+        return resolved;
+    }
+    for name in &manifest.permissions.secrets {
+        let variable = format!("DOWAI_SECRET_{}", name.to_ascii_uppercase());
+        if let Ok(value) = std::env::var(variable) {
+            resolved.insert(name.clone(), json!(value));
+        }
+    }
+    resolved
+}
+
+/// Acrescenta os segredos ao payload sob a chave reservada `__secrets__`, que sempre é
+/// sobrescrita: uma entrada do chamador com essa chave não vira segredo.
+fn with_secrets(input: &Value, secrets: serde_json::Map<String, Value>) -> Value {
+    let mut payload = input.clone();
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("__secrets__".to_owned(), Value::Object(secrets));
+    }
+    payload
+}
+
 /// Worker: lê a entrada de stdin, instala o hook de permissões antes de qualquer código do
 /// plugin, carrega o módulo validado pelo caminho canônico e chama a função com a entrada como
 /// kwargs. O resultado é o único conteúdo escrito no stdout real.
@@ -161,17 +191,23 @@ def _guard(event, args):
 sys.addaudithook(_guard)
 try:
     payload = json.loads(sys.stdin.read())
+    secrets = payload.pop("__secrets__", {})
     sys.path.append(plugin_dir)
     spec = importlib.util.spec_from_file_location(module_name, path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
-    result = getattr(module, function)(**payload)
+    target = getattr(module, function)
+    kwargs = payload
+    if "secrets" in inspect.signature(target).parameters:
+        kwargs = dict(payload, secrets=secrets)
+    result = target(**kwargs)
     if inspect.iscoroutine(result):
         import asyncio
         result = asyncio.run(result)
-except BaseException:
-    os._exit(10)
+except BaseException as error:
+    # 13 = efeito possivelmente aplicado (ver EXIT_UNCERTAIN no plugin email); demais = 10.
+    os._exit(13 if getattr(error, "dowai_exit_code", None) == 13 else 10)
 try:
     data = json.dumps(result, allow_nan=False)
 except BaseException:
@@ -279,7 +315,7 @@ fn run(execution: &PluginExecution<'_>) -> Result<Value> {
     let manifest = &call.plugin.manifest;
     let target = format!("{}.{}", manifest.id, call.method);
 
-    let input = validate_input(&execution.input)?;
+    validate_input(&execution.input)?;
     let key = validate_key(execution.idempotency_key)?;
     if manifest.idempotency_key_required && key.is_none() {
         return Err(plugin_error(
@@ -294,6 +330,12 @@ fn run(execution: &PluginExecution<'_>) -> Result<Value> {
         .parent()
         .ok_or_else(|| DowaiError::Path("Plugin manifest has no directory".to_owned()))?;
     let grants = resolve_grants(manifest, execution.policy)?;
+    // O payload inclui os segredos já resolvidos. Ele segue só por stdin: nunca por argumentos,
+    // ambiente, erro, AUDIT ou resultado.
+    let input = validate_input(&with_secrets(
+        &execution.input,
+        resolve_secrets(manifest, execution.policy),
+    ))?;
     let (source, module, function) =
         resolve_entrypoint_file(plugin_dir, &call.method, &call.entrypoint)?;
     let working_dir = std::fs::canonicalize(plugin_dir)?;
