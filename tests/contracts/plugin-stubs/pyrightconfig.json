@@ -1,0 +1,7 @@
+{
+  "stubPath": ".dowai/stubs",
+  "typeCheckingMode": "standard",
+  "pythonVersion": "3.12",
+  "reportMissingModuleSource": "none",
+  "include": ["app_ok.py"]
+}

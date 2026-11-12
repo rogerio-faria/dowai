@@ -10,7 +10,7 @@
 //! Permissões não são concedidas aqui: a descoberta apenas registra o que o manifesto declara.
 
 use crate::{sha256_hex, DowaiError, Result};
-use rustpython_ast::{self as ast, Mod, Stmt};
+use rustpython_ast::{self as ast, Mod, Ranged, Stmt};
 use rustpython_parser::{parse, Mode};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -65,6 +65,8 @@ pub struct ParameterSignature {
     pub kind: ParameterKind,
     pub annotated: bool,
     pub has_default: bool,
+    /// Texto da anotação no código-fonte, quando existe (ENT-055). Não é validado aqui.
+    pub annotation: Option<String>,
 }
 
 /// Assinatura de um entrypoint, obtida sem importar o módulo.
@@ -225,6 +227,7 @@ fn signature_for(plugin_dir: &Path, method: &str, entrypoint: &str) -> Result<Pl
                 false,
                 &definition.args,
                 definition.returns.is_some(),
+                &source,
             )),
             Stmt::AsyncFunctionDef(definition) if definition.name.as_str() == function => {
                 Some(build(
@@ -234,6 +237,7 @@ fn signature_for(plugin_dir: &Path, method: &str, entrypoint: &str) -> Result<Pl
                     true,
                     &definition.args,
                     definition.returns.is_some(),
+                    &source,
                 ))
             }
             _ => None,
@@ -258,22 +262,27 @@ fn build(
     is_async: bool,
     arguments: &ast::Arguments,
     returns_annotated: bool,
+    source: &str,
 ) -> PluginSignature {
     let mut parameters = Vec::new();
     for arg in &arguments.posonlyargs {
-        parameters.push(with_default(ParameterKind::PositionalOnly, arg));
+        parameters.push(with_default(ParameterKind::PositionalOnly, arg, source));
     }
     for arg in &arguments.args {
-        parameters.push(with_default(ParameterKind::PositionalOrKeyword, arg));
+        parameters.push(with_default(
+            ParameterKind::PositionalOrKeyword,
+            arg,
+            source,
+        ));
     }
     if let Some(vararg) = &arguments.vararg {
-        parameters.push(bare(ParameterKind::VarPositional, vararg));
+        parameters.push(bare(ParameterKind::VarPositional, vararg, source));
     }
     for arg in &arguments.kwonlyargs {
-        parameters.push(with_default(ParameterKind::KeywordOnly, arg));
+        parameters.push(with_default(ParameterKind::KeywordOnly, arg, source));
     }
     if let Some(kwarg) = &arguments.kwarg {
-        parameters.push(bare(ParameterKind::VarKeyword, kwarg));
+        parameters.push(bare(ParameterKind::VarKeyword, kwarg, source));
     }
     PluginSignature {
         method: method.to_string(),
@@ -285,21 +294,41 @@ fn build(
     }
 }
 
-fn with_default(kind: ParameterKind, arg: &ast::ArgWithDefault) -> ParameterSignature {
+fn with_default(
+    kind: ParameterKind,
+    arg: &ast::ArgWithDefault,
+    source: &str,
+) -> ParameterSignature {
     ParameterSignature {
         name: arg.def.arg.as_str().to_string(),
         kind,
         annotated: arg.def.annotation.is_some(),
         has_default: arg.default.is_some(),
+        annotation: arg
+            .def
+            .annotation
+            .as_deref()
+            .map(|expression| source_slice(source, expression.range())),
     }
 }
 
-fn bare(kind: ParameterKind, arg: &ast::Arg) -> ParameterSignature {
+/// Texto exato de uma expressão no código-fonte (ranges em bytes do parser).
+fn source_slice(source: &str, range: rustpython_ast::text_size::TextRange) -> String {
+    let start = usize::from(range.start());
+    let end = usize::from(range.end());
+    source.get(start..end).unwrap_or_default().to_string()
+}
+
+fn bare(kind: ParameterKind, arg: &ast::Arg, source: &str) -> ParameterSignature {
     ParameterSignature {
         name: arg.arg.as_str().to_string(),
         kind,
         annotated: arg.annotation.is_some(),
         has_default: false,
+        annotation: arg
+            .annotation
+            .as_deref()
+            .map(|expression| source_slice(source, expression.range())),
     }
 }
 

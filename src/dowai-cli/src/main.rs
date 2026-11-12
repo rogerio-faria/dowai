@@ -107,6 +107,12 @@ enum PluginsCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Generate typed `.pyi` stubs for the effective plugins under `.dowai/stubs` (ENT-055).
+    /// Reads manifests and signatures only; no plugin code is imported or executed.
+    Sync {
+        #[arg(long)]
+        json: bool,
+    },
     /// Resolve `namespace.method` through the single resolver (ENT-106). Only resolves: no
     /// plugin code is imported or executed. Override follows `plugins.allow_local_override`.
     Resolve {
@@ -788,6 +794,7 @@ fn wants_json(command: &Command) -> bool {
         Command::Plugins { command } => match command {
             PluginsCommand::List { json, .. }
             | PluginsCommand::Info { json, .. }
+            | PluginsCommand::Sync { json }
             | PluginsCommand::Resolve { json, .. }
             | PluginsCommand::Run { json, .. } => *json,
         },
@@ -834,6 +841,43 @@ fn dispatch_plugins(command: PluginsCommand) -> Result<Option<Value>> {
                     println!("  method: {method} -> {target}");
                 }
             }
+            Ok(None)
+        }
+        PluginsCommand::Sync { json } => {
+            let project_dir = roots
+                .project
+                .as_deref()
+                .and_then(Path::parent)
+                .ok_or_else(|| {
+                    DowaiError::Config(
+                        "plugins sync exige um projeto (dowai_project.json) no diretório atual"
+                            .to_owned(),
+                    )
+                })?;
+            let catalog = discover(&roots, PluginScope::All)?;
+            let report = dowai_core::plugin_stubs::sync_stubs(
+                project_dir,
+                &catalog,
+                plugins_allow_local_override()?,
+            )?;
+            for warning in &report.warnings {
+                eprintln!(
+                    "aviso {}: {} {}",
+                    warning.code, warning.plugin, warning.message
+                );
+            }
+            if json {
+                return Ok(Some(report.to_json()));
+            }
+            println!("stubs: {}", report.stubs_dir.display());
+            println!(
+                "plugins: {} | gravados: {} | inalterados: {} | removidos: {} | avisos: {}",
+                report.plugins.len(),
+                report.written.len(),
+                report.unchanged.len(),
+                report.removed.len(),
+                report.warnings.len()
+            );
             Ok(None)
         }
         PluginsCommand::Resolve { target, json } => {

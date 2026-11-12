@@ -9,6 +9,7 @@ pub mod package_policy;
 mod planner;
 pub mod plugin_manifest;
 pub mod plugin_registry;
+pub mod plugin_stubs;
 mod project;
 mod python_ast;
 mod runs;
