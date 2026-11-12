@@ -294,10 +294,12 @@ fn dispatch(command: Command) -> Result<Option<Value>> {
                 admin_config_path().as_deref(),
             );
             // ENT-016: every problem becomes a diagnostic with a stable code. Messages never
-            // carry driver output, which may contain connection data.
+            // carry driver output, which may contain connection data. Warnings (ENT-018) are
+            // advisory and do not degrade the health report.
             let mut diagnostics: Vec<Value> = report
                 .diagnostics
                 .iter()
+                .filter(|diagnostic| diagnostic.severity == dowai_core::DiagnosticSeverity::Error)
                 .map(|diagnostic| json!({"code": diagnostic.code, "message": diagnostic.message}))
                 .collect();
             let mut python_runtime = "not_checked";
@@ -381,16 +383,35 @@ fn dispatch(command: Command) -> Result<Option<Value>> {
             }
         }
         Command::Validate(args) => {
-            let _strict = args.strict;
             let project_dir = match args.path {
                 Some(path) => path,
                 None => std::env::current_dir()?,
             };
-            let report = validate_project_with_configuration(
+            let mut report = validate_project_with_configuration(
                 &project_dir,
                 user_config_path().as_deref(),
                 admin_config_path().as_deref(),
             );
+            if args.strict {
+                report.apply_strict();
+            }
+            if !args.json {
+                for diagnostic in &report.diagnostics {
+                    let label = match diagnostic.severity {
+                        dowai_core::DiagnosticSeverity::Error => "Error",
+                        dowai_core::DiagnosticSeverity::Warning => "Warning",
+                    };
+                    let location = diagnostic
+                        .path
+                        .as_deref()
+                        .map(|path| format!(" ({path})"))
+                        .unwrap_or_default();
+                    eprintln!(
+                        "{label} [{}]{location}: {}",
+                        diagnostic.code, diagnostic.message
+                    );
+                }
+            }
             let value = serde_json::to_value(&report)
                 .map_err(|error| DowaiError::Config(error.to_string()))?;
             if !report.valid {
@@ -414,7 +435,14 @@ fn dispatch(command: Command) -> Result<Option<Value>> {
             if args.json {
                 Ok(Some(value))
             } else {
-                println!("Project is valid.");
+                if report.diagnostics.is_empty() {
+                    println!("Project is valid.");
+                } else {
+                    println!(
+                        "Project is valid with {} warning(s).",
+                        report.diagnostics.len()
+                    );
+                }
                 Ok(None)
             }
         }

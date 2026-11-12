@@ -21,8 +21,9 @@ pub use planner::{
     plan, read_planned_model, validate_plan_templates, ExecutionMode, ExecutionPlan, PlanNode,
 };
 pub use project::{
-    create_project, load_project, validate_project, validate_project_with_configuration, Project,
-    ProjectPython, ProjectSource, ValidationReport,
+    create_project, load_project, validate_project, validate_project_with_configuration,
+    DiagnosticSeverity, Project, ProjectPython, ProjectSource, ValidationDiagnostic,
+    ValidationReport,
 };
 pub use runs::{
     current_time_ms, default_run_store_path, filter_invocations, invocation_depths,

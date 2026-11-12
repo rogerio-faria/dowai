@@ -64,10 +64,44 @@ fn default_models_dir() -> PathBuf {
     PathBuf::from("models")
 }
 
+/// Severidade de um diagnóstico de validação (ENT-018).
+///
+/// Avisos não invalidam o projeto no modo normal; `validate --strict` os converte em erros.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DiagnosticSeverity {
+    Error,
+    Warning,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ValidationDiagnostic {
     pub code: String,
     pub message: String,
+    pub severity: DiagnosticSeverity,
+    /// Caminho relativo ao projeto, quando o diagnóstico tem localização conhecida.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+impl ValidationDiagnostic {
+    fn error(code: &str, message: String, path: Option<String>) -> Self {
+        Self {
+            code: code.to_owned(),
+            message,
+            severity: DiagnosticSeverity::Error,
+            path,
+        }
+    }
+
+    fn warning(code: &str, message: String, path: Option<String>) -> Self {
+        Self {
+            code: code.to_owned(),
+            message,
+            severity: DiagnosticSeverity::Warning,
+            path,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -76,6 +110,28 @@ pub struct ValidationReport {
     pub valid: bool,
     pub project: Option<Project>,
     pub diagnostics: Vec<ValidationDiagnostic>,
+}
+
+impl ValidationReport {
+    /// Modo `--strict` (ENT-018): cada aviso passa a ser erro e o relatório falha se houver qualquer diagnóstico.
+    pub fn apply_strict(&mut self) {
+        for diagnostic in &mut self.diagnostics {
+            diagnostic.severity = DiagnosticSeverity::Error;
+        }
+        self.finalize();
+    }
+
+    /// Ordena os diagnósticos de forma determinística e recalcula `valid`.
+    fn finalize(&mut self) {
+        self.diagnostics.sort_by(|a, b| {
+            (a.severity, &a.path, &a.code, &a.message)
+                .cmp(&(b.severity, &b.path, &b.code, &b.message))
+        });
+        self.valid = !self
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error);
+    }
 }
 
 pub fn load_project(project_root: &Path) -> Result<Project> {
@@ -273,46 +329,70 @@ pub fn validate_project_with_configuration(
     let project = match load_project(project_root) {
         Ok(project) => Some(project),
         Err(error) => {
-            diagnostics.push(ValidationDiagnostic {
-                code: error.code().to_owned(),
-                message: error.message(),
-            });
+            diagnostics.push(ValidationDiagnostic::error(
+                error.code(),
+                error.message(),
+                Some(PROJECT_FILE.to_owned()),
+            ));
             None
         }
     };
 
     if let Some(config) = &project {
+        let models_path = config.models_dir.display().to_string();
         let models = project_root.join(&config.models_dir);
         if !models.is_dir() {
-            diagnostics.push(ValidationDiagnostic {
-                code: "DOWAI_MODELS_DIR_MISSING".to_owned(),
-                message: format!("Models directory does not exist: {}", models.display()),
-            });
-        } else if let Err(error) = plan(project_root, &["all".to_owned()], ExecutionMode::Automatic)
-        {
-            diagnostics.push(ValidationDiagnostic {
-                code: error.code().to_owned(),
-                message: error.message(),
-            });
+            diagnostics.push(ValidationDiagnostic::error(
+                "DOWAI_MODELS_DIR_MISSING",
+                format!("Models directory does not exist: {}", models.display()),
+                Some(models_path),
+            ));
+        } else {
+            match plan(project_root, &["all".to_owned()], ExecutionMode::Automatic) {
+                Ok(execution_plan) => {
+                    if execution_plan.nodes.is_empty() {
+                        diagnostics.push(ValidationDiagnostic::warning(
+                            "DOWAI_MODELS_EMPTY",
+                            "Models directory contains no .sql or .py models".to_owned(),
+                            Some(models_path.clone()),
+                        ));
+                    }
+                    for warning in execution_plan.warnings {
+                        diagnostics.push(ValidationDiagnostic::warning(
+                            "DOWAI_PLAN_WARNING",
+                            warning,
+                            Some(models_path.clone()),
+                        ));
+                    }
+                }
+                Err(error) => diagnostics.push(ValidationDiagnostic::error(
+                    error.code(),
+                    error.message(),
+                    Some(models_path),
+                )),
+            }
         }
         if let Err(error) = crate::resolve_effective_configuration(
             project_root,
             user_config_path,
             admin_config_path,
         ) {
-            diagnostics.push(ValidationDiagnostic {
-                code: error.code().to_owned(),
-                message: error.message(),
-            });
+            diagnostics.push(ValidationDiagnostic::error(
+                error.code(),
+                error.message(),
+                None,
+            ));
         }
     }
 
-    ValidationReport {
+    let mut report = ValidationReport {
         schema_version: 2,
-        valid: diagnostics.is_empty(),
+        valid: true,
         project,
         diagnostics,
-    }
+    };
+    report.finalize();
+    report
 }
 
 fn validate_project_name(name: &str) -> Result<()> {
