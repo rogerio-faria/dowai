@@ -1,0 +1,33 @@
+{
+  "execution_mode": "automatic",
+  "nodes": [
+    {
+      "depends_on": [],
+      "id": "arq10.sql",
+      "path": "arq10.sql"
+    },
+    {
+      "depends_on": [
+        "arq10.sql"
+      ],
+      "id": "arq7.py",
+      "path": "arq7.py"
+    },
+    {
+      "depends_on": [
+        "arq7.py"
+      ],
+      "id": "arq1.sql",
+      "path": "arq1.sql"
+    },
+    {
+      "depends_on": [
+        "arq1.sql"
+      ],
+      "id": "comissao.py",
+      "path": "comissao.py"
+    }
+  ],
+  "schema_version": 2,
+  "warnings": []
+}

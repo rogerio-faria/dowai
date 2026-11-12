@@ -1,0 +1,28 @@
+{
+  "execution_mode": "manual",
+  "nodes": [
+    {
+      "depends_on": [
+        "arq7.py"
+      ],
+      "id": "arq1.sql",
+      "path": "arq1.sql"
+    },
+    {
+      "depends_on": [],
+      "id": "arq10.sql",
+      "path": "arq10.sql"
+    },
+    {
+      "depends_on": [
+        "arq10.sql"
+      ],
+      "id": "arq7.py",
+      "path": "arq7.py"
+    }
+  ],
+  "schema_version": 2,
+  "warnings": [
+    "arq1.sql depends on arq7.py; manual mode does not reorder or run predecessors"
+  ]
+}
