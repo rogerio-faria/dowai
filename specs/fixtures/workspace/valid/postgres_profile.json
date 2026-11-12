@@ -1,0 +1,16 @@
+{
+  "schema_version": 2,
+  "workspace_name": "local",
+  "profiles": {
+    "local": {
+      "type": "postgres",
+      "host": "127.0.0.1",
+      "port": 5432,
+      "user": "dowai",
+      "database": "analytics",
+      "password_env": "DOWAI_PG_PASSWORD",
+      "tls": "disabled"
+    }
+  },
+  "defaults": {"execution": {"default_mode": "automatic"}}
+}

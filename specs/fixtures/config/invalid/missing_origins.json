@@ -1,0 +1,10 @@
+{
+  "schema_version": 2,
+  "effective": {
+    "execution": {"default_mode": "automatic", "default_profile": null, "stop_on_error": true, "allow_manual_mode": true, "max_call_depth": 8, "max_invocations_per_run": 1000},
+    "templates": {"strict_undefined": true, "allow_dowai_if_alias": true, "max_nesting_depth": 16},
+    "security": {"allow_external_writes": false, "require_approval_for_destructive": true, "allowed_paths": [], "allowed_hosts": [], "allowed_profiles": []},
+    "ai": {"enabled": false, "allow_data_rows": false}
+  },
+  "sources": {"engine_defaults": "active", "user": "not_loaded", "workspace": "not_loaded", "project": "not_loaded", "admin": "not_loaded"}
+}

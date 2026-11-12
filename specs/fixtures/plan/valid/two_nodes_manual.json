@@ -1,0 +1,9 @@
+{
+  "schema_version": 2,
+  "execution_mode": "manual",
+  "nodes": [
+    {"id": "stg_vendas", "path": "models/stg_vendas.sql", "depends_on": []},
+    {"id": "faturamento", "path": "models/faturamento.sql", "depends_on": ["stg_vendas"]}
+  ],
+  "warnings": ["modelo sem teste associado"]
+}

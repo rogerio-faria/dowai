@@ -1,0 +1,16 @@
+{
+  "schema_version": 2,
+  "name": "automatic-dag",
+  "models_dir": "models",
+  "config": {"execution": {"default_mode": "automatic", "stop_on_error": true}},
+  "sources": {
+    "vendas": {"schema": "raw", "tables": {"pedidos": "pedidos_2026"}}
+  },
+  "python": {
+    "interpreter": "/home/admin/projetos/exemplo/.dowai_venv/bin/python",
+    "timeout_seconds": 120,
+    "dependencies": ["pandas==2.2.3"],
+    "package_policy": "declared_only",
+    "allow_unlisted_packages": false
+  }
+}

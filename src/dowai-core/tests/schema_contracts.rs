@@ -7,7 +7,21 @@ use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const CONTRACTS: [&str; 5] = ["commands", "events", "ipc", "plugin", "data_dictionary"];
+/// Every public schema under `specs/` must have fixtures. The first five came with B-06; the
+/// remaining six are the legacy contracts covered by ENT-009 (W01).
+const CONTRACTS: [&str; 11] = [
+    "commands",
+    "events",
+    "ipc",
+    "plugin",
+    "data_dictionary",
+    "config",
+    "project",
+    "plan",
+    "session",
+    "run",
+    "workspace",
+];
 
 fn specs_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../specs")
