@@ -2,11 +2,12 @@ use clap::{Args, Parser, Subcommand};
 use dowai_core::{
     admin_config_path, check_compatibility, create_project, default_run_store_path,
     default_session_store_path, discover, filter_invocations, find_plugins, invocation_depths,
-    plan, plugin_json, plugin_list_json, plugin_roots_from, resolve_effective_configuration,
-    session_ttl_from_config, user_config_path, validate_project_with_configuration,
-    CancellationToken, CompatibilityReport, CompatibilityStatus, DowaiError, ExecutionMode,
-    InvocationEntry, LogLevel, PluginCatalog, PluginScope, Result, RevisionSnapshot, RunDetail,
-    RunStore, RunSummary, SessionMetadata, SessionStore, TemplateOptions,
+    plan, plugin_json, plugin_list_json, plugin_roots_from, resolve_call,
+    resolve_effective_configuration, resolved_call_json, session_ttl_from_config, user_config_path,
+    validate_project_with_configuration, CancellationToken, CompatibilityReport,
+    CompatibilityStatus, DowaiError, ExecutionMode, InvocationEntry, LogLevel, PluginCatalog,
+    PluginScope, Result, RevisionSnapshot, RunDetail, RunStore, RunSummary, SessionMetadata,
+    SessionStore, TemplateOptions,
 };
 use dowai_runtime::{
     check_postgres_connection, check_python_runtime, check_python_sdk, declared_default_profile,
@@ -102,6 +103,13 @@ enum PluginsCommand {
     /// Show the manifest data of every plugin with this ID, with its origin.
     Info {
         id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Resolve `namespace.method` through the single resolver (ENT-106). Only resolves: no
+    /// plugin code is imported or executed. Override follows `plugins.allow_local_override`.
+    Resolve {
+        target: String,
         #[arg(long)]
         json: bool,
     },
@@ -765,7 +773,9 @@ fn wants_json(command: &Command) -> bool {
             CompatibilityCommand::Check { json, .. } => *json,
         },
         Command::Plugins { command } => match command {
-            PluginsCommand::List { json, .. } | PluginsCommand::Info { json, .. } => *json,
+            PluginsCommand::List { json, .. }
+            | PluginsCommand::Info { json, .. }
+            | PluginsCommand::Resolve { json, .. } => *json,
         },
     }
 }
@@ -810,6 +820,29 @@ fn dispatch_plugins(command: PluginsCommand) -> Result<Option<Value>> {
                     println!("  method: {method} -> {target}");
                 }
             }
+            Ok(None)
+        }
+        PluginsCommand::Resolve { target, json } => {
+            let config_root = find_config_root(&std::env::current_dir()?);
+            let configuration = resolve_effective_configuration(
+                &config_root,
+                user_config_path().as_deref(),
+                admin_config_path().as_deref(),
+            )?;
+            let allow_local_override = configuration["effective"]["plugins"]
+                ["allow_local_override"]
+                .as_bool()
+                .unwrap_or(false);
+            let catalog = discover(&roots, PluginScope::All)?;
+            let call = resolve_call(&catalog, &target, allow_local_override)?;
+            let resolved = resolved_call_json(&call);
+            if json {
+                return Ok(Some(resolved));
+            }
+            println!(
+                "{}.{} -> {}",
+                call.plugin.manifest.id, call.method, call.entrypoint
+            );
             Ok(None)
         }
     }

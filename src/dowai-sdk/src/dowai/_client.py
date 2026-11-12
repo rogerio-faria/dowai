@@ -123,6 +123,14 @@ class DowaiClient:
         arguments.append("--json")
         return self._payload(arguments)
 
+    def plugin_resolve(self, target: str) -> dict[str, Any]:
+        """Resolves `namespace.method` to its entrypoint, without executing it.
+
+        Runs `dowai plugins resolve <target> --json` (ENT-106). The engine applies the same
+        resolver as the CLI; refusals raise `DowaiExecutionError` with the engine's code.
+        """
+        return self._payload(["plugins", "resolve", _text(target, "target"), "--json"])
+
     def _result(self, arguments: list[str]) -> RunResult:
         code, payload = self._execute(arguments)
         status = payload.get("status")

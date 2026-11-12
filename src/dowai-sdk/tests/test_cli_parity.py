@@ -16,7 +16,7 @@ from pathlib import Path
 SDK_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SDK_ROOT / "src"))
 
-from dowai import DowaiClient, DowaiExecutionError  # noqa: E402
+from dowai import DowaiClient, DowaiExecutionError, Env  # noqa: E402
 
 REPOSITORY_ROOT = SDK_ROOT.parents[1]
 UNKNOWN_RUN = "00000000-0000-4000-8000-000000000000"
@@ -55,6 +55,28 @@ class CliParityTests(unittest.TestCase):
         )
         (cls.project / "models" / "fail.py").write_text(
             "def model(env):\n    raise RuntimeError('private detail')\n"
+        )
+        # ENT-106: a plugin declared in the project. Resolution must never import it.
+        plugin_dir = cls.project / "plugins" / "email"
+        plugin_dir.mkdir(parents=True)
+        cls.plugin_sentinel = root / "plugin-imported.flag"
+        (plugin_dir / "plugin.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "id": "email",
+                    "version": "1.0.0",
+                    "entrypoints": {"send": "sender:send"},
+                    "permissions": {"network": [], "filesystem": [], "secrets": []},
+                    "timeout_seconds": 30,
+                    "side_effects": False,
+                    "idempotency_key_required": False,
+                }
+            )
+        )
+        (plugin_dir / "sender.py").write_text(
+            f"open({str(cls.plugin_sentinel)!r}, 'w').write('imported')\n"
+            "def send(**kwargs):\n    return None\n"
         )
         cls.client = DowaiClient(cls.project, binary=cls.binary)
 
@@ -138,6 +160,23 @@ class CliParityTests(unittest.TestCase):
         run_id = cli_runs["runs"][0]["run_id"]
         self.assertEqual(self.client.run_detail(run_id), self.cli_json(["runs", "show", run_id]))
         self.assertEqual(self.client.logs(run_id), self.cli_json(["logs", run_id]))
+
+    def test_plugin_resolution_is_identical_on_every_path(self):
+        cli = self.cli_json(["plugins", "resolve", "email.send"])
+        self.assertEqual(cli["entrypoint"], "sender:send")
+        self.assertEqual(self.client.plugin_resolve("email.send"), cli)
+        env = Env(backend=self.client)
+        self.assertEqual(env.plugins.run("email.send"), cli)
+        self.assertEqual(env.plugins.email.send(), cli)
+        self.assertFalse(self.plugin_sentinel.exists(), "resolution must not import the plugin")
+
+    def test_undeclared_plugin_method_raises_the_same_code_as_the_cli(self):
+        code, cli = self.cli(["plugins", "resolve", "email.delete", "--json"])
+        self.assertNotEqual(code, 0)
+        with self.assertRaises(DowaiExecutionError) as context:
+            Env(backend=self.client).plugins.email.delete()
+        self.assertEqual(context.exception.code, cli["error_code"])
+        self.assertEqual(context.exception.code, "DOWAI_CONFIG_INVALID")
 
     def test_invalid_identifier_raises_the_same_code_as_the_cli(self):
         code, cli = self.cli(["logs", "not-a-uuid", "--json"])

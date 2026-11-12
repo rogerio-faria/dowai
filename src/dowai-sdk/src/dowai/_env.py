@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from typing import Any, Iterator, Protocol
 
 from ._errors import DowaiExecutionError
+from ._plugins import PluginCalls
 from ._result import ExecutionMode, RunResult
 
 
@@ -121,6 +122,15 @@ class Env:
         self._validate_name(table)
         operation = self._backend_operation("source")
         return operation(name, table)
+
+    @property
+    def plugins(self) -> PluginCalls:
+        """Plugin calls resolved by the bound runtime (ENT-106). Nothing is executed here."""
+        return PluginCalls(self._resolve_plugin)
+
+    def _resolve_plugin(self, target: str) -> dict[str, Any]:
+        operation = self._backend_operation("plugin_resolve")
+        return operation(target)
 
     def _backend_operation(self, name: str) -> Any:
         backend = self._require_backend(name)
