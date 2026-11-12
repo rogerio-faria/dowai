@@ -1,0 +1,17 @@
+{
+  "schema_version": 2,
+  "id": "alerts",
+  "version": "1.0.0",
+  "entrypoints": {
+    "evaluate": "checker:evaluate",
+    "plan": "checker:plan"
+  },
+  "permissions": {
+    "network": [],
+    "filesystem": [],
+    "secrets": []
+  },
+  "timeout_seconds": 10,
+  "side_effects": false,
+  "idempotency_key_required": false
+}
