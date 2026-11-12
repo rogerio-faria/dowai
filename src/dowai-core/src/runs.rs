@@ -15,7 +15,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 /// Current `PRAGMA user_version` of the run journal database.
-pub const RUN_SCHEMA_VERSION: i64 = 3;
+pub const RUN_SCHEMA_VERSION: i64 = 4;
 pub const MAX_LIST_LIMIT: usize = 1_000;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_TARGET_CHARS: usize = 256;
@@ -411,7 +411,7 @@ impl RunStore {
         })
     }
 
-    fn connect(&self) -> Result<Connection> {
+    pub(crate) fn connect(&self) -> Result<Connection> {
         let parent = self
             .path
             .parent()
@@ -443,8 +443,13 @@ impl RunStore {
             1 => {
                 migrate_v1_to_v2(&mut connection)?;
                 migrate_v2_to_v3(&mut connection)?;
+                migrate_v3_to_v4(&mut connection)?;
             }
-            2 => migrate_v2_to_v3(&mut connection)?,
+            2 => {
+                migrate_v2_to_v3(&mut connection)?;
+                migrate_v3_to_v4(&mut connection)?;
+            }
+            3 => migrate_v3_to_v4(&mut connection)?,
             RUN_SCHEMA_VERSION => {}
             other => {
                 return Err(DowaiError::State(format!(
@@ -519,6 +524,37 @@ fn migrate_v2_to_v3(connection: &mut Connection) -> Result<()> {
     transaction.commit().map_err(state_error)
 }
 
+/// Schema 4 adds the durable outbox for external effects (ENT-051, plan 9.3). The table holds
+/// the idempotency key, the effect kind and target and the outbox state; it never holds the
+/// effect payload, so the journal stays free of content.
+fn migrate_v3_to_v4(connection: &mut Connection) -> Result<()> {
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(state_error)?;
+    if user_version(&transaction)? == 3 {
+        transaction
+            .execute_batch(
+                "CREATE TABLE outbox (
+                   seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                   idempotency_key TEXT NOT NULL UNIQUE
+                     CHECK (length(idempotency_key) BETWEEN 1 AND 128),
+                   effect_kind TEXT NOT NULL,
+                   target TEXT NOT NULL,
+                   status TEXT NOT NULL CHECK (status IN
+                     ('PENDING','SENT','CONFIRMED','FAILED','UNCERTAIN')),
+                   attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+                   error_code TEXT,
+                   created_at_ms INTEGER NOT NULL,
+                   updated_at_ms INTEGER NOT NULL
+                 );
+                 CREATE INDEX outbox_status ON outbox(status, seq);
+                 PRAGMA user_version = 4;",
+            )
+            .map_err(state_error)?;
+    }
+    transaction.commit().map_err(state_error)
+}
+
 /// JSON array of the requested targets; `None` stays NULL.
 fn targets_json(targets: Option<&[String]>) -> Result<Option<String>> {
     targets
@@ -583,13 +619,13 @@ fn read_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunSummary> {
     })
 }
 
-fn user_version(connection: &Connection) -> Result<i64> {
+pub(crate) fn user_version(connection: &Connection) -> Result<i64> {
     connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(state_error)
 }
 
-fn state_error(error: rusqlite::Error) -> DowaiError {
+pub(crate) fn state_error(error: rusqlite::Error) -> DowaiError {
     DowaiError::State(format!("Run journal operation failed: {error}"))
 }
 

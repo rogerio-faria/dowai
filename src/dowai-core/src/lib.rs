@@ -4,6 +4,7 @@ pub mod compatibility;
 mod config;
 pub mod config_catalog;
 mod error;
+mod outbox;
 pub mod package_policy;
 mod planner;
 mod project;
@@ -25,6 +26,9 @@ pub use config::{
     WorkspaceProfile,
 };
 pub use error::{exit_codes, DowaiError, Result};
+pub use outbox::{
+    DeliveryOutcome, DispatchReport, EffectSink, OutboxEntry, Probe, NOT_DELIVERED_CODE,
+};
 pub use planner::{
     plan, read_planned_model, validate_plan_templates, verify_planned_model, ExecutionMode,
     ExecutionPlan, PlanNode,
