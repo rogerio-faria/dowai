@@ -37,7 +37,7 @@ pub use planner::{
 };
 pub use plugin_registry::{
     discover, find_plugins, plugin_json, plugin_list_json, plugin_roots_from, resolve_call,
-    PluginCatalog, PluginScope,
+    resolved_call_json, PluginCatalog, PluginScope, ResolvedCall,
 };
 pub use project::{
     create_project, load_project, validate_project, validate_project_with_configuration,

@@ -1,12 +1,14 @@
-//! ENT-053: descoberta de plugins por escopo, dispatcher único de resolução e listagem.
+//! ENT-053 e ENT-054: descoberta de plugins por escopo, dispatcher único de resolução, listagem
+//! e override local/global.
 //!
 //! Garante que project/global são registrados com origem, que manifesto inválido não oculta os
-//! demais, que ID duplicado no mesmo nível é erro, que a descoberta não executa código do plugin
-//! e que `namespace.method` resolve por um único caminho (recusando ambiguidade entre escopos).
+//! demais, que ID duplicado no mesmo nível é erro, que a descoberta não executa código do plugin,
+//! que `namespace.method` resolve por um único caminho e que o override local só ocorre com
+//! `allow_local_override`, substituindo o global inteiro e deixando registro da substituição.
 
 use dowai_core::plugin_registry::{
-    discover, find_plugins, plugin_list_json, plugin_roots_from, resolve_call, PluginRoots,
-    PluginScope,
+    discover, find_plugins, plugin_list_json, plugin_roots_from, resolve_call, resolved_call_json,
+    PluginRoots, PluginScope,
 };
 use serde_json::Value;
 use std::fs;
@@ -174,6 +176,7 @@ fn discovery_never_imports_or_executes_plugin_code() {
     resolve_call(
         &discover(&roots, PluginScope::All).expect("discover"),
         "email.send",
+        true,
     )
     .expect("resolve");
     assert!(
@@ -208,38 +211,94 @@ fn dispatcher_resolves_namespace_method_to_the_declared_entrypoint() {
     write_plugin(&workspace.join("plugins"), "email", "email", &sentinel);
     let catalog = discover(&roots, PluginScope::All).expect("discover");
 
-    let call = resolve_call(&catalog, "email.send").expect("resolve");
+    let call = resolve_call(&catalog, "email.send", true).expect("resolve");
     assert_eq!(call.plugin.manifest.id, "email");
     assert_eq!(call.method, "send");
     assert_eq!(call.entrypoint, "sender:send");
+    assert!(call.shadowed.is_none());
 }
 
 #[test]
-fn dispatcher_refuses_unknown_undeclared_malformed_and_ambiguous_targets() {
+fn dispatcher_refuses_unknown_undeclared_and_malformed_targets() {
     let scratch = Scratch::new("refuse");
     let sentinel = scratch.path().join("sentinel.txt");
-    let (workspace, project, roots) = workspace_layout(&scratch);
+    let (workspace, _project, roots) = workspace_layout(&scratch);
     write_plugin(&workspace.join("plugins"), "email", "email", &sentinel);
     let catalog = discover(&roots, PluginScope::All).expect("discover");
 
-    let unknown = resolve_call(&catalog, "missing.send").expect_err("unknown plugin");
+    let unknown = resolve_call(&catalog, "missing.send", true).expect_err("unknown plugin");
     assert!(unknown.to_string().contains("não encontrado"));
 
-    let undeclared = resolve_call(&catalog, "email.delete").expect_err("undeclared method");
+    let undeclared = resolve_call(&catalog, "email.delete", true).expect_err("undeclared method");
     assert!(undeclared.to_string().contains("não declarado"));
 
     for malformed in ["email", ".send", "email."] {
         assert!(
-            resolve_call(&catalog, malformed).is_err(),
+            resolve_call(&catalog, malformed, true).is_err(),
             "{malformed} must be refused"
         );
     }
+}
 
-    // Mesmo ID nos dois escopos: sem ENT-054, a chamada é recusada em vez de escolher um.
+#[test]
+fn same_id_in_both_scopes_is_refused_without_local_override_permission() {
+    let scratch = Scratch::new("override-denied");
+    let sentinel = scratch.path().join("sentinel.txt");
+    let (workspace, project, roots) = workspace_layout(&scratch);
+    write_plugin(&workspace.join("plugins"), "email", "email", &sentinel);
     write_plugin(&project.join("plugins"), "email-local", "email", &sentinel);
     let both = discover(&roots, PluginScope::All).expect("discover both scopes");
-    let ambiguous = resolve_call(&both, "email.send").expect_err("ambiguous");
-    assert!(ambiguous.to_string().contains("ENT-054"));
+
+    let refused = resolve_call(&both, "email.send", false).expect_err("override denied");
+    assert_eq!(refused.code(), "DOWAI_POLICY_DENIED");
+    assert!(refused.to_string().contains("allow_local_override"));
+    assert!(!sentinel.exists(), "refusal must not run plugin code");
+}
+
+#[test]
+fn local_override_replaces_the_global_plugin_entirely_and_records_it() {
+    let scratch = Scratch::new("override-allowed");
+    let sentinel = scratch.path().join("sentinel.txt");
+    let (workspace, project, roots) = workspace_layout(&scratch);
+    write_plugin(&workspace.join("plugins"), "email", "email", &sentinel);
+    // Local declara apenas `send`: o método `ping`, existente no global, não deve ser mesclado.
+    let local = project.join("plugins").join("email-local");
+    fs::create_dir_all(&local).expect("local dir");
+    fs::write(
+        local.join("plugin.json"),
+        r#"{
+  "schema_version": 2,
+  "id": "email",
+  "version": "2.0.0",
+  "entrypoints": { "send": "local_sender:send" },
+  "permissions": { "network": [], "filesystem": [], "secrets": [] },
+  "timeout_seconds": 30,
+  "side_effects": false,
+  "idempotency_key_required": false
+}"#,
+    )
+    .expect("local manifest");
+    let both = discover(&roots, PluginScope::All).expect("discover both scopes");
+
+    let call = resolve_call(&both, "email.send", true).expect("override applied");
+    assert_eq!(call.plugin.origin.as_str(), "project");
+    assert_eq!(call.plugin.manifest.version, "2.0.0");
+    assert_eq!(call.entrypoint, "local_sender:send");
+    let shadowed = call.shadowed.expect("global plugin recorded as replaced");
+    assert_eq!(shadowed.origin.as_str(), "global");
+    assert_eq!(shadowed.manifest.version, "1.0.0");
+
+    let not_merged = resolve_call(&both, "email.ping", true).expect_err("no method merge");
+    assert!(not_merged.to_string().contains("não declarado"));
+
+    let record = resolved_call_json(&call);
+    assert_eq!(record["plugin"]["origin"], "project");
+    assert_eq!(record["override"]["replaced_origin"], "global");
+    assert_eq!(record["override"]["replaced_version"], "1.0.0");
+    assert!(record["override"]["replaced_manifest_sha256"]
+        .as_str()
+        .is_some_and(|hash| hash.len() == 64));
+    assert!(!sentinel.exists(), "override must not run plugin code");
 }
 
 #[test]

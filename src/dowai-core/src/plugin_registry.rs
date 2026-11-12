@@ -1,4 +1,5 @@
-//! Descoberta, dispatcher único e listagem de plugins (ENT-053, plano §6.1, §9.1, AC007).
+//! Descoberta, dispatcher único e listagem de plugins (ENT-053, ENT-054, plano §6.1, §9.1, §9.2,
+//! AC006, AC007).
 //!
 //! Plugins são descobertos em `<projeto>/plugins/<id>/plugin.json` (escopo `project`) e em
 //! `<workspace>/plugins/<id>/plugin.json` (escopo `global`). A descoberta só lê manifestos
@@ -6,8 +7,8 @@
 //!
 //! Toda chamada de plugin, tipada ou genérica, DEVE ser resolvida por [`resolve_call`]. Ainda
 //! não existe execução de plugin nem API Python `env.plugins`; quando existirem, passarão por
-//! este mesmo caminho. A precedência de override local (ENT-054) não está implementada: enquanto
-//! o mesmo ID existir nos dois escopos, a resolução é recusada em vez de escolher um deles.
+//! este mesmo caminho. Override: o plugin local com o mesmo ID substitui o global inteiro, somente
+//! com `plugins.allow_local_override = true` (ENT-054).
 
 use crate::plugin_manifest::{read_manifest, PluginManifest};
 use crate::{DowaiError, Result};
@@ -197,19 +198,28 @@ fn discover_level(root: &Path, origin: PluginOrigin, catalog: &mut PluginCatalog
     Ok(())
 }
 
-/// Chamada resolvida: plugin, método e alvo `module:function` declarado no manifesto.
+/// Chamada resolvida: plugin efetivo, método, alvo `module:function` declarado no manifesto e,
+/// quando houve override, o plugin global substituído integralmente (plano §9.2).
 #[derive(Debug)]
 pub struct ResolvedCall<'a> {
     pub plugin: &'a DiscoveredPlugin,
     pub method: String,
     pub entrypoint: String,
+    /// Plugin global com o mesmo ID, substituído pelo plugin local. `None` sem override.
+    pub shadowed: Option<&'a DiscoveredPlugin>,
 }
 
 /// Dispatcher único de resolução. Aceita `namespace.method` (ex.: `email.send`).
 ///
-/// Recusa alvo malformado, plugin inexistente, método não declarado e ID presente nos dois
-/// escopos (precedência de override ainda não implementada; ENT-054).
-pub fn resolve_call<'a>(catalog: &'a PluginCatalog, target: &str) -> Result<ResolvedCall<'a>> {
+/// Recusa alvo malformado, plugin inexistente e método não declarado. Quando o mesmo ID existe
+/// no escopo `project` e no `global`, o local substitui o global **inteiro** (sem mesclar
+/// métodos) somente se `allow_local_override` for `true` (`plugins.allow_local_override`, ENT-054);
+/// caso contrário a chamada é recusada com `DOWAI_POLICY_DENIED`.
+pub fn resolve_call<'a>(
+    catalog: &'a PluginCatalog,
+    target: &str,
+    allow_local_override: bool,
+) -> Result<ResolvedCall<'a>> {
     let (namespace, method) = target
         .split_once('.')
         .filter(|(namespace, method)| !namespace.is_empty() && !method.is_empty())
@@ -220,16 +230,39 @@ pub fn resolve_call<'a>(catalog: &'a PluginCatalog, target: &str) -> Result<Reso
         })?;
 
     let candidates = find_plugins(catalog, namespace);
-    let plugin = match candidates.as_slice() {
+    let (plugin, shadowed) = match candidates.as_slice() {
         [] => {
             return Err(DowaiError::Config(format!(
                 "plugin não encontrado: {namespace}"
             )))
         }
-        [only] => *only,
+        [only] => (*only, None),
+        [_, _] => {
+            let local = candidates
+                .iter()
+                .copied()
+                .find(|plugin| plugin.origin == PluginOrigin::Project);
+            let global = candidates
+                .iter()
+                .copied()
+                .find(|plugin| plugin.origin == PluginOrigin::Global);
+            match (local, global) {
+                (Some(local), Some(global)) if allow_local_override => (local, Some(global)),
+                (Some(_), Some(_)) => {
+                    return Err(DowaiError::Policy(format!(
+                        "override local do plugin {namespace} recusado: plugins.allow_local_override = false"
+                    )))
+                }
+                _ => {
+                    return Err(DowaiError::Config(format!(
+                        "plugin {namespace} duplicado no mesmo escopo"
+                    )))
+                }
+            }
+        }
         _ => {
             return Err(DowaiError::Config(format!(
-                "plugin {namespace} existe nos escopos project e global; a precedência de override local (ENT-054) não está implementada, então a chamada foi recusada"
+                "plugin {namespace} duplicado no mesmo escopo"
             )))
         }
     };
@@ -245,6 +278,23 @@ pub fn resolve_call<'a>(catalog: &'a PluginCatalog, target: &str) -> Result<Reso
         plugin,
         method: method.to_owned(),
         entrypoint,
+        shadowed,
+    })
+}
+
+/// Registro JSON de uma resolução: plugin efetivo e, se houver, o global substituído. Inclui
+/// origem, caminho, versão e hash, para que o override fique rastreável.
+pub fn resolved_call_json(call: &ResolvedCall<'_>) -> Value {
+    json!({
+        "target": format!("{}.{}", call.plugin.manifest.id, call.method),
+        "entrypoint": call.entrypoint,
+        "plugin": plugin_json(call.plugin),
+        "override": call.shadowed.map(|shadowed| json!({
+            "replaced_origin": shadowed.origin.as_str(),
+            "replaced_manifest_path": shadowed.manifest.manifest_path.display().to_string(),
+            "replaced_version": shadowed.manifest.version,
+            "replaced_manifest_sha256": shadowed.manifest.manifest_sha256,
+        })),
     })
 }
 
