@@ -1,0 +1,10 @@
+{
+  "schema_version": 2,
+  "id": "api",
+  "version": "1.0.0",
+  "entrypoints": { "call": "client:call" },
+  "permissions": { "network": [], "filesystem": [], "secrets": [] },
+  "timeout_seconds": 30,
+  "side_effects": false,
+  "idempotency_key_required": false
+}

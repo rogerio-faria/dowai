@@ -1,0 +1,18 @@
+{
+  "schema_version": 2,
+  "id": "rest",
+  "version": "1.0.0",
+  "entrypoints": {
+    "get": "client:get",
+    "post": "client:post",
+    "get_pages": "client:get_pages"
+  },
+  "permissions": {
+    "network": ["rest_api"],
+    "filesystem": [],
+    "secrets": ["rest_token"]
+  },
+  "timeout_seconds": 120,
+  "side_effects": true,
+  "idempotency_key_required": true
+}
