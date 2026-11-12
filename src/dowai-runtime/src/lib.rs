@@ -2,9 +2,9 @@ use auditor::Auditor;
 use dowai_core::{
     admin_config_path, current_time_ms, default_run_store_path, load_project,
     load_workspace_profile, plan, read_planned_model, resolve_effective_configuration, sha256_hex,
-    source_relation_key, user_config_path, CancellationToken, DowaiError, ExecutionMode,
-    ExecutionPlan, Materialization, NewInvocation, NewRun, PlanNode, Result, RunStore,
-    SessionStore, TemplateOptions, VariableOrigin, VersionedSnapshot, WorkspaceProfile,
+    source_relation_key, user_config_path, verify_planned_model, CancellationToken, DowaiError,
+    ExecutionMode, ExecutionPlan, Materialization, NewInvocation, NewRun, PlanNode, Result,
+    RunStore, SessionStore, TemplateOptions, VariableOrigin, VersionedSnapshot, WorkspaceProfile,
 };
 use dowai_postgres::{
     quote_identifier, AdapterError, Materialization as PostgresMaterialization, PgProfile,
@@ -452,10 +452,14 @@ fn run_python_node(
 ) -> Result<BTreeMap<String, Value>> {
     let hash = model_hash(root, node);
     let mut started_id: Option<String> = None;
-    let outcome = executor.run_static(node, mode, variables, root_invocation_id, &mut |id| {
-        audit.node_started(id, &node.id, hash.clone());
-        started_id = Some(id.to_owned());
-    });
+    // ENT-024: a Python model changed after planning is refused before the interpreter starts.
+    let outcome = match verify_planned_model(root, node) {
+        Err(error) => Err(error),
+        Ok(_) => executor.run_static(node, mode, variables, root_invocation_id, &mut |id| {
+            audit.node_started(id, &node.id, hash.clone());
+            started_id = Some(id.to_owned());
+        }),
+    };
     let invocation_id = match started_id {
         Some(id) => id,
         None => {
@@ -1321,7 +1325,7 @@ fn render_sql_node(
     template_options: &TemplateOptions,
     relations: &BTreeMap<String, String>,
 ) -> Result<(PreparedNode, BTreeMap<String, Value>)> {
-    let source = read_planned_model(project_dir, &node.path)?;
+    let source = verify_planned_model(project_dir, node)?;
     let rendered = dowai_core::render_sql_model(&source, variables, template_options, relations)
         .map_err(|error| {
             if error.code() == "DOWAI_NOT_IMPLEMENTED" {

@@ -1,6 +1,6 @@
 use crate::python_ast::static_env_dependencies;
 use crate::templates::{static_sql_references, StaticSqlReference};
-use crate::{load_project, render_template, DowaiError, Result, TemplateOptions};
+use crate::{load_project, render_template, sha256_hex, DowaiError, Result, TemplateOptions};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -27,6 +27,10 @@ pub struct PlanNode {
     pub id: String,
     pub path: String,
     pub depends_on: Vec<String>,
+    /// SHA-256 do conteúdo do modelo no momento do plano (ENT-024). Fora da serialização
+    /// para não alterar snapshots nem `plan_hash`; usado para detectar alteração antes da execução.
+    #[serde(skip)]
+    pub sha256: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -42,6 +46,7 @@ struct Model {
     id: String,
     path: PathBuf,
     dependencies: BTreeSet<String>,
+    sha256: String,
 }
 
 pub fn plan(project_root: &Path, targets: &[String], mode: ExecutionMode) -> Result<ExecutionPlan> {
@@ -88,6 +93,7 @@ pub fn plan(project_root: &Path, targets: &[String], mode: ExecutionMode) -> Res
     let mut resolved = BTreeMap::new();
     for model in models_by_id.values() {
         let body = fs::read_to_string(&model.path)?;
+        let sha256 = sha256_hex(body.as_bytes());
         let dependencies = extract_dependencies(&model.id, &body)?;
         let mut ids = BTreeSet::new();
         for dependency in dependencies {
@@ -98,6 +104,7 @@ pub fn plan(project_root: &Path, targets: &[String], mode: ExecutionMode) -> Res
             model.id.clone(),
             Model {
                 dependencies: ids,
+                sha256,
                 ..model.clone()
             },
         );
@@ -128,6 +135,7 @@ pub fn plan(project_root: &Path, targets: &[String], mode: ExecutionMode) -> Res
                 id: model.id.clone(),
                 path: model.id.clone(),
                 depends_on: model.dependencies.iter().cloned().collect(),
+                sha256: model.sha256.clone(),
             }
         })
         .collect();
@@ -138,6 +146,20 @@ pub fn plan(project_root: &Path, targets: &[String], mode: ExecutionMode) -> Res
         nodes,
         warnings,
     })
+}
+
+/// Lê o modelo planejado e recusa o conteúdo se ele mudou desde `plan()` (ENT-024).
+///
+/// Retorna o conteúdo verificado. Erro estável: `DOWAI_PLAN_MODEL_CHANGED`.
+pub fn verify_planned_model(project_root: &Path, node: &PlanNode) -> Result<String> {
+    let content = read_planned_model(project_root, &node.path)?;
+    if sha256_hex(content.as_bytes()) != node.sha256 {
+        return Err(DowaiError::ModelChanged(format!(
+            "Model changed after planning and was not executed: {}",
+            node.path
+        )));
+    }
+    Ok(content)
 }
 
 /// Validate SQL templates in plan order using a private, ephemeral variable copy.
@@ -171,7 +193,7 @@ pub fn validate_plan_templates(
         {
             continue;
         }
-        let source = read_planned_model(&root, &node.path)?;
+        let source = verify_planned_model(&root, node)?;
         let rendered = render_template(&source, &ephemeral_variables, options)
             .map_err(|error| DowaiError::Template(format!("{}: {}", node.path, error.message())))?;
         ephemeral_variables = rendered.variables;
@@ -231,6 +253,7 @@ fn discover_models(models_dir: &Path) -> Result<Vec<Model>> {
                 id: path_string(relative),
                 path,
                 dependencies: BTreeSet::new(),
+                sha256: String::new(),
             })
         })
         .collect()
@@ -242,6 +265,20 @@ fn collect_model_paths(root: &Path, current: &Path, paths: &mut Vec<PathBuf>) ->
         let path = entry.path();
         let file_type = entry.file_type()?;
         if file_type.is_symlink() {
+            // ENT-024: o alvo do symlink precisa existir e permanecer dentro do diretório de modelos.
+            // Symlinks internos são ignorados aqui porque o alvo real é descoberto pelo próprio caminho.
+            let target = path.canonicalize().map_err(|error| {
+                DowaiError::Path(format!(
+                    "Model symlink cannot be resolved: {} ({error})",
+                    path.display()
+                ))
+            })?;
+            if !target.starts_with(root) {
+                return Err(DowaiError::Path(format!(
+                    "Model symlink escapes the models directory: {}",
+                    path.display()
+                )));
+            }
             continue;
         }
         if file_type.is_dir() {

@@ -31,6 +31,8 @@ pub enum DowaiError {
     LegacyConfigFormat(String),
     Path(String),
     Model(String),
+    /// Model file changed between planning and execution (ENT-024).
+    ModelChanged(String),
     Template(String),
     Cycle(String),
     Session(String),
@@ -76,6 +78,7 @@ impl DowaiError {
             Self::LegacyConfigFormat(_) => "DOWAI_CONFIG_LEGACY_YAML",
             Self::Path(_) => "DOWAI_POLICY_PATH",
             Self::Model(_) => "DOWAI_PLAN_INVALID",
+            Self::ModelChanged(_) => "DOWAI_PLAN_MODEL_CHANGED",
             Self::Template(_) => "DOWAI_TEMPLATE_INVALID",
             Self::Cycle(_) => "DOWAI_PLAN_CYCLE",
             Self::Session(_) => "DOWAI_SESSION_INVALID",
@@ -119,6 +122,7 @@ impl DowaiError {
             | Self::PythonFailure(_)
             | Self::PythonTimeout(_)
             | Self::PythonProtocol(_)
+            | Self::ModelChanged(_)
             | Self::DatasetAccess { .. } => ec::EXECUTION_FAILED,
             Self::NotImplemented(_) => ec::NOT_IMPLEMENTED,
             Self::Cancelled(_) => ec::CANCELLED,
@@ -132,6 +136,7 @@ impl DowaiError {
             | Self::LegacyConfigFormat(message)
             | Self::Path(message)
             | Self::Model(message)
+            | Self::ModelChanged(message)
             | Self::Template(message)
             | Self::Cycle(message)
             | Self::Session(message)

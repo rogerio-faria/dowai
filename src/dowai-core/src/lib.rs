@@ -19,7 +19,8 @@ pub use config::{
 };
 pub use error::{exit_codes, DowaiError, Result};
 pub use planner::{
-    plan, read_planned_model, validate_plan_templates, ExecutionMode, ExecutionPlan, PlanNode,
+    plan, read_planned_model, validate_plan_templates, verify_planned_model, ExecutionMode,
+    ExecutionPlan, PlanNode,
 };
 pub use project::{
     create_project, load_project, validate_project, validate_project_with_configuration,
