@@ -1521,6 +1521,7 @@ fn map_execution_error(error: AdapterError) -> DowaiError {
         AdapterError::QueryFailed
         | AdapterError::TransientFailure
         | AdapterError::UnsupportedRelationType
+        | AdapterError::InvalidTransactionState
         | AdapterError::MultipleStatements => DowaiError::Execution(error.to_string()),
         AdapterError::Cancelled => DowaiError::cancelled(),
         AdapterError::MissingPassword

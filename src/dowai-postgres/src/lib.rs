@@ -9,6 +9,10 @@ use postgres::types::ToSql;
 use postgres::{Client, Config, Row};
 use postgres_native_tls::MakeTlsConnector;
 
+mod adapter;
+
+pub use adapter::{Capabilities, ColumnInfo, SqlAdapter, POSTGRES_CAPABILITIES};
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TlsMode {
     #[default]
@@ -101,6 +105,8 @@ pub enum AdapterError {
     /// Transient failure (ADR 0005 R2): lost connection, lock or statement timeout, deadlock or
     /// serialization failure. The transaction was rolled back, so nothing was applied.
     TransientFailure,
+    /// `begin_transaction` with a transaction already open, or commit/rollback without one.
+    InvalidTransactionState,
 }
 
 impl AdapterError {
@@ -140,6 +146,9 @@ impl std::fmt::Display for AdapterError {
                 formatter.write_str("PostgreSQL transient failure; the operation may be retried")
             }
             Self::Cancelled => formatter.write_str("PostgreSQL operation cancelled"),
+            Self::InvalidTransactionState => {
+                formatter.write_str("invalid PostgreSQL transaction state")
+            }
         }
     }
 }
@@ -162,6 +171,8 @@ pub fn quote_identifier(identifier: &str) -> Result<String, AdapterError> {
 pub struct PostgresAdapter {
     client: Client,
     tls: MakeTlsConnector,
+    /// Set by `SqlAdapter::begin_transaction` and cleared by commit or rollback.
+    in_transaction: bool,
 }
 
 impl PostgresAdapter {
@@ -193,7 +204,11 @@ impl PostgresAdapter {
         let client = config
             .connect(tls.clone())
             .map_err(|_| AdapterError::ConnectionFailed)?;
-        Ok(Self { client, tls })
+        Ok(Self {
+            client,
+            tls,
+            in_transaction: false,
+        })
     }
 
     pub fn execute(
