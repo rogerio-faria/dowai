@@ -36,6 +36,22 @@ Estado atual, conforme `docs/CONFIGURATION.md` e `docs/ADR/0003`:
 
 Consequência: o DOWAI deve ser usado apenas com código Python confiável. Não há garantia de contenção de código malicioso.
 
+### 2.1 Sandbox de plugins: controle cooperativo (ENT-108, decisão D-092 opção 1)
+
+Decisão registrada pelo usuário: **não** há sandbox de sistema operacional para plugins nesta versão. Nenhuma ferramenta de isolamento de sistema (ex.: `bubblewrap`) é instalada ou exigida.
+
+O controle aplicado é cooperativo e limitado ao interpretador Python:
+
+- O worker de plugin (`src/dowai-runtime/src/plugin_exec.rs`) registra um hook `sys.addaudithook`, que recusa criação de processo e, conforme a permissão do plugin, rede (`plugins.allow_network`) e escrita em arquivos (`plugins.allow_filesystem`).
+- O hook **não é fronteira de segurança**. Código nativo (extensões C, `ctypes`) ou chamadas que não emitam eventos de auditoria podem contorná-lo.
+- Não há isolamento de memória, syscalls, filesystem ou rede no nível do sistema operacional para plugins.
+
+Restrição operacional (obrigatória até decisão diferente registrada em `DECISOES.md`):
+
+- Plugins só devem ser executados quando forem **código confiável**, isto é, produzido ou revisado pelo próprio operador/equipe do workspace.
+- Plugins de terceiros não confiáveis não devem ser instalados nem executados com a configuração atual.
+- Alternativas que exigem decisão específica, não adotadas: sandbox de SO no Linux (namespaces, seccomp, `bubblewrap`), sandbox de SO no Windows (job objects restritivos, AppContainer) e recusa de plugins sem sandbox.
+
 ## 3. Princípio do menor privilégio (§12.3 item 1)
 
 Estado atual:
