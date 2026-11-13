@@ -1622,6 +1622,8 @@ fn map_execution_error(error: AdapterError) -> DowaiError {
         | AdapterError::InvalidTransactionState
         | AdapterError::InvalidStreamLimit
         | AdapterError::InflightLimitExceeded
+        | AdapterError::InvalidWriteSpec(_)
+        | AdapterError::DuplicateMergeKey
         | AdapterError::MultipleStatements => DowaiError::Execution(error.to_string()),
         AdapterError::Cancelled => DowaiError::cancelled(),
         AdapterError::MissingPassword

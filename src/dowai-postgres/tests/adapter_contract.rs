@@ -63,10 +63,8 @@ fn contract_test_connection_returns_declared_capabilities() {
     assert!(returned.parameters);
     assert!(returned.row_count);
     assert!(returned.stream, "stream is implemented by ENT-031");
-    assert!(
-        !returned.merge_upsert,
-        "merge is not implemented before ENT-032"
-    );
+    assert!(returned.merge_upsert, "merge is implemented by ENT-032");
+    assert!(returned.staging, "staging is implemented by ENT-032");
 }
 
 #[test]

@@ -11,9 +11,11 @@ use postgres_native_tls::MakeTlsConnector;
 
 mod adapter;
 mod stream;
+mod write;
 
 pub use adapter::{Capabilities, ColumnInfo, SqlAdapter, POSTGRES_CAPABILITIES};
 pub use stream::{Batch, BatchStream, RowCount, StreamLimits, STREAM_BATCH_ROWS_MAX};
+pub use write::{MergeCounters, WRITE_MAX_PARAMS};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TlsMode {
@@ -149,6 +151,10 @@ pub enum AdapterError {
     InvalidStreamLimit,
     /// A batch exceeded `max_inflight_bytes`. The stream fails closed; no rows are truncated.
     InflightLimitExceeded,
+    /// Write specification rejected before any SQL runs (empty or mismatched columns/keys).
+    InvalidWriteSpec(&'static str),
+    /// The staging table holds more than one row for the same merge key in one merge.
+    DuplicateMergeKey,
 }
 
 impl AdapterError {
@@ -194,6 +200,15 @@ impl std::fmt::Display for AdapterError {
             Self::InvalidStreamLimit => formatter.write_str("invalid PostgreSQL stream limits"),
             Self::InflightLimitExceeded => {
                 formatter.write_str("PostgreSQL batch exceeds the in-flight byte limit")
+            }
+            Self::InvalidWriteSpec(reason) => {
+                write!(
+                    formatter,
+                    "invalid PostgreSQL write specification: {reason}"
+                )
+            }
+            Self::DuplicateMergeKey => {
+                formatter.write_str("PostgreSQL merge staging has duplicate keys")
             }
         }
     }

@@ -2,11 +2,12 @@
 //!
 //! Cada SGBD declara [`Capabilities`] verdadeiras. Operações ainda não implementadas por um
 //! adapter ficam com a capability `false`; o motor não deve depender delas sem checar a flag.
-//! `write_batch` e `merge` serão acrescentados por ENT-032.
+//! Escrita em staging e `merge` (ENT-032) estão em [`SqlAdapter::merge`].
 
 use postgres::types::ToSql;
 
 use crate::stream::{BatchStream, StreamLimits};
+use crate::write::MergeCounters;
 use crate::{classify_failure, quote_identifier, AdapterError, PostgresAdapter};
 
 /// Capacidades declaradas por um adapter. Todas `false` significa "não suportado".
@@ -70,6 +71,25 @@ pub trait SqlAdapter {
         params: &[&(dyn ToSql + Sync)],
         limits: StreamLimits,
     ) -> Result<BatchStream<'a>, AdapterError>;
+    /// Cria a staging temporária do destino (mesmas colunas). Exige transação aberta (ENT-032).
+    fn create_staging(&mut self, target: &str, staging: &str) -> Result<(), AdapterError>;
+    /// Insere um lote na staging, uma linha por entrada, valores na ordem de `columns`.
+    /// Exige transação aberta e devolve linhas inseridas (ENT-032).
+    fn write_staging_batch(
+        &mut self,
+        staging: &str,
+        columns: &[String],
+        rows: &[Vec<&(dyn ToSql + Sync)>],
+    ) -> Result<u64, AdapterError>;
+    /// Upsert da staging no destino pelas chaves; contagens de inseridos e atualizados.
+    /// Exige transação aberta (ENT-032).
+    fn merge(
+        &mut self,
+        staging: &str,
+        target: &str,
+        columns: &[String],
+        keys: &[String],
+    ) -> Result<MergeCounters, AdapterError>;
 }
 
 /// Capabilities reais do adapter PostgreSQL. Só declara o que os testes de contrato verificam.
@@ -77,10 +97,10 @@ pub const POSTGRES_CAPABILITIES: Capabilities = Capabilities {
     transactional_ddl: true,
     identifier_quoting: true,
     schemas: false,
-    staging: false,
+    staging: true,
     bulk_load: false,
     stream: true,
-    merge_upsert: false,
+    merge_upsert: true,
     tls: true,
     parameters: true,
     row_count: true,
@@ -155,6 +175,29 @@ impl SqlAdapter for PostgresAdapter {
     ) -> Result<BatchStream<'a>, AdapterError> {
         PostgresAdapter::stream_query(self, sql, params, limits)
     }
+
+    fn create_staging(&mut self, target: &str, staging: &str) -> Result<(), AdapterError> {
+        PostgresAdapter::create_staging(self, target, staging)
+    }
+
+    fn write_staging_batch(
+        &mut self,
+        staging: &str,
+        columns: &[String],
+        rows: &[Vec<&(dyn ToSql + Sync)>],
+    ) -> Result<u64, AdapterError> {
+        PostgresAdapter::write_staging_batch(self, staging, columns, rows)
+    }
+
+    fn merge(
+        &mut self,
+        staging: &str,
+        target: &str,
+        columns: &[String],
+        keys: &[String],
+    ) -> Result<MergeCounters, AdapterError> {
+        PostgresAdapter::merge_staging(self, staging, target, columns, keys)
+    }
 }
 
 #[cfg(test)]
@@ -171,9 +214,9 @@ mod tests {
         assert!(capabilities.tls);
         assert!(capabilities.cancellation);
         assert!(capabilities.stream);
-        // Ainda não implementadas (ENT-032 e staging/schemas fora da fatia).
-        assert!(!capabilities.merge_upsert);
-        assert!(!capabilities.staging);
+        assert!(capabilities.merge_upsert);
+        assert!(capabilities.staging);
+        // Ainda não implementadas (carga em massa e schemas fora da fatia).
         assert!(!capabilities.bulk_load);
         assert!(!capabilities.schemas);
     }
