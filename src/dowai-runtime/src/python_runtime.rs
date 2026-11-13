@@ -57,10 +57,12 @@ import contextlib
 import csv
 import datetime
 import decimal
+import importlib
 import itertools
 import json
 import os
 import pathlib
+import re
 import runpy
 import secrets
 import sys
@@ -468,6 +470,180 @@ def main():
         if isinstance(batch_size, bool) or not isinstance(batch_size, int) or not 1 <= batch_size <= 10000:
             raise ValueError("batch_size must be an integer between 1 and 10000")
 
+    # ENT-047 (B-09.3): to_arrow/to_pandas/to_polars materialize a dataset. The mapping from
+    # PostgreSQL type names (as reported by the schema) to frame types is explicit: any other
+    # type is refused with DOWAI_DATASET_TYPE_UNSUPPORTED instead of being guessed.
+    DATASET_MAX_ROWS = 1000000
+    FRAME_KINDS = {
+        "bool": "bool",
+        "int2": "int16",
+        "int4": "int32",
+        "int8": "int64",
+        "float4": "float32",
+        "float8": "float64",
+        "text": "string",
+        "varchar": "string",
+        "bpchar": "string",
+        "name": "string",
+        "numeric": "decimal",
+        "date": "date",
+        "timestamp": "timestamp",
+        "timestamptz": "timestamptz",
+    }
+    TIMESTAMP_TEXT = re.compile(
+        r"(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?"
+        r"(?:([+-])(\d{2})(?::?(\d{2}))?(?::?(\d{2}))?)?\Z"
+    )
+
+    def check_max_rows(max_rows):
+        if isinstance(max_rows, bool) or not isinstance(max_rows, int) or not 1 <= max_rows <= 10000000:
+            raise ValueError("max_rows must be an integer between 1 and 10000000")
+
+    def library(module):
+        try:
+            return importlib.import_module(module)
+        except ImportError:
+            raise ExecutionError(
+                "DOWAI_DATASET_LIBRARY_UNAVAILABLE",
+                "%s is not installed in the project virtual environment" % module,
+            )
+
+    def parse_timestamp(text, with_zone):
+        match = TIMESTAMP_TEXT.match(text)
+        if match is None or (match.group(8) is not None) != with_zone:
+            raise ExecutionError("DOWAI_DATASET_VALUE_INVALID", "timestamp text is not in the expected form")
+        try:
+            moment = datetime.datetime(
+                *(int(match.group(index)) for index in range(1, 7)),
+                int((match.group(7) or "0").ljust(6, "0")),
+            )
+        except ValueError:
+            raise ExecutionError("DOWAI_DATASET_VALUE_INVALID", "timestamp value is out of range")
+        if not with_zone:
+            return moment
+        offset = datetime.timedelta(
+            hours=int(match.group(9)),
+            minutes=int(match.group(10) or 0),
+            seconds=int(match.group(11) or 0),
+        )
+        if match.group(8) == "-":
+            offset = -offset
+        # Stored as UTC: the offset in the text is applied, never the host's local zone.
+        return (moment - offset).replace(tzinfo=datetime.timezone.utc)
+
+    def frame_value(value, kind):
+        if value is None:
+            return None
+        invalid = ExecutionError("DOWAI_DATASET_VALUE_INVALID", "value does not match its declared type")
+        if kind == "bool":
+            if not isinstance(value, bool):
+                raise invalid
+            return value
+        if kind in ("int16", "int32", "int64"):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise invalid
+            return value
+        if kind in ("float32", "float64"):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise invalid
+            return float(value)
+        if kind == "string":
+            if not isinstance(value, str):
+                raise invalid
+            return value
+        if kind == "decimal":
+            if not isinstance(value, str):
+                raise invalid
+            try:
+                number = decimal.Decimal(value)
+            except decimal.InvalidOperation:
+                raise invalid
+            if not number.is_finite():
+                raise ExecutionError("DOWAI_DATASET_VALUE_INVALID", "NaN and infinity have no frame mapping")
+            return number
+        if kind == "date":
+            try:
+                return datetime.date.fromisoformat(value)
+            except (TypeError, ValueError):
+                raise invalid
+        if kind in ("timestamp", "timestamptz"):
+            if not isinstance(value, str):
+                raise invalid
+            return parse_timestamp(value, kind == "timestamptz")
+        raise invalid
+
+    def decimal_shape(values):
+        # Scale keeps the digits PostgreSQL returned (1.50 keeps scale 2); precision covers all values.
+        scale = 0
+        integer_digits = 0
+        for value in values:
+            if value is None:
+                continue
+            parts = value.as_tuple()
+            scale = max(scale, -parts.exponent)
+            integer_digits = max(integer_digits, len(parts.digits) + parts.exponent)
+        precision = max(integer_digits + scale, 1)
+        if precision > 38:
+            raise ExecutionError("DOWAI_DATASET_TYPE_UNSUPPORTED", "numeric values exceed decimal(38) precision")
+        return precision, scale
+
+    def quantized(values, scale):
+        quantum = decimal.Decimal(1).scaleb(-scale)
+        context = decimal.Context(prec=100)
+        return [None if value is None else value.quantize(quantum, context=context) for value in values]
+
+    def arrow_array(pa, kind, values):
+        if kind == "decimal":
+            precision, scale = decimal_shape(values)
+            return pa.array(quantized(values, scale), type=pa.decimal128(precision, scale))
+        types = {
+            "bool": pa.bool_(),
+            "int16": pa.int16(),
+            "int32": pa.int32(),
+            "int64": pa.int64(),
+            "float32": pa.float32(),
+            "float64": pa.float64(),
+            "string": pa.string(),
+            "date": pa.date32(),
+            "timestamp": pa.timestamp("us"),
+            "timestamptz": pa.timestamp("us", tz="UTC"),
+        }
+        return pa.array(values, type=types[kind])
+
+    def polars_series(pl, name, kind, values):
+        if kind == "decimal":
+            precision, scale = decimal_shape(values)
+            return pl.Series(name, quantized(values, scale), dtype=pl.Decimal(precision, scale))
+        types = {
+            "bool": pl.Boolean,
+            "int16": pl.Int16,
+            "int32": pl.Int32,
+            "int64": pl.Int64,
+            "float32": pl.Float32,
+            "float64": pl.Float64,
+            "string": pl.String,
+            "date": pl.Date,
+            "timestamp": pl.Datetime("us"),
+            "timestamptz": pl.Datetime("us", "UTC"),
+        }
+        return pl.Series(name, values, dtype=types[kind])
+
+    def pandas_series(pd, name, kind, values):
+        types = {
+            "decimal": object,
+            "date": object,
+            "bool": "boolean",
+            "int16": "Int16",
+            "int32": "Int32",
+            "int64": "Int64",
+            "float32": "Float32",
+            "float64": "Float64",
+            "string": "string",
+            "timestamp": "datetime64[us]",
+            "timestamptz": pd.DatetimeTZDtype(unit="us", tz="UTC"),
+        }
+        return pd.Series(values, name=name, dtype=types[kind])
+
     def matches(value, predicate):
         # SQL semantics: NULL never equals and never differs (ENT-041).
         if value is None:
@@ -583,6 +759,62 @@ def main():
 
         def iter_rows(self, batch_size=1000):
             return (row for batch in self.iter_batches(batch_size) for row in batch)
+
+        def _frame_columns(self):
+            schema = {column["name"]: column["type"] for column in self.schema()}
+            names = list(schema) if self._select is None else list(self._select)
+            columns = []
+            for name in names:
+                if name not in schema:
+                    raise ExecutionError("DOWAI_DATASET_COLUMN_UNKNOWN", "column is not in the dataset schema")
+                kind = FRAME_KINDS.get(schema[name])
+                if kind is None:
+                    raise ExecutionError(
+                        "DOWAI_DATASET_TYPE_UNSUPPORTED",
+                        "column type has no explicit frame mapping; select other columns",
+                    )
+                columns.append((name, kind))
+            return columns
+
+        def _materialize(self, max_rows):
+            check_max_rows(max_rows)
+            columns = self._frame_columns()
+            values = {name: [] for name, _ in columns}
+            total = 0
+            for batch in self._iterate_batches(1000):
+                for row in batch:
+                    total += 1
+                    if total > max_rows:
+                        raise ExecutionError(
+                            "DOWAI_DATASET_TOO_LARGE",
+                            "dataset exceeds max_rows; filter or select fewer rows",
+                        )
+                    for name, kind in columns:
+                        values[name].append(frame_value(row[name], kind))
+            return columns, values
+
+        def to_arrow(self, max_rows=DATASET_MAX_ROWS):
+            """Materialize as a pyarrow.Table (ENT-047). Memory: bounded by max_rows."""
+            pa = library("pyarrow")
+            columns, values = self._materialize(max_rows)
+            arrays = [arrow_array(pa, kind, values[name]) for name, kind in columns]
+            return pa.Table.from_arrays(arrays, names=[name for name, _ in columns])
+
+        def to_pandas(self, max_rows=DATASET_MAX_ROWS):
+            """Materialize as a pandas.DataFrame with nullable dtypes (ENT-047)."""
+            pd = library("pandas")
+            columns, values = self._materialize(max_rows)
+            return pd.DataFrame(
+                {name: pandas_series(pd, name, kind, values[name]) for name, kind in columns}
+            )
+
+        def to_polars(self, max_rows=DATASET_MAX_ROWS):
+            """Materialize as a polars.DataFrame (ENT-047)."""
+            pl = library("polars")
+            columns, values = self._materialize(max_rows)
+            return pl.DataFrame(
+                [polars_series(pl, name, kind, values[name]) for name, kind in columns]
+            )
 
         def _iterate_batches(self, batch_size):
             offset = 0

@@ -1,0 +1,4 @@
+# Gerado por scripts/python-env.sh a partir de dowai_project.json. Não editar.
+pandas==2.2.3
+polars==1.33.1
+pyarrow==21.0.0

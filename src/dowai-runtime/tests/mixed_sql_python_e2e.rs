@@ -215,6 +215,32 @@ impl Fixture {
     }
 }
 
+impl Fixture {
+    /// Replaces the fixture's venv with a copy of the locked venv of ENT-047 (pandas, polars,
+    /// pyarrow). The runtime only accepts an interpreter inside the project directory, so the
+    /// copy must live in `.venv` of the fixture; `cp -a` keeps the venv's symlinks.
+    fn use_dataframe_venv(&self) {
+        let source = std::env::var("DOWAI_TEST_DATAFRAME_VENV")
+            .expect("DOWAI_TEST_DATAFRAME_VENV is required (locked venv of tests/contracts/python-dataframes)");
+        let venv = self.project.join(".venv");
+        fs::remove_dir_all(&venv).expect("remove bare venv");
+        let copied = Command::new("cp")
+            .arg("-a")
+            .arg(&source)
+            .arg(&venv)
+            .output()
+            .expect("copy locked venv");
+        assert!(copied.status.success(), "copy of the locked venv failed");
+        let interpreter = venv.join("bin").join("python");
+        let path = self.project.join("dowai_project.json");
+        let mut manifest: Value = serde_json::from_slice(&fs::read(&path).expect("read manifest"))
+            .expect("manifest is JSON");
+        manifest["python"]["interpreter"] = json!(interpreter);
+        fs::write(&path, serde_json::to_vec(&manifest).expect("serialize"))
+            .expect("write manifest");
+    }
+}
+
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
@@ -849,4 +875,142 @@ fn ent042_declared_source_is_read_and_undeclared_source_is_refused() {
         json!("DOWAI_DATASET_SOURCE_UNDECLARED")
     );
     assert_eq!(variables["empty_name_refused"], json!(true));
+}
+
+const FRAME_SOURCE_SQL: &str = "select 1::int4 as id, 'ação ✓'::text as label, true as flag, 9007199254740993::int8 as big, 0.1::float4 as f4, 0.1::float8 as f8, 1.50::numeric as amount, '2026-11-13 10:00:00'::timestamp as created, '2026-11-13 10:00:00+05:30'::timestamptz as created_tz, '2026-11-13'::date as day union all select 2, null, null, null, null, null, null, null, null, null";
+
+const FRAME_MODEL: &str = r#"import datetime
+import decimal
+import struct
+
+import pandas as pd
+import polars as pl
+
+
+def model(env):
+    env.depends_on('SOURCE')
+    ds = env.ref('SOURCE')
+
+    def expect(condition, label):
+        if not condition:
+            raise RuntimeError('frame check failed: ' + label)
+
+    arrow = ds.to_arrow()
+    expect([str(field.type) for field in arrow.schema] == [
+        'int32', 'string', 'bool', 'int64', 'float', 'double', 'decimal128(3, 2)',
+        'timestamp[us]', 'timestamp[us, tz=UTC]', 'date32[day]'], 'arrow types')
+    first, second = arrow.to_pylist()
+    expect(first['label'] == 'ação ✓', 'utf-8 text')
+    expect(first['big'] == 9007199254740993, 'int8 is exact')
+    expect(first['f4'] == struct.unpack('f', struct.pack('f', 0.1))[0], 'float4 is the nearest float32')
+    expect(first['f8'] == 0.1, 'float8 is exact')
+    expect(first['amount'] == decimal.Decimal('1.50'), 'numeric keeps scale')
+    expect(first['created'] == datetime.datetime(2026, 11, 13, 10, 0), 'timestamp without zone')
+    expect(first['created_tz'] == datetime.datetime(2026, 11, 13, 4, 30, tzinfo=datetime.timezone.utc), 'timestamptz to UTC')
+    expect(first['day'] == datetime.date(2026, 11, 13), 'date')
+    expect(second['id'] == 2 and all(value is None for key, value in second.items() if key != 'id'), 'nulls')
+
+    pdf = ds.to_pandas()
+    expect([str(dtype) for dtype in pdf.dtypes] == [
+        'Int32', 'string', 'boolean', 'Int64', 'Float32', 'Float64', 'object',
+        'datetime64[us]', 'datetime64[us, UTC]', 'object'], 'pandas dtypes')
+    expect(pdf.loc[0, 'label'] == 'ação ✓', 'pandas utf-8')
+    expect(pdf.loc[0, 'amount'] == decimal.Decimal('1.50'), 'pandas numeric')
+    expect(pd.isna(pdf.loc[1, 'amount']) and pd.isna(pdf.loc[1, 'created_tz']), 'pandas nulls')
+
+    polars = ds.to_polars()
+    expect(polars.schema['amount'] == pl.Decimal(3, 2), 'polars decimal')
+    expect(polars.schema['created_tz'] == pl.Datetime('us', 'UTC'), 'polars timestamptz')
+    expect(polars.schema['created'] == pl.Datetime('us'), 'polars timestamp')
+    expect(polars['created_tz'][0] == datetime.datetime(2026, 11, 13, 4, 30, tzinfo=datetime.timezone.utc), 'polars UTC value')
+    expect(polars['f4'][0] == struct.unpack('f', struct.pack('f', 0.1))[0], 'polars float4')
+    expect(polars['label'][0] == 'ação ✓', 'polars utf-8')
+    env.setVar('frames_ok', True)
+    return None
+"#;
+
+/// ENT-047: `to_arrow`, `to_pandas` and `to_polars` keep nulls, UTF-8 text, exact integers and
+/// numerics, float4 rounding, and timestamptz converted to UTC, with explicit frame types.
+#[test]
+#[ignore = "opt-in E2E; requires PostgreSQL and DOWAI_TEST_DATAFRAME_PYTHON"]
+fn ent047_frames_map_types_explicitly() {
+    let fx = Fixture::new("ent047-frames");
+    fx.use_dataframe_venv();
+    let (sql, py) = (fx.name("upstream"), fx.name("frames"));
+    fx.write_model(&format!("{sql}.sql"), FRAME_SOURCE_SQL);
+    fx.write_model(&format!("{py}.py"), &FRAME_MODEL.replace("SOURCE", &sql));
+
+    let result = fx
+        .run(&[&format!("{py}.py")], None, None)
+        .expect("mixed run");
+
+    assert_eq!(result.status, "SUCCEEDED");
+    assert_eq!(fx.variables(&result.session_id)["frames_ok"], json!(true));
+}
+
+/// ENT-047: a missing frame library is refused with a stable code, and a missing type mapping
+/// is refused without guessing, while `max_rows` bounds materialization.
+#[test]
+#[ignore = "opt-in E2E; requires PostgreSQL and DOWAI_TEST_DATAFRAME_PYTHON"]
+fn ent047_refusals_have_stable_codes_and_max_rows_bounds_memory() {
+    let fx = Fixture::new("ent047-refusals");
+    fx.use_dataframe_venv();
+    let (sql, py) = (fx.name("upstream"), fx.name("refusals"));
+    fx.write_model(
+        &format!("{sql}.sql"),
+        "select 1::int4 as id, '{\"a\": 1}'::json as doc union all select 2, null",
+    );
+    fx.write_model(
+        &format!("{py}.py"),
+        &format!(
+            "def model(env):\n    env.depends_on('{sql}')\n    ds = env.ref('{sql}')\n    env.setVar('at_limit', ds.select('id').to_arrow(max_rows=2).num_rows)\n    try:\n        ds.select('id').to_arrow(max_rows=1)\n    except Exception as error:\n        env.setVar('too_large_code', error.code)\n    try:\n        ds.to_polars(max_rows=0)\n    except ValueError:\n        env.setVar('bad_max_rows', True)\n    try:\n        ds.to_pandas()\n    except Exception as error:\n        env.setVar('json_code', error.code)\n    env.setVar('selected_rows', ds.select('id').to_pandas().shape[0])\n    return None\n"
+        ),
+    );
+
+    let result = fx
+        .run(&[&format!("{py}.py")], None, None)
+        .expect("mixed run");
+
+    assert_eq!(result.status, "SUCCEEDED");
+    let variables = fx.variables(&result.session_id);
+    assert_eq!(variables["at_limit"], json!(2));
+    assert_eq!(
+        variables["too_large_code"],
+        json!("DOWAI_DATASET_TOO_LARGE")
+    );
+    assert_eq!(variables["bad_max_rows"], json!(true));
+    assert_eq!(
+        variables["json_code"],
+        json!("DOWAI_DATASET_TYPE_UNSUPPORTED")
+    );
+    assert_eq!(variables["selected_rows"], json!(2));
+}
+
+/// ENT-047: without the frame libraries in the project venv, each `to_*` fails with a stable code.
+#[test]
+#[ignore = "opt-in E2E; requires a dedicated disposable PostgreSQL database"]
+fn ent047_missing_frame_library_is_refused_with_stable_code() {
+    let fx = Fixture::new("ent047-missing");
+    let (sql, py) = (fx.name("upstream"), fx.name("missing"));
+    fx.write_model(&format!("{sql}.sql"), "select 1::int4 as id");
+    fx.write_model(
+        &format!("{py}.py"),
+        &format!(
+            "def model(env):\n    env.depends_on('{sql}')\n    ds = env.ref('{sql}')\n    for name in ('to_arrow', 'to_pandas', 'to_polars'):\n        try:\n            getattr(ds, name)()\n        except Exception as error:\n            env.setVar(name, error.code)\n    return None\n"
+        ),
+    );
+
+    let result = fx
+        .run(&[&format!("{py}.py")], None, None)
+        .expect("mixed run");
+
+    assert_eq!(result.status, "SUCCEEDED");
+    let variables = fx.variables(&result.session_id);
+    for name in ["to_arrow", "to_pandas", "to_polars"] {
+        assert_eq!(
+            variables[name],
+            json!("DOWAI_DATASET_LIBRARY_UNAVAILABLE"),
+            "{name} must refuse with a stable code"
+        );
+    }
 }

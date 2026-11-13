@@ -1,0 +1,8 @@
+{
+  "schema_version": 2,
+  "name": "python-dataframes-fixture",
+  "python": {
+    "interpreter": "/usr/bin/python3",
+    "dependencies": ["pandas==2.2.3", "polars==1.33.1", "pyarrow==21.0.0"]
+  }
+}
