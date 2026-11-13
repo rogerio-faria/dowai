@@ -327,6 +327,21 @@ impl MysqlAdapter {
             .map(|()| MYSQL_CAPABILITIES)
     }
 
+    /// Colunas da chave primária de `table`, na ordem da chave (vazio se não houver).
+    pub fn primary_key(&mut self, table: &str) -> Result<Vec<String>, MysqlError> {
+        quote_identifier(table)?;
+        let rows: Vec<String> = self
+            .conn
+            .exec(
+                "SELECT CAST(column_name AS CHAR) FROM information_schema.key_column_usage \
+                 WHERE table_schema = DATABASE() AND table_name = ? \
+                 AND constraint_name = 'PRIMARY' ORDER BY ordinal_position",
+                (table,),
+            )
+            .map_err(classify)?;
+        Ok(rows)
+    }
+
     /// Colunas e tipos de `table` no banco corrente (identificador simples, sem schema).
     pub fn introspect_table(&mut self, table: &str) -> Result<Vec<ColumnInfo>, MysqlError> {
         quote_identifier(table)?;

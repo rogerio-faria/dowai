@@ -113,11 +113,18 @@ names; schema and relation names are quoted as PostgreSQL identifiers:
 
 `{{ source('warehouse', 'orders') }}` resolves to
 `"landing zone"."order facts"` on the selected PostgreSQL connection. Sources
-are external inputs, not executable plan nodes, and currently use the same
-connection profile selected for model execution. Undeclared sources, dynamic
-arguments, and unsupported adapters fail explicitly. Other profile types,
-profile layering, and live database verification are not implemented. Full refresh
-is implemented only for PostgreSQL (staging and swap, `--yes` required).
+are external inputs, not executable plan nodes. By default a source uses the
+PostgreSQL connection selected for model execution. A source may declare an
+optional `"profile"` naming a `mysql` profile (ENT-116, D-121): then `schema`
+must equal that profile's database, `tables` maps to MySQL tables, and
+`env.source(name, table)` reads them (`schema()`, `iter_rows`, `select`). Such a
+table needs a primary key (batches are read in key order), and `filter` on it
+returns `DOWAI_DATASET_FILTER_UNSUPPORTED`. A MySQL source does not take part in
+`env.ref`, SQL models, or the PostgreSQL profile policy beyond the named profile
+and `allowed_profiles`/`allowed_hosts`. Undeclared sources, dynamic arguments,
+and unsupported adapters fail explicitly. Profile layering and live database
+verification are not implemented. Full refresh is implemented only for PostgreSQL
+(staging and swap, `--yes` required).
 
 Python-only model execution is configured separately from database profiles:
 

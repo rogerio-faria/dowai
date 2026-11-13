@@ -21,6 +21,7 @@ use dowai_core::{
     validate_project_with_configuration, CancellationToken, DowaiError, ExecutionMode, PlanNode,
     Result, SessionStore,
 };
+use dowai_mysql::{quote_identifier as mysql_quote, MysqlAdapter, MysqlProfile};
 use dowai_postgres::{DatasetCell, PgProfile, PostgresAdapter};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -79,6 +80,19 @@ pub(crate) struct DatasetSource {
     rows_served: u64,
     /// Fallback warnings (ENT-041), each recorded once per run.
     warnings: Vec<String>,
+    /// `mysql` profiles of declared sources (ENT-116), resolved by name. An `Err` is reported on
+    /// the first read of a source that uses it.
+    mysql_profiles: BTreeMap<String, std::result::Result<MysqlProfile, &'static str>>,
+    /// Declared sources read from a MySQL profile: `(source, table)` to `(profile, table)`.
+    mysql_sources: BTreeMap<(String, String), (String, String)>,
+    mysql_adapters: BTreeMap<String, MysqlAdapter>,
+}
+
+/// MySQL side of the declared sources of a run (ENT-116).
+#[derive(Default)]
+pub(crate) struct MysqlSources {
+    pub profiles: BTreeMap<String, std::result::Result<MysqlProfile, &'static str>>,
+    pub sources: BTreeMap<(String, String), (String, String)>,
 }
 
 impl DatasetSource {
@@ -98,7 +112,135 @@ impl DatasetSource {
             requests: 0,
             rows_served: 0,
             warnings: Vec::new(),
+            mysql_profiles: BTreeMap::new(),
+            mysql_sources: BTreeMap::new(),
+            mysql_adapters: BTreeMap::new(),
         }
+    }
+
+    /// Adds the declared sources that read from MySQL profiles (ENT-116).
+    pub(crate) fn with_mysql(mut self, mysql: MysqlSources) -> Self {
+        self.mysql_profiles = mysql.profiles;
+        self.mysql_sources = mysql.sources;
+        self
+    }
+
+    /// The MySQL `(profile, table)` of a declared source, when the source reads from MySQL.
+    fn mysql_source(&self, target: &DatasetRef) -> Option<(String, String)> {
+        match target {
+            DatasetRef::Source { source, table } => self
+                .mysql_sources
+                .get(&(source.clone(), table.clone()))
+                .cloned(),
+            DatasetRef::Model(_) => None,
+        }
+    }
+
+    /// MySQL adapter of a profile, connected on first use and kept for the run.
+    fn mysql_adapter(&mut self, profile: &str) -> Result<&mut MysqlAdapter> {
+        if !self.mysql_adapters.contains_key(profile) {
+            let resolved = self.mysql_profiles.get(profile).ok_or_else(|| {
+                dataset_error(
+                    DATASET_UNAVAILABLE,
+                    "Dataset source profile is not available",
+                )
+            })?;
+            let adapter_profile = resolved
+                .as_ref()
+                .map_err(|reason| dataset_error(DATASET_UNAVAILABLE, reason))?;
+            let adapter = MysqlAdapter::connect(adapter_profile).map_err(|_| {
+                dataset_error(DATASET_UNAVAILABLE, "Dataset source connection failed")
+            })?;
+            self.mysql_adapters.insert(profile.to_owned(), adapter);
+        }
+        self.mysql_adapters
+            .get_mut(profile)
+            .ok_or_else(|| dataset_error(DATASET_UNAVAILABLE, "Dataset source connection failed"))
+    }
+
+    /// Columns of a MySQL table, described once per run.
+    fn mysql_columns(&mut self, profile: &str, table: &str) -> Result<Vec<(String, String)>> {
+        let key = format!("mysql:{profile}.{table}");
+        if let Some(columns) = self.columns.get(&key) {
+            return Ok(columns.clone());
+        }
+        let columns: Vec<(String, String)> = self
+            .mysql_adapter(profile)?
+            .introspect_table(table)
+            .map_err(|_| dataset_error(DATASET_UNAVAILABLE, "Dataset could not be described"))?
+            .into_iter()
+            .map(|column| (column.name, column.data_type))
+            .collect();
+        self.columns.insert(key, columns.clone());
+        Ok(columns)
+    }
+
+    /// One window of a MySQL source, in primary-key order. Filters are not pushed down or
+    /// applied by the host yet: a request with filters is refused (ENT-116 limitation).
+    fn mysql_rows(
+        &mut self,
+        profile: &str,
+        table: &str,
+        select: Option<&[String]>,
+        filters: &[FilterRequest],
+        offset: u64,
+        limit: u32,
+    ) -> Result<DatasetAnswer> {
+        if !filters.is_empty() {
+            return Err(dataset_error(
+                dataset_query::DATASET_FILTER_UNSUPPORTED,
+                "Filters are not supported for MySQL sources",
+            ));
+        }
+        let all_columns = self.mysql_columns(profile, table)?;
+        let plan = dataset_query::plan(&all_columns, select, &[])?;
+        let key_columns = self
+            .mysql_adapter(profile)?
+            .primary_key(table)
+            .map_err(|_| dataset_error(DATASET_UNAVAILABLE, "Dataset rows could not be read"))?;
+        if key_columns.is_empty() {
+            return Err(dataset_error(
+                DATASET_UNAVAILABLE,
+                "MySQL source table needs a primary key for ordered batches",
+            ));
+        }
+        let quote = |name: &str| {
+            mysql_quote(name)
+                .map_err(|_| dataset_error(DATASET_UNAVAILABLE, "Dataset identifier is invalid"))
+        };
+        let selected = plan
+            .fetch
+            .iter()
+            .map(|(name, _)| quote(name))
+            .collect::<Result<Vec<_>>>()?
+            .join(", ");
+        let keys = key_columns
+            .iter()
+            .map(|name| quote(name))
+            .collect::<Result<Vec<_>>>()?
+            .join(", ");
+        let sql = format!(
+            "SELECT {selected} FROM {} ORDER BY {keys} LIMIT ? OFFSET ?",
+            quote(table)?
+        );
+        let params = [
+            dowai_mysql::Value::UInt(u64::from(limit)),
+            dowai_mysql::Value::UInt(offset),
+        ];
+        let rows = self
+            .mysql_adapter(profile)?
+            .query_rows(&sql, &params)
+            .map_err(|_| dataset_error(DATASET_UNAVAILABLE, "Dataset rows could not be read"))?;
+        self.rows_served += rows.len() as u64;
+        let rows = rows
+            .into_iter()
+            .map(|row| row.into_iter().map(cell_to_json).collect())
+            .collect();
+        Ok(DatasetAnswer::Rows {
+            columns: plan.fetch.into_iter().map(|(name, _)| name).collect(),
+            rows,
+            residual: plan.residual,
+        })
     }
 
     /// Warnings raised by dataset reads of the run, drained once when the run finishes.
@@ -184,6 +326,15 @@ impl DatasetSource {
     }
 
     fn schema(&mut self, target: &DatasetRef, depends_on: &[String]) -> Result<DatasetAnswer> {
+        if let Some((profile, table)) = self.mysql_source(target) {
+            let columns = self.mysql_columns(&profile, &table)?;
+            return Ok(DatasetAnswer::Columns(
+                columns
+                    .into_iter()
+                    .map(|(name, data_type)| DatasetColumn { name, data_type })
+                    .collect(),
+            ));
+        }
         let relation = self.authorize(target, depends_on)?;
         let columns = self.columns(&relation)?;
         Ok(DatasetAnswer::Columns(
@@ -223,6 +374,9 @@ impl DatasetSource {
                 DATASET_LIMIT,
                 "Dataset row limit reached for this run",
             ));
+        }
+        if let Some((profile, table)) = self.mysql_source(target) {
+            return self.mysql_rows(&profile, &table, select, filters, offset, limit);
         }
         let relation = self.authorize(target, depends_on)?;
         let all_columns = self.columns(&relation)?;

@@ -7,6 +7,7 @@ use dowai_core::{
     NewInvocation, NewRun, PlanNode, Result, RunStart, RunStore, SessionStore, TemplateOptions,
     VariableOrigin, VersionedSnapshot, WorkspaceProfile,
 };
+use dowai_mysql::MysqlProfile;
 use dowai_postgres::{
     quote_identifier, AdapterError, Materialization as PostgresMaterialization, PgProfile,
     PostgresAdapter, TlsMode,
@@ -855,12 +856,15 @@ fn execute_run(
         let dataset_profile = resolve_profile(&root, &configuration, None)
             .and_then(|(_, workspace_profile)| postgres_profile(workspace_profile, &configuration))
             .map_err(|_| "No PostgreSQL profile is available for datasets");
-        executor.datasets = Some(executor::DatasetSource::new(
-            dataset_profile,
-            build_relations(&root, &execution_plan)?,
-            BTreeSet::new(),
-            declared_source_relations(&root)?,
-        ));
+        executor.datasets = Some(
+            executor::DatasetSource::new(
+                dataset_profile,
+                build_relations(&root, &execution_plan)?,
+                BTreeSet::new(),
+                declared_source_relations(&root)?,
+            )
+            .with_mysql(declared_mysql_sources(&root, &configuration)?),
+        );
         let mut completed_nodes = Vec::with_capacity(execution_plan.nodes.len());
         for (index, node) in execution_plan.nodes.iter().enumerate() {
             if let Err(error) = cancel.check() {
@@ -972,12 +976,15 @@ fn execute_run(
             .filter(|node| !is_python_path(&node.path))
             .filter_map(|node| relations.get(&node.id.replace('\\', "/")).cloned())
             .collect();
-        executor.datasets = Some(executor::DatasetSource::new(
-            Ok(postgres_profile(profile.clone(), &configuration)?),
-            relations.clone(),
-            sql_relations,
-            declared_source_relations(&root)?,
-        ));
+        executor.datasets = Some(
+            executor::DatasetSource::new(
+                Ok(postgres_profile(profile.clone(), &configuration)?),
+                relations.clone(),
+                sql_relations,
+                declared_source_relations(&root)?,
+            )
+            .with_mysql(declared_mysql_sources(&root, &configuration)?),
+        );
         let pg_profile = postgres_profile(profile, &configuration)?;
         // Connected before the first node, as before ENT-114; nested SQL calls reuse it.
         let adapter = PostgresAdapter::connect(&pg_profile)
@@ -1366,9 +1373,77 @@ pub fn check_postgres_connection(
 
 /// Quoted relations of the tables declared by the project's sources (ENT-042), keyed by
 /// `(source, table)`. Only these pairs are reachable through `env.source`.
+/// Declared sources that read from a MySQL profile (ENT-116, D-121). Each profile is resolved
+/// and checked by the same policy as the run's profile. A failure is kept and reported on the
+/// first read of a source that uses that profile, so an unrelated run is not blocked.
+fn declared_mysql_sources(
+    project_dir: &Path,
+    configuration: &Value,
+) -> Result<executor::MysqlSources> {
+    let mut mysql = executor::MysqlSources::default();
+    for (source_name, source) in load_project(project_dir)?.sources {
+        let Some(profile_name) = source.profile.clone() else {
+            continue;
+        };
+        for (table_name, relation_name) in &source.tables {
+            mysql.sources.insert(
+                (source_name.clone(), table_name.clone()),
+                (profile_name.clone(), relation_name.clone()),
+            );
+        }
+        if mysql.profiles.contains_key(&profile_name) {
+            continue;
+        }
+        let resolved = resolve_profile(project_dir, configuration, Some(&profile_name))
+            .and_then(|(_, profile)| {
+                if profile.profile_type != "mysql" {
+                    return Err(DowaiError::Config(
+                        "Source profile is not a MySQL profile".to_owned(),
+                    ));
+                }
+                if profile.database != source.schema {
+                    return Err(DowaiError::Config(
+                        "MySQL source schema must match the profile database".to_owned(),
+                    ));
+                }
+                mysql_profile(profile, configuration)
+            })
+            .map_err(|_| "No usable MySQL profile is available for this source");
+        mysql.profiles.insert(profile_name, resolved);
+    }
+    Ok(mysql)
+}
+
+/// Builds the MySQL adapter profile with the effective `database` timeouts (ENT-116). The
+/// password is never copied: only the name of its environment variable.
+fn mysql_profile(profile: WorkspaceProfile, configuration: &Value) -> Result<MysqlProfile> {
+    let database = &configuration["effective"]["database"];
+    let mut adapter_profile = MysqlProfile::new(
+        profile.host,
+        profile.port,
+        profile.user,
+        profile.database,
+        profile.password_env,
+    );
+    if profile.tls == dowai_core::ProfileTlsMode::Disabled {
+        adapter_profile.set_tls_mode(TlsMode::Disabled);
+    }
+    if let Some(seconds) = database["connect_timeout_seconds"].as_u64() {
+        adapter_profile.set_connect_timeout(Duration::from_secs(seconds));
+    }
+    if let Some(seconds) = database["query_timeout_seconds"].as_u64() {
+        adapter_profile.set_query_timeout(Some(Duration::from_secs(seconds)));
+    }
+    Ok(adapter_profile)
+}
+
 fn declared_source_relations(project_dir: &Path) -> Result<BTreeMap<(String, String), String>> {
     let mut relations = BTreeMap::new();
     for (source_name, source) in load_project(project_dir)?.sources {
+        // Sources with their own profile are read by `declared_mysql_sources` (ENT-116).
+        if source.profile.is_some() {
+            continue;
+        }
         let schema = quote_identifier(&source.schema)
             .map_err(|error| DowaiError::Model(error.to_string()))?;
         for (table_name, relation_name) in source.tables {

@@ -58,6 +58,11 @@ fn default_python_package_policy() -> String {
 pub struct ProjectSource {
     pub schema: String,
     pub tables: BTreeMap<String, String>,
+    /// Optional connection profile of the source (ENT-116, D-121). Absent = the PostgreSQL
+    /// profile of the run. A `mysql` profile reads the tables of its database; then `schema`
+    /// must equal that database name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 fn default_models_dir() -> PathBuf {
@@ -214,6 +219,9 @@ fn validate_project_sources(sources: &BTreeMap<String, ProjectSource>) -> Result
     for (source_name, source) in sources {
         validate_source_name(source_name, "source")?;
         validate_relation_name(&source.schema, "source schema")?;
+        if let Some(profile) = &source.profile {
+            validate_source_name(profile, "source profile")?;
+        }
         for (table_name, relation_name) in &source.tables {
             validate_source_name(table_name, "source table name")?;
             validate_relation_name(relation_name, "source table relation")?;
