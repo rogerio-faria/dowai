@@ -865,36 +865,30 @@ fn execute_run(
             )
             .with_mysql(declared_mysql_sources(&root, &configuration)?),
         );
-        let mut completed_nodes = Vec::with_capacity(execution_plan.nodes.len());
-        for (index, node) in execution_plan.nodes.iter().enumerate() {
-            if let Err(error) = cancel.check() {
-                trace.python = executor.invocations;
-                trace.skip(&execution_plan.nodes[index..], mode);
+        let completed_nodes = match run_nodes_sequentially(
+            trace,
+            &execution_plan.nodes,
+            mode,
+            cancel,
+            |trace, node| {
+                variables = run_python_node(
+                    &mut executor,
+                    &mut trace.audit,
+                    &root,
+                    node,
+                    mode,
+                    std::mem::take(&mut variables),
+                    &run_invocation_id,
+                )?;
+                Ok(python_node_result(node))
+            },
+        ) {
+            Ok(completed) => completed,
+            Err(error) => {
+                trace.python = std::mem::take(&mut executor.invocations);
                 return Err(error);
             }
-            match run_python_node(
-                &mut executor,
-                &mut trace.audit,
-                &root,
-                node,
-                mode,
-                variables,
-                &run_invocation_id,
-            ) {
-                Ok(next) => variables = next,
-                Err(error) => {
-                    trace.python = executor.invocations;
-                    trace.skip(&execution_plan.nodes[index + 1..], mode);
-                    return Err(error);
-                }
-            }
-            completed_nodes.push(RunNodeResult {
-                id: node.id.clone(),
-                relation: node.id.clone(),
-                materialization: "none".to_owned(),
-                status: "SUCCEEDED".to_owned(),
-            });
-        }
+        };
         // ENT-111: the dataset profile is resolved from configuration only. A failure is kept
         // by the source and reported on the first dataset read; the connection opens only then.
         // Fallback warnings of dataset reads are reported as in mixed runs (ENT-041).
@@ -998,93 +992,80 @@ fn execute_run(
             retry_policy,
             cancel.clone(),
         ));
-        let mut completed_nodes = Vec::with_capacity(execution_plan.nodes.len());
-        for (index, node) in execution_plan.nodes.iter().enumerate() {
-            if let Err(error) = cancel.check() {
-                trace.python = std::mem::take(&mut executor.invocations);
-                trace.skip(&execution_plan.nodes[index..], mode);
-                return Err(error);
-            }
-            if is_python_path(&node.path) {
-                match run_python_node(
-                    &mut executor,
-                    &mut trace.audit,
-                    &root,
-                    node,
-                    mode,
-                    variables,
-                    &run_invocation_id,
-                ) {
-                    Ok(next) => variables = next,
-                    Err(error) => {
-                        trace.python = std::mem::take(&mut executor.invocations);
-                        trace.skip(&execution_plan.nodes[index + 1..], mode);
-                        return Err(error);
-                    }
-                }
-                completed_nodes.push(RunNodeResult {
-                    id: node.id.clone(),
-                    relation: node.id.clone(),
-                    materialization: "none".to_owned(),
-                    status: "SUCCEEDED".to_owned(),
-                });
-                continue;
-            }
-            let hash = model_hash(&root, node);
-            let rendered = render_checked(
-                &root,
-                node,
-                &variables,
-                &template_options,
-                &relations,
-                &store,
-            );
-            let (prepared, next_variables) = match rendered {
-                Ok(rendered) => rendered,
-                Err(error) => {
-                    // Rendering failed before any attempt: the node is journaled once.
-                    let invocation_id = Uuid::new_v4().to_string();
-                    let node_started = Instant::now();
-                    trace.audit.node_started(&invocation_id, &node.id, hash);
-                    trace
-                        .audit
-                        .node_finished(&invocation_id, &node.id, Some(&error));
-                    trace.node(
-                        invocation_id,
+        let completed_nodes = match run_nodes_sequentially(
+            trace,
+            &execution_plan.nodes,
+            mode,
+            cancel,
+            |trace, node| {
+                if is_python_path(&node.path) {
+                    variables = run_python_node(
+                        &mut executor,
+                        &mut trace.audit,
+                        &root,
                         node,
                         mode,
-                        node_failure_status(&error),
-                        node_started,
-                        Some(&error),
-                    );
-                    trace.python = std::mem::take(&mut executor.invocations);
-                    trace.skip(&execution_plan.nodes[index + 1..], mode);
-                    return Err(error);
+                        std::mem::take(&mut variables),
+                        &run_invocation_id,
+                    )?;
+                    return Ok(python_node_result(node));
                 }
-            };
-            let materialized = match executor.sql.as_mut() {
-                Some(sql) => sql.materialize(node, mode, hash, Some(&mut *trace), &prepared),
-                None => Err(DowaiError::Execution(
-                    "SQL execution is not configured for this run".to_owned(),
-                )),
-            };
-            if let Err(error) = materialized {
+                let hash = model_hash(&root, node);
+                let (prepared, next_variables) = match render_checked(
+                    &root,
+                    node,
+                    &variables,
+                    &template_options,
+                    &relations,
+                    &store,
+                ) {
+                    Ok(rendered) => rendered,
+                    Err(error) => {
+                        // Rendering failed before any attempt: the node is journaled once.
+                        let invocation_id = Uuid::new_v4().to_string();
+                        let node_started = Instant::now();
+                        trace.audit.node_started(&invocation_id, &node.id, hash);
+                        trace
+                            .audit
+                            .node_finished(&invocation_id, &node.id, Some(&error));
+                        trace.node(
+                            invocation_id,
+                            node,
+                            mode,
+                            node_failure_status(&error),
+                            node_started,
+                            Some(&error),
+                        );
+                        return Err(error);
+                    }
+                };
+                match executor.sql.as_mut() {
+                    Some(sql) => sql.materialize(node, mode, hash, Some(&mut *trace), &prepared)?,
+                    None => {
+                        return Err(DowaiError::Execution(
+                            "SQL execution is not configured for this run".to_owned(),
+                        ))
+                    }
+                };
+                variables = next_variables;
+                Ok(RunNodeResult {
+                    id: prepared.id,
+                    relation: prepared.relation,
+                    materialization: match prepared.materialization {
+                        Materialization::Table => "table",
+                        Materialization::View => "view",
+                    }
+                    .to_owned(),
+                    status: "SUCCEEDED".to_owned(),
+                })
+            },
+        ) {
+            Ok(completed) => completed,
+            Err(error) => {
                 trace.python = std::mem::take(&mut executor.invocations);
-                trace.skip(&execution_plan.nodes[index + 1..], mode);
                 return Err(error);
             }
-            variables = next_variables;
-            completed_nodes.push(RunNodeResult {
-                id: prepared.id,
-                relation: prepared.relation,
-                materialization: match prepared.materialization {
-                    Materialization::Table => "table",
-                    Materialization::View => "view",
-                }
-                .to_owned(),
-                status: "SUCCEEDED".to_owned(),
-            });
-        }
+        };
         let session = match prior_session {
             Some(session) => session,
             None => store.create(&root, dowai_core::session_ttl_from_config(&configuration)?)?,
@@ -1207,6 +1188,47 @@ fn execute_run(
         invocations: Vec::new(),
         warnings: execution_plan.warnings,
     })
+}
+
+/// Sequential scheduler shared by the Python-only and mixed runs (ENT-118). Nodes run one by
+/// one in plan order. A cancelled run or a failed node records every node not started as
+/// `SKIPPED` and returns the error. `run_node` records its own journal entries for the node
+/// it runs, including the failure of that node.
+fn run_nodes_sequentially<F>(
+    trace: &mut Trace,
+    nodes: &[PlanNode],
+    mode: ExecutionMode,
+    cancel: &CancellationToken,
+    mut run_node: F,
+) -> Result<Vec<RunNodeResult>>
+where
+    F: FnMut(&mut Trace, &PlanNode) -> Result<RunNodeResult>,
+{
+    let mut completed = Vec::with_capacity(nodes.len());
+    for (index, node) in nodes.iter().enumerate() {
+        if let Err(error) = cancel.check() {
+            trace.skip(&nodes[index..], mode);
+            return Err(error);
+        }
+        match run_node(trace, node) {
+            Ok(result) => completed.push(result),
+            Err(error) => {
+                trace.skip(&nodes[index + 1..], mode);
+                return Err(error);
+            }
+        }
+    }
+    Ok(completed)
+}
+
+/// Result record of a Python node: it materializes no relation.
+fn python_node_result(node: &PlanNode) -> RunNodeResult {
+    RunNodeResult {
+        id: node.id.clone(),
+        relation: node.id.clone(),
+        materialization: "none".to_owned(),
+        status: "SUCCEEDED".to_owned(),
+    }
 }
 
 /// Final status of a node whose execution ended in `error`.
