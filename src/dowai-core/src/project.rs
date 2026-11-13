@@ -372,6 +372,7 @@ pub fn validate_project_with_configuration(
                 )),
             }
         }
+        diagnose_pyproject_divergence(project_root, config, &mut diagnostics);
         if let Err(error) = crate::resolve_effective_configuration(
             project_root,
             user_config_path,
@@ -393,6 +394,61 @@ pub fn validate_project_with_configuration(
     };
     report.finalize();
     report
+}
+
+/// Sinaliza, sem alterar arquivos, divergência entre `python.dependencies` do
+/// `dowai_project.json` (fonte canônica) e `[project].dependencies` do `pyproject.toml` (ENT-046).
+fn diagnose_pyproject_divergence(
+    project_root: &Path,
+    project: &Project,
+    diagnostics: &mut Vec<ValidationDiagnostic>,
+) {
+    let declared = project
+        .python
+        .as_ref()
+        .map(|python| python.dependencies.as_slice())
+        .unwrap_or_default();
+    let pyproject = match crate::python_env::read_pyproject_dependencies(project_root) {
+        Ok(Some(dependencies)) => dependencies,
+        Ok(None) => {
+            if project_root
+                .join(crate::python_env::PYPROJECT_FILE)
+                .is_file()
+            {
+                diagnostics.push(ValidationDiagnostic::warning(
+                    "DOWAI_PYPROJECT_UNREADABLE",
+                    "pyproject.toml has no readable [project].dependencies table; divergence not checked"
+                        .to_owned(),
+                    Some(crate::python_env::PYPROJECT_FILE.to_owned()),
+                ));
+            }
+            return;
+        }
+        Err(error) => {
+            diagnostics.push(ValidationDiagnostic::warning(
+                "DOWAI_PYPROJECT_UNREADABLE",
+                error.message(),
+                Some(crate::python_env::PYPROJECT_FILE.to_owned()),
+            ));
+            return;
+        }
+    };
+    match crate::python_env::compare_dependencies(declared, &pyproject) {
+        Ok(divergence) if divergence.is_empty() => {}
+        Ok(divergence) => diagnostics.push(ValidationDiagnostic::warning(
+            "DOWAI_PYPROJECT_DIVERGENCE",
+            format!(
+                "pyproject.toml and dowai_project.json declare different dependencies ({}); dowai_project.json is authoritative and nothing was merged",
+                divergence.describe()
+            ),
+            Some(crate::python_env::PYPROJECT_FILE.to_owned()),
+        )),
+        Err(error) => diagnostics.push(ValidationDiagnostic::warning(
+            error.code(),
+            error.message(),
+            Some(crate::python_env::PYPROJECT_FILE.to_owned()),
+        )),
+    }
 }
 
 fn validate_project_name(name: &str) -> Result<()> {

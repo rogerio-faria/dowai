@@ -14,6 +14,7 @@ pub mod plugin_registry;
 pub mod plugin_stubs;
 mod project;
 mod python_ast;
+pub mod python_env;
 mod runs;
 mod sessions;
 pub mod state;

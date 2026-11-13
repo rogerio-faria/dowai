@@ -1,0 +1,8 @@
+{
+  "schema_version": 2,
+  "name": "python-env-fixture",
+  "python": {
+    "interpreter": "/usr/bin/python3",
+    "dependencies": ["sqlalchemy==2.0.36"]
+  }
+}
