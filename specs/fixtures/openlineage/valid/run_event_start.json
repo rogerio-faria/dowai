@@ -1,0 +1,23 @@
+{
+  "eventType": "START",
+  "eventTime": "2026-11-13T12:00:00.000Z",
+  "producer": "urn:dowai:producer:cli",
+  "schemaURL": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/RunEvent",
+  "run": {
+    "runId": "0190f0a0-0000-7000-8000-000000000001",
+    "facets": {
+      "dowai_execution": {
+        "_producer": "urn:dowai:producer:cli",
+        "_schemaURL": "urn:dowai:facets:execution/1-0-0",
+        "observed": true
+      }
+    }
+  },
+  "job": { "namespace": "dowai", "name": "models/comissao" },
+  "inputs": [
+    { "namespace": "postgres://localhost:5432", "name": "public.vendas" }
+  ],
+  "outputs": [
+    { "namespace": "mysql://localhost:3306", "name": "dw.comissao" }
+  ]
+}

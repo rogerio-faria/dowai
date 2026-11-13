@@ -1,0 +1,8 @@
+{
+  "eventType": "BEGIN",
+  "eventTime": "2026-11-13T12:00:00.000Z",
+  "producer": "urn:dowai:producer:cli",
+  "schemaURL": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/RunEvent",
+  "run": { "runId": "0190f0a0-0000-7000-8000-000000000001" },
+  "job": { "namespace": "dowai", "name": "models/comissao" }
+}
