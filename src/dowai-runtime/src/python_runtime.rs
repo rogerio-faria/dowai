@@ -1,5 +1,6 @@
 use crate::dataset_query::FilterRequest;
 use crate::executor::DatasetRef;
+use crate::external_write::WriteRequest;
 use dowai_core::{CancellationToken, DowaiError, ProjectPython, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -31,6 +32,12 @@ use std::time::{Duration, Instant};
 // (`code`). Only datasets declared as dependencies of the model are served, and
 // only from SQL models already committed by the run.
 //
+// Worker -> host, zero or more `{"kind":"write"}` lines (ENT-048, `env.write`), each with
+// `operation` ("open", "rows", "commit" or "abort"). `open` carries `target` (profile), `table`,
+// `mode`, `keys`, `columns` and `confirm_replace`; `rows` carries `rows` (mappings). The host
+// answers each with exactly one line: `write_ok` (`payload`) or `write_failed` (`code`, static).
+// A failed write is aborted on the host; the worker sends `abort` whenever it stops early.
+//
 // Worker -> host, zero or more `{"kind":"command"}` lines (ENT-040, `env.plan` and
 // `env.validate`), each with `operation` ("plan" or "validate") and, for "plan", `target`
 // and `mode`; both carry the caller's `variables`. The host answers with exactly one line:
@@ -60,6 +67,8 @@ import decimal
 import importlib
 import itertools
 import json
+import math
+import numbers
 import os
 import pathlib
 import re
@@ -330,9 +339,6 @@ def main():
             """Capability handles for workspace profiles (ENT-043)."""
             return Connections(self)
 
-        def _unsupported(self, *args, **kwargs):
-            raise NotImplementedError()
-
         def _export_destination(self, path):
             """Asks the host to authorize the destination of an export (ENT-050)."""
             respond({"protocol_version": 1, "kind": "export", "path": path})
@@ -365,7 +371,36 @@ def main():
             target = self._export_destination(path)
             return write_csv(data, target, settings)
 
-        write = _unsupported
+        def write(self, data, target, table, mode="append", keys=None, confirm_replace=False):
+            """`env.write(data, target, table, mode="append", keys=None, confirm_replace=False)`.
+
+            Writes rows to `table` of the workspace profile `target` (ENT-048). `data` is a Dataset,
+            a pandas or Polars DataFrame, a PyArrow table, or an iterable of mappings. `append` adds
+            rows; `replace` deletes the destination rows and requires `confirm_replace=True`;
+            `upsert` merges by `keys`, which must be a unique key of the destination. The rows are
+            written in one destination transaction. The host checks the profile, the policy and the
+            schema. Source and destination are not one transaction. Returns the counts.
+            """
+            return write_destination(self, data, target, table, mode, keys, confirm_replace)
+
+        def _write_exchange(self, operation, **fields):
+            message = {"protocol_version": 1, "kind": "write", "operation": operation}
+            message.update(fields)
+            respond(message)
+            line = _in.readline()
+            if not line:
+                raise RuntimeError("the DOWAI host closed the write channel")
+            reply = json.loads(line)
+            if reply.get("protocol_version") != 1:
+                raise RuntimeError("invalid write reply")
+            if reply.get("kind") == "write_failed":
+                raise ExecutionError(
+                    str(reply.get("code") or "DOWAI_WRITE_FAILED"),
+                    "write was not applied to the destination",
+                )
+            if reply.get("kind") != "write_ok" or not isinstance(reply.get("payload"), dict):
+                raise RuntimeError("invalid write reply")
+            return reply["payload"]
 
     def check_path(value):
         if not isinstance(value, str) or not value.strip() or "\x00" in value:
@@ -460,6 +495,106 @@ def main():
                 os.remove(temporary)
             raise
         return count
+
+    WRITE_MODES = ("append", "replace", "upsert")
+    WRITE_BATCH_ROWS = 1000
+
+    def write_value(value):
+        if value is None or isinstance(value, (bool, str)):
+            return value
+        if isinstance(value, numbers.Integral):
+            return int(value)
+        if isinstance(value, decimal.Decimal):
+            if not value.is_finite():
+                raise ValueError("a non-finite decimal cannot be written")
+            return str(value)
+        if isinstance(value, numbers.Real):
+            number = float(value)
+            if not math.isfinite(number):
+                raise ValueError("a non-finite float cannot be written")
+            return number
+        if isinstance(value, datetime.datetime):
+            if value.tzinfo is None:
+                raise ValueError("a naive datetime cannot be written; use a timezone-aware value")
+            return value.isoformat()
+        if isinstance(value, (datetime.date, datetime.time)):
+            return value.isoformat()
+        raise ValueError("unsupported value type for write: %s" % type(value).__name__)
+
+    def write_source(data):
+        if isinstance(data, Dataset):
+            names = [column["name"] for column in data.schema()]
+            return names, data.iter_rows(batch_size=1000)
+        if isinstance(data, (str, bytes, Mapping)):
+            raise ValueError("data must be a Dataset, a DataFrame or an iterable of mappings")
+        rows = data
+        for method in ("to_pylist", "to_dicts"):
+            converter = getattr(data, method, None)
+            if callable(converter):
+                rows = converter()
+                break
+        else:
+            if hasattr(data, "to_dict") and hasattr(data, "columns"):
+                rows = data.to_dict("records")
+        source = iter(rows)
+        sentinel = object()
+        first = next(source, sentinel)
+        if first is sentinel:
+            raise ValueError("there are no rows to write; pass a Dataset to write an empty relation")
+        if not isinstance(first, Mapping):
+            raise ValueError("every row must be a mapping")
+        return list(first.keys()), itertools.chain([first], source)
+
+    def write_destination(environment, data, target, table, mode, keys, confirm_replace):
+        if not isinstance(target, str) or not target.strip() or "\x00" in target:
+            raise ValueError("target must be a non-empty profile name")
+        if not isinstance(table, str) or not table.strip() or "\x00" in table:
+            raise ValueError("table must be a non-empty name")
+        if mode not in WRITE_MODES:
+            raise ValueError("mode must be 'append', 'replace' or 'upsert'")
+        if not isinstance(confirm_replace, bool):
+            raise ValueError("confirm_replace must be a bool")
+        if mode == "upsert":
+            if not isinstance(keys, (list, tuple)) or not keys:
+                raise ValueError("upsert requires a non-empty list of key columns")
+            keys = list(keys)
+            if not all(isinstance(key, str) and key.strip() for key in keys):
+                raise ValueError("keys must be non-empty strings")
+        elif keys is not None:
+            raise ValueError("keys are only accepted by upsert")
+        if mode == "replace" and not confirm_replace:
+            raise ValueError("replace requires confirm_replace=True")
+        if mode != "replace" and confirm_replace:
+            raise ValueError("confirm_replace only applies to replace")
+        names, source = write_source(data)
+        names = list(names)
+        width = len(names)
+        environment._write_exchange(
+            "open",
+            target=target,
+            table=table,
+            mode=mode,
+            keys=keys,
+            columns=names,
+            confirm_replace=confirm_replace,
+        )
+        try:
+            batch = []
+            for row in source:
+                if not isinstance(row, Mapping) or len(row) != width or any(name not in row for name in names):
+                    raise ValueError("every row must have the same columns")
+                batch.append({name: write_value(row[name]) for name in names})
+                if len(batch) >= WRITE_BATCH_ROWS:
+                    environment._write_exchange("rows", rows=batch)
+                    batch = []
+            if batch:
+                environment._write_exchange("rows", rows=batch)
+            payload = environment._write_exchange("commit")
+        except BaseException:
+            with contextlib.suppress(Exception):
+                environment._write_exchange("abort")
+            raise
+        return payload
 
     def check_name(value):
         if not isinstance(value, str) or not value.strip():
@@ -898,6 +1033,14 @@ struct WorkerMessage {
     invocation_id: Option<String>,
     #[serde(default)]
     dataset: Option<String>,
+    #[serde(default)]
+    keys: Option<Vec<String>>,
+    #[serde(default)]
+    columns: Option<Vec<String>>,
+    #[serde(default)]
+    confirm_replace: Option<bool>,
+    #[serde(default)]
+    rows: Option<Vec<Value>>,
     /// `env.source` (ENT-042): the declared source and its table, instead of `dataset`.
     #[serde(default)]
     source: Option<String>,
@@ -947,6 +1090,8 @@ pub(crate) enum HostRequest {
     Export {
         path: String,
     },
+    /// One operation of `env.write` (ENT-048).
+    Write(WriteRequest),
 }
 
 /// Successful answer of a dataset operation.
@@ -967,6 +1112,8 @@ pub(crate) enum HostReply {
     Command(Result<Value>),
     /// Absolute target path authorized for the export.
     Export(Result<String>),
+    /// Payload of a write operation (ENT-048), or the refusal.
+    Write(Result<Value>),
 }
 
 #[derive(Serialize)]
@@ -1017,6 +1164,16 @@ struct ExportReply<'a> {
     kind: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct WriteReply<'a> {
+    protocol_version: u32,
+    kind: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payload: Option<&'a Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     code: Option<&'a str>,
 }
@@ -1208,7 +1365,7 @@ pub(crate) fn execute_model(
         let message = parse_message(&line)?;
         if matches!(
             message.kind.as_str(),
-            "call" | "dataset" | "command" | "export"
+            "call" | "dataset" | "command" | "export" | "write"
         ) {
             return Err(protocol_error());
         }
@@ -1442,6 +1599,51 @@ impl Supervision {
                     bytes = serde_json::to_vec(&CommandReply {
                         protocol_version: IPC_PROTOCOL_VERSION,
                         kind: "command_failed",
+                        payload: None,
+                        code: Some("DOWAI_EXECUTION_FAILED"),
+                    })
+                    .map_err(|_| protocol_error())?;
+                }
+                bytes.push(b'\n');
+                self.replies.send(bytes).map_err(|_| protocol_error())?;
+                Ok(())
+            }
+            "write" => {
+                let Some(operation) = message.operation else {
+                    return Err(protocol_error());
+                };
+                let HostReply::Write(result) = on_request(HostRequest::Write(WriteRequest {
+                    operation,
+                    target: message.target,
+                    table: message.table,
+                    mode: message.mode,
+                    keys: message.keys,
+                    columns: message.columns,
+                    confirm_replace: message.confirm_replace.unwrap_or(false),
+                    rows: message.rows.unwrap_or_default(),
+                })) else {
+                    return Err(protocol_error());
+                };
+                let mut bytes = match &result {
+                    Ok(payload) => serde_json::to_vec(&WriteReply {
+                        protocol_version: IPC_PROTOCOL_VERSION,
+                        kind: "write_ok",
+                        payload: Some(payload),
+                        code: None,
+                    }),
+                    Err(error) => serde_json::to_vec(&WriteReply {
+                        protocol_version: IPC_PROTOCOL_VERSION,
+                        kind: "write_failed",
+                        payload: None,
+                        code: Some(error.code()),
+                    }),
+                }
+                .map_err(|_| protocol_error())?;
+                // A payload that does not fit the protocol is refused, not truncated.
+                if bytes.len() > MAX_IPC_BYTES {
+                    bytes = serde_json::to_vec(&WriteReply {
+                        protocol_version: IPC_PROTOCOL_VERSION,
+                        kind: "write_failed",
                         payload: None,
                         code: Some("DOWAI_EXECUTION_FAILED"),
                     })

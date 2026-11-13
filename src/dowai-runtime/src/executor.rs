@@ -4,6 +4,7 @@
 //! invocation history linked by `parent_invocation_id`.
 
 use crate::dataset_query::{self, FilterRequest};
+use crate::external_write::{ExternalWrite, WriteRequest};
 use crate::python_runtime::{
     self, CallDetails, ChildCall, ChildOutcome, DatasetAnswer, DatasetColumn, HostReply,
     HostRequest, ModelInvocation,
@@ -20,7 +21,7 @@ use dowai_core::{
     Result, SessionStore,
 };
 use dowai_postgres::{DatasetCell, PgProfile, PostgresAdapter};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -290,6 +291,8 @@ pub(crate) struct Executor<'a> {
     run_id: String,
     /// Session of the run when it is already known (explicit session); `None` otherwise.
     session_id: Option<String>,
+    /// Open `env.write` session (ENT-048). At most one; it belongs to the model that opened it.
+    writer: Option<ExternalWrite>,
 }
 
 /// Interpreter and per-worker timeout used by every Python model of a run.
@@ -337,6 +340,7 @@ impl<'a> Executor<'a> {
             attempts: 0,
             run_id: identity.run_id,
             session_id: identity.session_id,
+            writer: None,
         })
     }
 
@@ -491,6 +495,14 @@ impl<'a> Executor<'a> {
             &variables,
             &mut |request| self.handle_request(request, invocation_id, deadline, depends_on),
         );
+        // A write session opened by this model ends with it, even when the model failed (ENT-048).
+        if self
+            .writer
+            .as_ref()
+            .is_some_and(|writer| writer.depth() == self.stack.len())
+        {
+            self.abort_write();
+        }
         self.stack.pop();
         let variables = result?;
         self.store.validate_variables(&variables)?;
@@ -542,6 +554,70 @@ impl<'a> Executor<'a> {
                 variables,
             } => HostReply::Command(self.command(&operation, target, mode, variables)),
             HostRequest::Export { path } => HostReply::Export(self.export_destination(&path)),
+            HostRequest::Write(request) => HostReply::Write(self.write_request(request)),
+        }
+    }
+
+    /// Serves one `env.write` operation (ENT-048). A failed `rows` or `commit` aborts the
+    /// session, so the destination transaction never stays open after an error.
+    fn write_request(&mut self, request: WriteRequest) -> Result<Value> {
+        self.cancel.check()?;
+        match request.operation.as_str() {
+            "open" => {
+                if self.writer.is_some() {
+                    return Err(DowaiError::Write {
+                        code: crate::external_write::WRITE_SESSION,
+                        message: "another write session is already open".to_owned(),
+                    });
+                }
+                let depth = self.stack.len();
+                self.writer = Some(ExternalWrite::open(
+                    self.root,
+                    self.configuration,
+                    request,
+                    depth,
+                )?);
+                Ok(json!({ "state": "open" }))
+            }
+            "rows" => {
+                let Some(writer) = self.writer.as_mut() else {
+                    return Err(Self::no_write_session());
+                };
+                match writer.stage_rows(&request.rows) {
+                    Ok(staged) => Ok(json!({ "rows": staged })),
+                    Err(error) => {
+                        self.abort_write();
+                        Err(error)
+                    }
+                }
+            }
+            "commit" => {
+                let Some(writer) = self.writer.take() else {
+                    return Err(Self::no_write_session());
+                };
+                writer.commit()
+            }
+            "abort" => {
+                self.abort_write();
+                Ok(json!({ "state": "aborted" }))
+            }
+            _ => Err(DowaiError::Write {
+                code: crate::external_write::WRITE_INVALID_REQUEST,
+                message: "unknown write operation".to_owned(),
+            }),
+        }
+    }
+
+    fn no_write_session() -> DowaiError {
+        DowaiError::Write {
+            code: crate::external_write::WRITE_SESSION,
+            message: "no write session is open".to_owned(),
+        }
+    }
+
+    fn abort_write(&mut self) {
+        if let Some(writer) = self.writer.take() {
+            writer.abort();
         }
     }
 

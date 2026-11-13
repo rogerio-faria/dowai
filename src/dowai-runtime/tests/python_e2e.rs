@@ -234,7 +234,7 @@ fn supervised_python_dag_persists_variables_and_does_not_commit_failed_runs() {
 
     workspace.write_model(
         "unsupported.py",
-        "def model(env):\n    env.setVar('uncommitted', True)\n    env.write('upstream')\n",
+        "def model(env):\n    env.setVar('uncommitted', True)\n    env.write('upstream', 'x', 'y', mode='bogus')\n",
     );
     let unsupported = run_postgres(
         &workspace.project,
@@ -248,8 +248,9 @@ fn supervised_python_dag_persists_variables_and_does_not_commit_failed_runs() {
             full_refresh: false,
         },
     )
-    .expect_err("unsupported data APIs must not simulate success");
-    assert_eq!(unsupported.code(), "DOWAI_NOT_IMPLEMENTED");
+    .expect_err("invalid data API calls must not simulate success");
+    // `env.write` is implemented (ENT-048); an invalid call fails the model, never succeeds.
+    assert_eq!(unsupported.code(), "DOWAI_PYTHON_FAILED");
 
     workspace.write_model("returned.py", "def model(env):\n    return {'rows': []}\n");
     let unsupported_return = run_postgres(

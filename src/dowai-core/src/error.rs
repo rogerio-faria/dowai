@@ -70,6 +70,11 @@ pub enum DowaiError {
         code: &'static str,
         message: String,
     },
+    /// `env.write` refusals and failures, each with its own stable `DOWAI_WRITE_*` code (ENT-048).
+    Write {
+        code: &'static str,
+        message: String,
+    },
     /// Plugin execution refusals and failures, each with its own stable `DOWAI_PLUGIN_*` code
     /// (ENT-107). The message never carries free text produced by the plugin.
     Plugin {
@@ -110,6 +115,7 @@ impl DowaiError {
             Self::NotImplemented(_) => "DOWAI_NOT_IMPLEMENTED",
             Self::DatasetAccess { code, .. } => code,
             Self::Retry { code, .. } => code,
+            Self::Write { code, .. } => code,
             Self::Plugin { code, .. } => code,
             Self::Io(_) => "DOWAI_IO_ERROR",
         }
@@ -144,7 +150,8 @@ impl DowaiError {
             | Self::PythonProtocol(_)
             | Self::ModelChanged(_)
             | Self::ResourceUnsupported(_)
-            | Self::DatasetAccess { .. } => ec::EXECUTION_FAILED,
+            | Self::DatasetAccess { .. }
+            | Self::Write { .. } => ec::EXECUTION_FAILED,
             Self::NotImplemented(_) => ec::NOT_IMPLEMENTED,
             Self::Cancelled(_) => ec::CANCELLED,
         }
@@ -174,7 +181,8 @@ impl DowaiError {
             | Self::NotImplemented(message)
             | Self::DatasetAccess { message, .. }
             | Self::Plugin { message, .. }
-            | Self::Retry { message, .. } => message.clone(),
+            | Self::Retry { message, .. }
+            | Self::Write { message, .. } => message.clone(),
             Self::Validation { message, .. } => message.clone(),
             Self::Io(error) => error.to_string(),
         }

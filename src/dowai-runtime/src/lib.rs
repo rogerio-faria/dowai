@@ -24,6 +24,7 @@ use uuid::Uuid;
 mod auditor;
 mod dataset_query;
 mod executor;
+mod external_write;
 mod plugin_exec;
 mod python_runtime;
 mod resources;

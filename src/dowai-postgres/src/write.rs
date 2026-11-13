@@ -208,6 +208,86 @@ impl PostgresAdapter {
         })
     }
 
+    /// Insere linhas JSON (`[{coluna: valor}, ...]`) na staging. O PostgreSQL converte cada
+    /// valor para o tipo da coluna de `staging` (mesmas colunas do destino), sem interpolar
+    /// dados no SQL: o JSON é um único parâmetro. Exige transação. Devolve linhas inseridas.
+    pub fn write_staging_json(
+        &mut self,
+        staging: &str,
+        columns: &[String],
+        rows_json: &str,
+    ) -> Result<u64, AdapterError> {
+        self.require_transaction()?;
+        validate_batch_shape(columns, &[])?;
+        let staging_q = quote_identifier(staging)?;
+        let columns_sql = quoted_list(columns)?;
+        let sql = format!(
+            "INSERT INTO {staging_q} ({columns_sql}) SELECT {columns_sql} \
+             FROM jsonb_populate_recordset(NULL::{staging_q}, $1::text::jsonb)"
+        );
+        self.client
+            .execute(sql.as_str(), &[&rows_json])
+            .map_err(classify_failure)
+    }
+
+    /// Copia a staging para o destino sem conflito (`append`). Exige transação. Devolve linhas
+    /// inseridas.
+    pub fn append_staging(
+        &mut self,
+        staging: &str,
+        target: &str,
+        columns: &[String],
+    ) -> Result<u64, AdapterError> {
+        self.require_transaction()?;
+        validate_batch_shape(columns, &[])?;
+        let staging_q = quote_identifier(staging)?;
+        let target_q = quote_identifier(target)?;
+        let columns_sql = quoted_list(columns)?;
+        self.client
+            .execute(
+                &format!(
+                    "INSERT INTO {target_q} ({columns_sql}) SELECT {columns_sql} FROM {staging_q}"
+                ),
+                &[],
+            )
+            .map_err(classify_failure)
+    }
+
+    /// Remove todas as linhas do destino (`replace`, dentro da transação). Exige transação.
+    pub fn delete_all(&mut self, target: &str) -> Result<u64, AdapterError> {
+        self.require_transaction()?;
+        let target_q = quote_identifier(target)?;
+        self.client
+            .execute(&format!("DELETE FROM {target_q}"), &[])
+            .map_err(classify_failure)
+    }
+
+    /// Indica se `target` tem índice único cujas colunas são exatamente `keys` (sem parcial,
+    /// expressão ou colunas `INCLUDE`). Pré-condição de `upsert`. Não exige transação.
+    pub fn has_unique_key(&mut self, target: &str, keys: &[String]) -> Result<bool, AdapterError> {
+        let target_q = quote_identifier(target)?;
+        let mut expected: Vec<&String> = keys.iter().collect();
+        expected.sort();
+        let rows = self
+            .client
+            .query(
+                "SELECT array_agg(a.attname::text ORDER BY a.attname::text)::text[] \
+                 FROM pg_index i \
+                 JOIN pg_attribute a ON a.attrelid = i.indrelid \
+                   AND a.attnum = ANY(string_to_array(i.indkey::text, ' ')::int2[]) \
+                 WHERE i.indrelid = to_regclass($1::text) AND i.indisunique \
+                   AND i.indpred IS NULL AND i.indexprs IS NULL AND i.indnatts = i.indnkeyatts \
+                 GROUP BY i.indexrelid",
+                &[&target_q],
+            )
+            .map_err(classify_failure)?;
+        Ok(rows.iter().any(|row| {
+            let mut names: Vec<String> = row.get(0);
+            names.sort();
+            names.len() == expected.len() && names.iter().zip(expected.iter()).all(|(a, b)| a == *b)
+        }))
+    }
+
     fn require_transaction(&self) -> Result<(), AdapterError> {
         if self.in_transaction {
             Ok(())
