@@ -384,7 +384,7 @@ fn write_is_refused_without_external_write_policy() {
         .expect_err("run must be refused without external write policy");
     assert_eq!(error.code(), "DOWAI_POLICY_DENIED");
     assert_eq!(error.exit_code(), 5);
-    assert!(rows_of(&table, "id", "id").is_empty());
+    assert!(rows_of(&table, "id::text", "id").is_empty());
 }
 
 #[test]
@@ -471,5 +471,244 @@ def model(env):
             "id",
         ),
         vec![row(&["1", "12.50", "2026-01-01 12:00:00", "true", "<NULL>"])]
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Incremental dirigido pelo usuário (ENT-066, ADR 0005 D09, plano §10.3).
+//
+// O motor não infere regra: o modelo declara a fonte, o filtro de delta (`updated_at` acima do
+// watermark), a exclusão (`status == 'deleted'`) e a chave do UPSERT. O watermark é a variável
+// de sessão `orders_watermark`, publicada só se a run terminar com sucesso (AC039). Assim, uma
+// falha após a escrita no destino preserva o watermark anterior, e a execução seguinte recarrega
+// o mesmo delta, que o UPSERT por `id` absorve sem duplicar.
+// Os testes usam uma execução vazia para criar a sessão antes de provocar a falha.
+// ---------------------------------------------------------------------------------------------
+
+/// Modelo incremental. `{T}` vira o nome da tabela de destino. `fail_after_write` levanta
+/// erro depois de a escrita ter sido confirmada no destino e depois de `setVar`, para simular
+/// queda antes da publicação das variáveis da run.
+fn incremental_body(source: &str, fail_after_write: bool) -> String {
+    let tail = if fail_after_write {
+        "    raise RuntimeError('falha depois da escrita')\n"
+    } else {
+        ""
+    };
+    format!(
+        r#"SOURCE = {source}
+
+def model(env):
+    watermark = env.getVar("orders_watermark", 0)
+    delta = [r for r in SOURCE if r["updated_at"] > watermark and r["status"] != "deleted"]
+    if delta:
+        result = env.write(delta, target="warehouse", table="{{T}}", mode="upsert", keys=["id"])
+        env.setVar("last_inserted", result["inserted"])
+        env.setVar("last_updated", result["updated"])
+        env.setVar("orders_watermark", max(r["updated_at"] for r in delta))
+    env.setVar("last_delta", len(delta))
+{tail}"#
+    )
+}
+
+impl Fixture {
+    /// Runs `body` as the only model of a run, in `session_id` when given (the session carries
+    /// the watermark between runs). `Ok((status, session_id))` for a run that ends, `Err` when
+    /// the run is refused or fails before it ends (the caller then keeps its own session id).
+    fn run_in_session(
+        &self,
+        body: &str,
+        table: &str,
+        session_id: Option<String>,
+    ) -> Result<(String, String), DowaiError> {
+        fs::write(
+            self.project.join("models").join("writer.py"),
+            body.replace("{T}", table),
+        )
+        .expect("write model");
+        let result = run_postgres(
+            &self.project,
+            RunRequest {
+                targets: vec!["writer.py".to_owned()],
+                mode: None,
+                profile: None,
+                session_id,
+                variables: BTreeMap::new(),
+                confirm_destructive: false,
+                full_refresh: false,
+            },
+        )?;
+        Ok((result.status, result.session_id))
+    }
+
+    /// Variables published in `session_id`.
+    fn variables(&self, session_id: &str) -> BTreeMap<String, Value> {
+        SessionStore::for_user_state(default_session_store_path().expect("state path"))
+            .snapshot(session_id)
+            .expect("session snapshot")
+    }
+
+    /// Creates a session with an empty source, so later runs can share its variables.
+    fn start_session(&self, table: &str) -> String {
+        let (status, session) = self
+            .run_in_session(&incremental_body("[]", false), table, None)
+            .expect("session-creating run");
+        assert_eq!(status, "SUCCEEDED");
+        session
+    }
+}
+
+const ORDERS_DDL: &str = "id integer PRIMARY KEY, amount integer, status text, updated_at integer";
+
+#[test]
+#[ignore = "opt-in E2E; requires a dedicated disposable PostgreSQL database"]
+/// Second run without new data loads nothing; a run with new and updated rows loads only the
+/// delta, excludes `deleted` rows and keeps one row per key.
+fn incremental_second_run_does_not_duplicate_and_loads_only_the_delta() {
+    let table = format!("inc_orders_{}", nonce());
+    let fixture = Fixture::new("incremental", true, &[&table]);
+    fixture.table(&table, ORDERS_DDL);
+    let session = fixture.start_session(&table);
+
+    let first_source = r#"[
+    {"id": 1, "amount": 10, "status": "ok", "updated_at": 1},
+    {"id": 2, "amount": 20, "status": "ok", "updated_at": 2},
+    {"id": 3, "amount": 30, "status": "deleted", "updated_at": 3}
+]"#;
+    let (status, session) = fixture
+        .run_in_session(
+            &incremental_body(first_source, false),
+            &table,
+            Some(session),
+        )
+        .expect("first run");
+    assert_eq!(status, "SUCCEEDED");
+    let variables = fixture.variables(&session);
+    assert_eq!(variables["last_delta"], json!(2));
+    assert_eq!(variables["orders_watermark"], json!(2));
+
+    let (status, session) = fixture
+        .run_in_session(
+            &incremental_body(first_source, false),
+            &table,
+            Some(session),
+        )
+        .expect("second run without new data");
+    assert_eq!(status, "SUCCEEDED");
+    let variables = fixture.variables(&session);
+    assert_eq!(variables["last_delta"], json!(0));
+    assert_eq!(variables["orders_watermark"], json!(2));
+    assert_eq!(
+        rows_of(&table, "id::text, amount::text", "id"),
+        vec![row(&["1", "10"]), row(&["2", "20"])]
+    );
+
+    let second_source = r#"[
+    {"id": 1, "amount": 10, "status": "ok", "updated_at": 1},
+    {"id": 2, "amount": 25, "status": "ok", "updated_at": 5},
+    {"id": 3, "amount": 30, "status": "deleted", "updated_at": 3},
+    {"id": 4, "amount": 40, "status": "ok", "updated_at": 4}
+]"#;
+    let (status, session) = fixture
+        .run_in_session(
+            &incremental_body(second_source, false),
+            &table,
+            Some(session),
+        )
+        .expect("run with new data");
+    assert_eq!(status, "SUCCEEDED");
+    let variables = fixture.variables(&session);
+    assert_eq!(variables["last_delta"], json!(2));
+    assert_eq!(variables["last_inserted"], json!(1));
+    assert_eq!(variables["last_updated"], json!(1));
+    assert_eq!(variables["orders_watermark"], json!(5));
+    assert_eq!(
+        rows_of(&table, "id::text, amount::text", "id"),
+        vec![row(&["1", "10"]), row(&["2", "25"]), row(&["4", "40"])]
+    );
+}
+
+#[test]
+#[ignore = "opt-in E2E; requires a dedicated disposable PostgreSQL database"]
+/// A failure after the destination commit, before the run publishes its variables, keeps the
+/// previous watermark. The next run reloads the same delta, and the UPSERT leaves no duplicates.
+fn incremental_failure_after_commit_keeps_watermark_and_reloads_without_duplicates() {
+    let table = format!("inc_crash_{}", nonce());
+    let fixture = Fixture::new("incremental-crash", true, &[&table]);
+    fixture.table(&table, ORDERS_DDL);
+    let session = fixture.start_session(&table);
+
+    let source = r#"[
+    {"id": 1, "amount": 10, "status": "ok", "updated_at": 1},
+    {"id": 2, "amount": 20, "status": "ok", "updated_at": 2}
+]"#;
+    let crashed = fixture.run_in_session(
+        &incremental_body(source, true),
+        &table,
+        Some(session.clone()),
+    );
+    assert!(crashed.is_err(), "the run must fail after the write");
+    assert_eq!(
+        rows_of(&table, "id::text", "id").len(),
+        2,
+        "destination was committed"
+    );
+    assert!(
+        !fixture.variables(&session).contains_key("orders_watermark"),
+        "a failed run must not publish the watermark"
+    );
+
+    let (status, session) = fixture
+        .run_in_session(&incremental_body(source, false), &table, Some(session))
+        .expect("recovery run");
+    assert_eq!(status, "SUCCEEDED");
+    let variables = fixture.variables(&session);
+    assert_eq!(variables["last_delta"], json!(2));
+    assert_eq!(variables["last_inserted"], json!(0));
+    assert_eq!(variables["last_updated"], json!(2));
+    assert_eq!(variables["orders_watermark"], json!(2));
+    assert_eq!(
+        rows_of(&table, "id::text, amount::text", "id"),
+        vec![row(&["1", "10"]), row(&["2", "20"])]
+    );
+}
+
+#[test]
+#[ignore = "opt-in E2E; requires a dedicated disposable PostgreSQL database"]
+/// A write refused before commit (value of the wrong type) rolls the destination back and
+/// publishes no watermark; a corrected source then loads everything once.
+fn incremental_pre_commit_failure_preserves_the_checkpoint() {
+    let table = format!("inc_pre_{}", nonce());
+    let fixture = Fixture::new("incremental-pre", true, &[&table]);
+    fixture.table(&table, ORDERS_DDL);
+    let session = fixture.start_session(&table);
+
+    let broken = r#"[
+    {"id": 1, "amount": 10, "status": "ok", "updated_at": 1},
+    {"id": 2, "amount": "abc", "status": "ok", "updated_at": 2}
+]"#;
+    let refused = fixture.run_in_session(
+        &incremental_body(broken, false),
+        &table,
+        Some(session.clone()),
+    );
+    assert!(refused.is_err(), "the write must be refused before commit");
+    assert!(
+        rows_of(&table, "id::text", "id").is_empty(),
+        "failed write leaves no rows"
+    );
+    assert!(!fixture.variables(&session).contains_key("orders_watermark"));
+
+    let fixed = r#"[
+    {"id": 1, "amount": 10, "status": "ok", "updated_at": 1},
+    {"id": 2, "amount": 20, "status": "ok", "updated_at": 2}
+]"#;
+    let (status, session) = fixture
+        .run_in_session(&incremental_body(fixed, false), &table, Some(session))
+        .expect("corrected run");
+    assert_eq!(status, "SUCCEEDED");
+    assert_eq!(fixture.variables(&session)["last_delta"], json!(2));
+    assert_eq!(
+        rows_of(&table, "id::text, amount::text", "id"),
+        vec![row(&["1", "10"]), row(&["2", "20"])]
     );
 }
