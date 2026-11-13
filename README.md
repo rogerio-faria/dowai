@@ -1,201 +1,277 @@
 # DOWAI
 
-DOWAI (Data Objects With AI) is a Rust data-workflow engine. This repository
-provides a project initializer, validator, static planner, local session store,
-an initial PostgreSQL SQL-model runtime, and a limited supervised Python model
-runtime.
+DOWAI (Data Objects With AI) is a Rust data-workflow engine: SQL and Python
+models run in one dependency graph, against PostgreSQL, with explicit policies
+for every write.
+
+## Why DOWAI
+
+- **SQL and Python in one run.** A Python model declares `env.depends_on("stg_vendas")`
+  and reads the rows of a SQL model with `env.ref("stg_vendas").iter_rows(...)`.
+  The SQL model runs first, in the same session.
+- **Writes are explicit and gated.** External writes are off by default
+  (`security.allow_external_writes`). Replacing a relation needs `--yes`.
+- **Incremental loads with a watermark the model declares.** The checkpoint is
+  published only after the run succeeds.
+- **Inspectable runs.** Each run has a local journal, stable `DOWAI_*` error
+  codes, and an append-only audit trail that stores hashes, not values.
 
 ## Current status
 
-The planner discovers literal `ref("model")` / `ref('model')` and
-`env.depends_on("model")` calls without executing SQL or Python, rejects
-dynamic references and cycles, and supports automatic dependency ordering and
-explicit manual ordering. Project and plan contracts use JSON schema version 2.
+**Execution is partial.** The full list of implemented behavior, limits and
+evidence is in [docs/STATUS.md](docs/STATUS.md). In short:
 
-**Execution is partial.** PostgreSQL behavior has been exercised against an
-isolated local PostgreSQL 17 disposable cluster with loopback TLS disabled;
-remote TLS and production credentials have not been verified.
-`dowai run` supports SQL-only models against a configured PostgreSQL profile,
-using table/view materialization and static `ref()` dependencies. It atomically
-replaces same-named relations in a per-model transaction. Python execution
-currently supports Python-only plans, project virtual environments, versioned
-JSON IPC, session-variable operations, `None` model returns, and nested
-`env.run()` between Python models. Mixed SQL/Python plans run in topological
-or manual order, sharing the session variables; SQL effects already applied are
-not reverted if a later node fails. Python datasets and dependency installation, MySQL,
-cross-database writes, plugins, OpenLineage, AI, and release packages remain
-unavailable. See
-[docs/STATUS.md](docs/STATUS.md).
+- Planning, validation, SQL templates and the project/workspace configuration
+  work offline.
+- PostgreSQL SQL models (tables and views) run with per-model atomic
+  replacement, `--full-refresh --yes` (staging and swap), and retries of
+  transient failures.
+- Python models run in a project virtual environment, supervised, with session
+  variables, `env.ref()`/`env.source()` reads, `env.write()`, and nested
+  `env.run()` of `.py` and `.sql` models.
+- MySQL is supported as an `env.write()` destination and as an `env.source()`
+  origin. It is not a SQL-model execution profile.
+
+Not available yet: plugins, AI features, OpenLineage, installers and release
+packages. Remote PostgreSQL TLS, Windows real-signal cancellation and
+production credentials have not been verified.
 
 ## Build
 
 Requirements: a supported Rust toolchain with Cargo. A minimum supported
-version is not declared until the compatibility matrix is established.
+version is not declared yet.
 
-```powershell
+```bash
+cargo build --workspace
 cargo test --workspace
-cargo build --workspace --release
 ```
+
+On Linux without `pkg-config`, set the OpenSSL location first:
+`OPENSSL_DIR=/usr OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu OPENSSL_INCLUDE_DIR=/usr/include`.
 
 ## Quick start
 
-```powershell
-cargo run -p dowai-cli -- init exemplo --workspace .
-cargo run -p dowai-cli -- validate .\projects\exemplo --json
-cargo run -p dowai-cli -- plan faturamento.sql --project-dir .\projects\exemplo --json
+This takes about five minutes and needs a PostgreSQL role and database that you
+can write to. Use a disposable local database for trying it out; the commands
+below assume `dowai_demo` for both names.
+
+```bash
+# 0. Create the role and database (run as a PostgreSQL administrator).
+createuser --pwprompt dowai_demo      # or create it with your own tooling
+createdb --owner dowai_demo dowai_demo
+
+# 1. Build the CLI (from this repository) and create a workspace elsewhere.
+cargo build --workspace                       # run inside the DOWAI repository
+export DOWAI="$(pwd)/target/debug/dowai"      # path to the binary you just built
+mkdir -p ~/dowai-demo && cd ~/dowai-demo
+"$DOWAI" init demo --workspace .              # creates ./projects/demo
+cd projects/demo
 ```
 
-Example model layout:
+Replace `workspace.json` (in the workspace root, the directory that contains
+`projects/`) with a PostgreSQL profile. The password is read from the environment variable
+named in `password_env`; it is never stored in the file:
 
-```text
-projects/exemplo/
-├── dowai_project.json
-└── models/
-    ├── stg_vendas.sql
-    └── faturamento.sql
+```json
+{
+  "schema_version": 2,
+  "workspace_name": "workspace",
+  "profiles": {
+    "warehouse": {
+      "type": "postgres",
+      "host": "127.0.0.1",
+      "port": 5432,
+      "user": "dowai_demo",
+      "database": "dowai_demo",
+      "password_env": "DOWAI_DEMO_PASSWORD",
+      "tls": "disabled"
+    }
+  },
+  "defaults": { "execution": { "default_profile": "warehouse" } }
+}
 ```
 
-`faturamento.sql` may declare its static dependency as
-`select * from {{ ref('stg_vendas') }}`. Python model dependencies may use
-`env.depends_on("stg_vendas")`. Planning reads files as text; it never imports
-or executes Python.
+`tls: "disabled"` is accepted only for loopback hosts. Use `"required"` for any
+other host.
 
-`plan --manual` preserves the supplied order and warns when a declared
-predecessor is omitted or comes later. Automatic planning orders all static
-predecessors first. `--vars` accepts a JSON object for template conditions and
-validates SQL templates in plan order. `def_var` changes are temporary to that
-planning operation; rendered SQL and variable changes are not persisted or
-included in the plan output.
+Create a virtual environment for Python models, then point the project at it
+and allow external writes (the project `config` layer):
 
-SQL templates support allowlisted conditionals, `ref()`, and
-`config(materialized='table'|'view')`. Values are never interpolated into SQL.
-Declare external PostgreSQL relations in the project `sources` map to resolve
-static `source()` macros; source relations are not executable plan nodes. See
-[configuration](docs/CONFIGURATION.md) for the JSON shape and restrictions.
+```bash
+python3 -m venv --without-pip .venv
+cat > dowai_project.json <<EOF
+{
+  "schema_version": 2,
+  "name": "demo",
+  "models_dir": "models",
+  "python": { "interpreter": "$(pwd)/.venv/bin/python", "timeout_seconds": 60 },
+  "config": { "security": { "allow_external_writes": true } }
+}
+EOF
+```
 
-## CLI currently available
+The interpreter must be inside the project directory. The models below use only
+the standard library, so the virtual environment needs no packages.
 
-- `dowai --version`
+Two models: a SQL model, and a Python model that reads it with `env.ref()`:
+
+```bash
+cat > models/stg_vendas.sql <<'EOF'
+select 1 as id, 'caneta' as produto, 10.5::numeric as valor
+union all
+select 2, 'caderno', 20.0::numeric
+EOF
+
+cat > models/faturamento.py <<'EOF'
+def model(env):
+    env.depends_on("stg_vendas")
+    rows = list(env.ref("stg_vendas").iter_rows(batch_size=100))
+    env.setVar("linhas", len(rows))
+    env.setVar("total", sum(float(row["valor"]) for row in rows))
+    return None
+EOF
+```
+
+Validate, then run. `--yes` confirms replacing relations that already exist
+from an earlier run:
+
+```bash
+export DOWAI_DEMO_PASSWORD='your-password'   # the password of the dowai_demo role
+"$DOWAI" validate . --json
+"$DOWAI" run all --yes --json
+```
+
+A successful run reports `"status": "SUCCEEDED"`. The variables `linhas` and
+`total` are stored in the session. `dowai session show <session_id>` lists their
+names; values are never printed by the CLI.
+
+## Advanced examples
+
+The incremental and full-refresh examples were run end to end against a local
+PostgreSQL 16 database. The others are covered by the E2E tests in
+`src/dowai-runtime/tests/` (`write_pg_e2e`, `full_refresh_e2e`,
+`python_e2e`, `connections_e2e`, `retry_e2e`).
+
+### Incremental load with a watermark
+
+The model declares its own watermark. The session keeps it between runs, and it
+moves forward only after the write is committed. Create the destination table
+first; `env.write` appends to an existing table.
+
+```sql
+CREATE TABLE pedidos_demo (id integer, updated_at integer, status text);
+```
+
+```python
+SOURCE = [
+    {"id": 1, "updated_at": 10, "status": "ok"},
+    {"id": 2, "updated_at": 20, "status": "ok"},
+]
+
+def model(env):
+    watermark = env.getVar("pedidos_watermark", 0)
+    delta = [row for row in SOURCE if row["updated_at"] > watermark]
+    if delta:
+        env.write(delta, target="warehouse", table="pedidos_demo", mode="append")
+        env.setVar("pedidos_watermark", max(row["updated_at"] for row in delta))
+    env.setVar("ultimo_delta", len(delta))
+    return None
+```
+
+Run it twice in the same session (`dowai run pedidos.py --yes --session <id>`).
+The first run loads both rows; the second loads none. `env.write` also supports
+`replace` and `upsert` (with `keys`). Upsert needs a unique index on the keys.
+
+### Full refresh through staging and swap
+
+```bash
+dowai run stg_vendas --full-refresh --yes --json
+```
+
+The new relation is built in a staging table and swapped in one transaction.
+A schema change in the destination fails the run by default and keeps the
+existing relation.
+
+### Refuse direct library writes
+
+Enable the policy in the project `config` layer:
+
+```json
+"config": { "security": { "deny_direct_library_writes": true } }
+```
+
+With it enabled, a Python model that imports a database driver or ORM to write
+data (for example `import sqlalchemy`) is refused before it runs, with
+`DOWAI_DIRECT_WRITE_DETECTED`. Without the policy, the same finding is a warning.
+
+### Connection handles without secrets
+
+A model asks for a connection by name and receives an opaque handle with only
+`name` and `kind`:
+
+```python
+def model(env):
+    conn = env.connections.get("approved")
+    env.setVar("conexao", conn.name)
+    return None
+```
+
+The handle has no URL, host, user or password attribute, cannot be assigned to,
+and cannot be pickled. Only profiles allowed by `security.allowed_profiles` can
+be requested.
+
+### Retry failed runs
+
+```bash
+dowai retry <run_id> --failed-only --yes --json
+```
+
+`retry` starts a new run from a FAILED or CANCELLED run. Variables are not
+journaled, so pass `--vars` again if the original run used any. Transient
+PostgreSQL failures of SQL models are retried inside a run with backoff and
+jitter; other failures, and Python models, are not retried.
+
+## CLI
+
 - `dowai init <name> [--workspace PATH]`
 - `dowai validate [PROJECT_DIR] [--strict] [--json]`
 - `dowai plan <model>... [--project-dir PATH] [--manual] [--vars JSON] [--json]`
-- `dowai session start [--project-dir PATH] [--json]`
-- `dowai session show <session_id> [--json]`
-- `dowai session end <session_id> [--json]`
+- `dowai run <model|all> [--profile NAME] [--session ID] [--vars JSON] [--full-refresh] [--yes] [--json]`
+- `dowai retry <run_id> [--failed-only] [--vars JSON] [--yes] [--json]`
+- `dowai runs list|show`, `dowai logs <run_id>`
+- `dowai session start|show|end`
 - `dowai config show --effective [--json]`
 - `dowai doctor [--check-connections] [--json]`
-- `dowai run <model|all> [--profile NAME] [--session ID] [--vars JSON] [--yes] [--json]`
-- `dowai runs list [--limit N] [--json]` (N from 1 to 1000, default 20)
-- `dowai runs show <run_id> [--json]`
-- `dowai logs <run_id> [--node NODE] [--level ERROR|WARN|INFO|DEBUG|TRACE] [--json]`
-- `dowai retry <run_id> [--failed-only] [--vars JSON] [--yes] [--json]` re-runs a FAILED or CANCELLED run (timeouts are FAILED) as a new run. Variables are not journaled, so `--vars` is required again when the original run used any. `--failed-only` re-runs only the models that failed, without their predecessors; it is refused when a failed model depends on a Python model that succeeded in the original run, because that model's variables were never committed.
-  (levels filter invocation status: ERROR = failed; WARN = failed or skipped;
-  INFO/DEBUG/TRACE = all recorded invocations; no free-text messages are shown)
 
-Every PostgreSQL run, including a failed one, is recorded in a local run journal
-(`runs.sqlite3`, next to the session store) with status, timings, error codes
-and invocation tree. Variable values, rendered SQL, error messages and paths are
-never stored.
-
-An audit trail is kept separately in `audit.jsonl` in the same state directory.
-It records run, node, variable-name, external-write, policy-denial and
-nested-invocation events with correlation IDs and SHA-256 hashes of the model,
-effective configuration and plan. It is append-only by convention, not immutable,
-and it cannot be disabled by project configuration.
-
-Concurrent writes to the same session variable are never silently overwritten.
-By default (`sessions.conflict_policy` = `error`) a run whose base revision changed
-fails with `DOWAI_SESSION_CONFLICT` (exit 3) and publishes nothing. With
-`wait_process`, the run waits for the session lock before running any node, up to
-`sessions.wait_process_timeout_seconds` (default 300, range 1 to 86400); if the
-wait times out, it fails with `DOWAI_SESSION_CONFLICT` and runs no node. Nested
-`env.run` calls inherit the lock.
-
-Ctrl+C and SIGTERM (SIGHUP on Unix) cancel a running `dowai run`: the run ends
-`CANCELLED` with exit code 130 and error code `DOWAI_CANCELLED`, Python worker
-process trees are terminated, an in-flight PostgreSQL statement is cancelled and
-its transaction rolled back, and no variables are published. Nodes not yet
-started are `SKIPPED`. On Windows only Ctrl+C is handled, and no real-signal test
-exists there yet.
-
-`--json` keeps machine-readable output on stdout. Errors use stable
-`DOWAI_*` codes and the exit codes documented in the master plan.
-The implemented configuration layers and limits are documented in
+Every command prints machine-readable JSON with `--json`, and errors use stable
+`DOWAI_*` codes. The configuration layers are described in
 [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 
-`doctor --check-connections` uses `execution.default_profile` and the named
-profile in the ancestor `workspace.json`. PostgreSQL profiles require `type`,
-`host`, `port`, `user`, `database`, and a `password_env` variable name; TLS is
-required by default. `tls: "disabled"` is permitted only for loopback hosts.
-Profile secrets are never stored in JSON.
-Database writes are denied unless effective `security.allow_external_writes`
-is enabled. Replacing an existing table or view requires `--yes` by default;
-administrator policy can require approval even if project configuration tries
-to disable it.
+## Limitations
 
-Sessions use a local SQLite database under the platform's DOWAI state
-directory, expire after 24 hours, and persist typed JSON variables through the
-core API. The CLI's `session show` reports variable names but never values.
-The initial limits are 1,000 variables, 64 KiB per value, and 16 MiB per
-session; these limits and the TTL are not configurable yet. Session values are
-stored as plaintext JSON in a per-user database, not encrypted; on Windows,
-filesystem access follows inherited ACLs. Do not put credentials there.
+- **Python is not a sandbox.** Models are trusted project code. They can reach
+  the operating system. The worker receives a minimal environment, and runs
+  under a timeout that terminates its process tree.
+- **Python packages are not installed by DOWAI.** Declaring Python dependencies
+  or enabling unlisted packages fails explicitly.
+- **`env.ref()` reads only SQL models of the same run.** Tables that are not
+  produced by a model are read with `env.source()`, declared in
+  `dowai_project.json`.
+- **Dataset reads** return rows in physical PostgreSQL order (`ctid`).
+- **MySQL** is a write destination and a source for `env.source()`, with
+  `select` and batches ordered by primary key. Filters on MySQL sources are not
+  supported yet, and MySQL tables cannot be SQL models. A transfer from
+  PostgreSQL to MySQL is two independent transactions, not one atomic unit.
+- **TLS** is verified only against local loopback servers with TLS disabled.
+- Plugins, AI features, OpenLineage and installers are not implemented.
 
-To run SQL models, define a PostgreSQL profile in the ancestor `workspace.json`
-and set `execution.default_profile` (or pass `--profile`). Profiles contain a
-`password_env` reference, never a password. Enable
-`security.allow_external_writes` in project configuration before running a
-model; replacing an existing relation also requires `--yes` by default. For
-example:
+Details and evidence for every item: [docs/STATUS.md](docs/STATUS.md). The
+roadmap is in [docs/ROADMAP.md](docs/ROADMAP.md).
 
-```powershell
-# Add "config": {"security": {"allow_external_writes": true}} to
-# dowai_project.json before executing models.
-dowai plan faturamento.sql --vars '{"full_load":true}'
-dowai run faturamento.sql --vars '{"full_load":true}' --yes --json
-```
+## Documentation and contributing
 
-By default, the model's file stem is its PostgreSQL relation name. A SQL run
-replaces an existing table/view of that name atomically for each model, but
-previously completed models are not rolled back if a later model fails.
-`source()` resolves only project-declared PostgreSQL relations using the same
-connection profile as models. `--full-refresh --yes` rebuilds PostgreSQL relations through staging and swap; schema drift fails by default. Remote database
-connections and TLS remain unverified as noted in
-[docs/STATUS.md](docs/STATUS.md).
-
-## Python SDK
-
-A preliminary typed API package is in [src/dowai-sdk](src/dowai-sdk).
-It is not connected to the Rust runtime yet and will fail clearly if runtime
-operations are attempted without a backend.
-
-### Initial Python model runtime
-
-Create a project virtual environment and set `python.interpreter` in
-`dowai_project.json` to its absolute interpreter path (`.venv\Scripts\python.exe`
-on Windows or `.venv/bin/python` on Linux/macOS). A Python-only `run` does not
-need a PostgreSQL profile, but effective `security.allow_external_writes` must
-be enabled because model code is arbitrary trusted project code.
-
-The current worker supports only `def model(env)`, `env.setVar()`,
-`env.getVar()`, `env.unsetVar()`, static `env.depends_on()` declarations, a
-`None` return, and `env.run("other.py")` for Python models (with
-`env.manual()` and `mode="manual"`). Nested calls inherit pending variables,
-merge them back only on success, and are limited by
-`execution.max_call_depth` and `execution.max_invocations_per_run`; `env.run()`
-of `.sql` files is not implemented yet. Variables commit to the session only
-after every selected model succeeds. The worker runs in a supervised subprocess with a configured timeout
-and bounded JSON IPC; Windows Job Objects and Unix process groups are
-terminated on timeout. The worker receives a minimal environment allowlist,
-not arbitrary host variables. This is **not a security sandbox**. Python code
-can access the operating system, and models must be trusted; detached Unix
-subprocesses can escape their process group. `env.ref()`, `env.source()`,
-`env.run()` of `.sql` files, non-`None` results, and package installation
-fail explicitly as unsupported. Datasets (`env.ref()`, `env.source()`) are
-read-only and need a configured PostgreSQL profile; `env.ref()` of a model
-needs a SQL model in the run.
-
-## Development
-
-See [docs/ROADMAP.md](docs/ROADMAP.md), [docs/STATUS.md](docs/STATUS.md), and
-the normative [plano_mestre.md](plano_mestre.md).
+- [Configuration](docs/CONFIGURATION.md), [API](docs/API.md),
+  [compatibility](docs/COMPATIBILITY.md), [operations](docs/OPERATIONS.md),
+  [security](docs/SECURITY.md)
+- [Contributing](CONTRIBUTING.md) and [security policy](SECURITY.md)
+- The normative requirements are in [plano_mestre.md](plano_mestre.md).
