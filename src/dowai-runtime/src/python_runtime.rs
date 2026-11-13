@@ -1,3 +1,4 @@
+use crate::dataset_query::FilterRequest;
 use dowai_core::{CancellationToken, DowaiError, ProjectPython, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -136,6 +137,7 @@ def main():
             self._variables = variables
             self._dependencies = dependencies
             self._mode = mode
+            self._closed = False
 
         @staticmethod
         def _name(name):
@@ -234,7 +236,12 @@ def main():
         def validate(self):
             return self._command("validate")
 
-        def _dataset_request(self, name, operation, **fields):
+        def _dataset_exchange(self, name, operation, **fields):
+            if self._closed:
+                raise ExecutionError(
+                    "DOWAI_DATASET_EXPIRED",
+                    "lazy dataset was used after its model finished",
+                )
             if not isinstance(name, str) or name not in self._dependencies:
                 raise ExecutionError(
                     "DOWAI_DATASET_UNDECLARED",
@@ -249,21 +256,41 @@ def main():
             reply = json.loads(line)
             if reply.get("protocol_version") != 1:
                 raise RuntimeError("invalid dataset reply")
-            if reply.get("kind") == "dataset_ok" and isinstance(reply.get("columns"), list):
-                return [dict(column) for column in reply["columns"]]
-            if (
-                reply.get("kind") == "dataset_rows"
-                and isinstance(reply.get("columns"), list)
-                and isinstance(reply.get("rows"), list)
-            ):
-                names = reply["columns"]
-                return [dict(zip(names, row)) for row in reply["rows"]]
             if reply.get("kind") == "dataset_failed":
                 raise ExecutionError(
                     str(reply.get("code") or "DOWAI_DATASET_UNAVAILABLE"),
                     "dataset is not available to this model",
                 )
+            return reply
+
+        def _dataset_request(self, name, operation, **fields):
+            reply = self._dataset_exchange(name, operation, **fields)
+            if reply.get("kind") == "dataset_ok" and isinstance(reply.get("columns"), list):
+                return [dict(column) for column in reply["columns"]]
             raise RuntimeError("invalid dataset reply")
+
+        def _dataset_batch(self, name, offset, limit, select, filters):
+            """Raw batch of a read plus the indexes of predicates the worker must apply."""
+            fields = {"offset": offset, "limit": limit}
+            if select is not None:
+                fields["select"] = list(select)
+            if filters:
+                fields["filters"] = list(filters)
+            reply = self._dataset_exchange(name, "rows", **fields)
+            if (
+                reply.get("kind") != "dataset_rows"
+                or not isinstance(reply.get("columns"), list)
+                or not isinstance(reply.get("rows"), list)
+            ):
+                raise RuntimeError("invalid dataset reply")
+            residual = reply.get("residual", [])
+            if not isinstance(residual, list) or not all(
+                isinstance(index, int) and not isinstance(index, bool) and 0 <= index < len(filters)
+                for index in residual
+            ):
+                raise RuntimeError("invalid dataset reply")
+            names = reply["columns"]
+            return [dict(zip(names, row)) for row in reply["rows"]], residual
 
         def ref(self, name):
             if not isinstance(name, str) or not name.strip():
@@ -277,10 +304,42 @@ def main():
         write = _unsupported
         generateCsv = _unsupported
 
+    def check_name(value):
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("column must be a non-empty string")
+        return value
+
+    def check_batch_size(batch_size):
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or not 1 <= batch_size <= 10000:
+            raise ValueError("batch_size must be an integer between 1 and 10000")
+
+    def matches(value, predicate):
+        # SQL semantics: NULL never equals and never differs (ENT-041).
+        if value is None:
+            return False
+        equal = value == predicate["value"]
+        return equal if predicate["op"] == "=" else not equal
+
     class Dataset:
-        def __init__(self, environment, name):
+        """Lazy relation: select/filter only describe the read; SQL runs it in batches (ENT-041).
+
+        A dataset is bound to the process that created it. Pickling is refused, and any use
+        after the model returns fails with DOWAI_DATASET_EXPIRED.
+        """
+
+        OPERATORS = ("=", "!=", "<", "<=", ">", ">=", "is_null", "is_not_null")
+
+        def __init__(self, environment, name, select=None, filters=()):
             self._environment = environment
             self._name = name
+            self._select = select
+            self._filters = filters
+
+        def __reduce_ex__(self, protocol):
+            raise TypeError("a lazy dataset cannot leave the DOWAI process")
+
+        def __reduce__(self):
+            raise TypeError("a lazy dataset cannot leave the DOWAI process")
 
         @property
         def name(self):
@@ -289,20 +348,54 @@ def main():
         def schema(self):
             return self._environment._dataset_request(self._name, "schema")
 
-        def iter_rows(self, batch_size=1000):
-            if isinstance(batch_size, bool) or not isinstance(batch_size, int) or not 1 <= batch_size <= 10000:
-                raise ValueError("batch_size must be an integer between 1 and 10000")
-            return self._iterate_rows(batch_size)
+        def select(self, *columns):
+            if not columns:
+                raise ValueError("select needs at least one column")
+            for column in columns:
+                check_name(column)
+            if len(set(columns)) != len(columns):
+                raise ValueError("select names the same column twice")
+            return Dataset(self._environment, self._name, tuple(columns), self._filters)
 
-        def _iterate_rows(self, batch_size):
+        def filter(self, column, op, value=None):
+            check_name(column)
+            if op not in Dataset.OPERATORS:
+                raise ValueError("unsupported filter operator")
+            if op in ("is_null", "is_not_null"):
+                if value is not None:
+                    raise ValueError("is_null and is_not_null take no value")
+            else:
+                if value is None or not isinstance(value, (bool, int, float, str)):
+                    raise ValueError("filter value must be bool, int, float or str")
+                if isinstance(value, float) and (value != value or value in (float("inf"), float("-inf"))):
+                    raise ValueError("filter value must be finite")
+            predicate = {"column": column, "op": op, "value": value}
+            return Dataset(self._environment, self._name, self._select, self._filters + (predicate,))
+
+        def iter_batches(self, batch_size=1000):
+            check_batch_size(batch_size)
+            return self._iterate_batches(batch_size)
+
+        def iter_rows(self, batch_size=1000):
+            return (row for batch in self.iter_batches(batch_size) for row in batch)
+
+        def _iterate_batches(self, batch_size):
             offset = 0
             while True:
-                batch = self._environment._dataset_request(
-                    self._name, "rows", offset=offset, limit=batch_size
+                raw, residual = self._environment._dataset_batch(
+                    self._name, offset, batch_size, self._select, self._filters
                 )
-                for row in batch:
-                    yield row
-                if len(batch) < batch_size:
+                kept = [
+                    row
+                    for row in raw
+                    if all(matches(row[self._filters[index]["column"]], self._filters[index]) for index in residual)
+                ]
+                if self._select is not None:
+                    kept = [{name: row[name] for name in self._select} for row in kept]
+                if kept:
+                    yield kept
+                # The end of the relation is the raw batch length, not the kept length.
+                if len(raw) < batch_size:
                     return
                 offset += batch_size
 
@@ -330,6 +423,8 @@ def main():
             message["invocation_id"] = failed_call
         respond(message)
         return
+    finally:
+        environment._closed = True
     if result is not None:
         respond({"protocol_version": 1, "kind": "unsupported"})
     else:
@@ -372,6 +467,10 @@ struct WorkerMessage {
     offset: Option<u64>,
     #[serde(default)]
     limit: Option<u32>,
+    #[serde(default)]
+    select: Option<Vec<String>>,
+    #[serde(default)]
+    filters: Option<Vec<FilterRequest>>,
 }
 
 /// One column of a dataset, as the worker sees it.
@@ -390,6 +489,8 @@ pub(crate) enum HostRequest {
         operation: String,
         offset: Option<u64>,
         limit: Option<u32>,
+        select: Option<Vec<String>>,
+        filters: Vec<FilterRequest>,
     },
     Command {
         operation: String,
@@ -405,6 +506,8 @@ pub(crate) enum DatasetAnswer {
     Rows {
         columns: Vec<String>,
         rows: Vec<Vec<Value>>,
+        /// Predicates (indexes into the request) the worker applies after fetching (ENT-041).
+        residual: Vec<usize>,
     },
 }
 
@@ -421,6 +524,7 @@ struct DatasetRowsReply<'a> {
     kind: &'a str,
     columns: &'a [String],
     rows: &'a [Vec<Value>],
+    residual: &'a [usize],
 }
 
 #[derive(Serialize)]
@@ -787,6 +891,8 @@ impl Supervision {
                     operation,
                     offset: message.offset,
                     limit: message.limit,
+                    select: message.select,
+                    filters: message.filters.unwrap_or_default(),
                 }) else {
                     return Err(protocol_error());
                 };
@@ -797,14 +903,17 @@ impl Supervision {
                         columns: Some(columns),
                         code: None,
                     }),
-                    Ok(DatasetAnswer::Rows { columns, rows }) => {
-                        serde_json::to_vec(&DatasetRowsReply {
-                            protocol_version: IPC_PROTOCOL_VERSION,
-                            kind: "dataset_rows",
-                            columns,
-                            rows,
-                        })
-                    }
+                    Ok(DatasetAnswer::Rows {
+                        columns,
+                        rows,
+                        residual,
+                    }) => serde_json::to_vec(&DatasetRowsReply {
+                        protocol_version: IPC_PROTOCOL_VERSION,
+                        kind: "dataset_rows",
+                        columns,
+                        rows,
+                        residual,
+                    }),
                     Err(error) => serde_json::to_vec(&DatasetReply {
                         protocol_version: IPC_PROTOCOL_VERSION,
                         kind: "dataset_failed",

@@ -681,3 +681,89 @@ fn retry_failed_only_skips_committed_sql_predecessor() {
         json!(true)
     );
 }
+
+/// ENT-041: `select` and `filter` run in SQL (pushdown); `iter_batches` returns only the rows
+/// the predicates keep, `is_null` included, and batch boundaries do not drop matches.
+#[test]
+#[ignore = "opt-in E2E; requires a dedicated disposable PostgreSQL database"]
+fn ent041_select_and_filter_are_pushed_and_batches_return_only_matches() {
+    let fx = Fixture::new("ent041-push");
+    let (sql, py) = (fx.name("upstream"), fx.name("reader"));
+    let _cleanup = TableCleanup(vec![sql.clone()]);
+    fx.write_model(
+        &format!("{sql}.sql"),
+        "select g::int4 as id, ('v' || g)::text as label, (g % 2 = 0) as even, null::text as empty from generate_series(1, 25) as g",
+    );
+    fx.write_model(
+        &format!("{py}.py"),
+        &format!(
+            "def model(env):\n    env.depends_on('{sql}')\n    ds = env.ref('{sql}')\n    view = ds.select('id', 'label').filter('id', '>', 10).filter('even', '=', True)\n    rows = [row for batch in view.iter_batches(batch_size=4) for row in batch]\n    env.setVar('row_count', len(rows))\n    env.setVar('ids', ','.join(str(r['id']) for r in rows))\n    env.setVar('keys', ','.join(sorted(rows[0].keys())))\n    nulls = list(ds.select('id').filter('empty', 'is_null').iter_rows(batch_size=10))\n    env.setVar('null_count', len(nulls))\n    return None\n"
+        ),
+    );
+
+    let result = fx
+        .run(&[&format!("{py}.py")], None, None)
+        .expect("mixed run");
+
+    assert_eq!(result.status, "SUCCEEDED");
+    assert!(
+        !result
+            .warnings
+            .iter()
+            .any(|warning| warning.starts_with("DOWAI_DATASET_FILTER_NOT_PUSHED")),
+        "pushed filters must not warn: {:?}",
+        result.warnings
+    );
+    let variables = fx.variables(&result.session_id);
+    assert_eq!(variables["row_count"], json!(7));
+    assert_eq!(variables["ids"], json!("12,14,16,18,20,22,24"));
+    assert_eq!(variables["keys"], json!("id,label"));
+    assert_eq!(variables["null_count"], json!(25));
+}
+
+/// ENT-041: an equality on a text-read column (`numeric`) is applied by the worker and reported
+/// as a warning; ordered comparisons on it, unknown projections and pickling are refused with
+/// stable codes.
+#[test]
+#[ignore = "opt-in E2E; requires a dedicated disposable PostgreSQL database"]
+fn ent041_fallback_is_warned_and_refusals_have_stable_codes() {
+    let fx = Fixture::new("ent041-fallback");
+    let (sql, py) = (fx.name("upstream"), fx.name("reader"));
+    let _cleanup = TableCleanup(vec![sql.clone()]);
+    fx.write_model(
+        &format!("{sql}.sql"),
+        "select g::int4 as id, (g * 1.5)::numeric(10,2) as amount from generate_series(1, 5) as g",
+    );
+    fx.write_model(
+        &format!("{py}.py"),
+        &format!(
+            "def model(env):\n    env.depends_on('{sql}')\n    ds = env.ref('{sql}')\n    matches = list(ds.filter('amount', '=', '1.50').iter_rows(batch_size=10))\n    env.setVar('fallback_count', len(matches))\n    env.setVar('fallback_id', matches[0]['id'])\n    try:\n        list(ds.filter('amount', '>', '1').iter_rows(batch_size=10))\n    except Exception as error:\n        env.setVar('ordered_code', error.code)\n    try:\n        list(ds.select('nope').iter_rows(batch_size=10))\n    except Exception as error:\n        env.setVar('select_code', error.code)\n    try:\n        import pickle\n        pickle.dumps(ds)\n    except TypeError:\n        env.setVar('pickle_refused', True)\n    return None\n"
+        ),
+    );
+
+    let result = fx
+        .run(&[&format!("{py}.py")], None, None)
+        .expect("mixed run");
+
+    assert_eq!(result.status, "SUCCEEDED");
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|warning| warning.starts_with("DOWAI_DATASET_FILTER_NOT_PUSHED")),
+        "fallback must be observable: {:?}",
+        result.warnings
+    );
+    let variables = fx.variables(&result.session_id);
+    assert_eq!(variables["fallback_count"], json!(1));
+    assert_eq!(variables["fallback_id"], json!(1));
+    assert_eq!(
+        variables["ordered_code"],
+        json!("DOWAI_DATASET_FILTER_UNSUPPORTED")
+    );
+    assert_eq!(
+        variables["select_code"],
+        json!("DOWAI_DATASET_INVALID_QUERY")
+    );
+    assert_eq!(variables["pickle_refused"], json!(true));
+}

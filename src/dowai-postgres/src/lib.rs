@@ -311,27 +311,29 @@ impl PostgresAdapter {
         offset: u64,
         limit: u32,
     ) -> Result<Vec<Vec<DatasetCell>>, AdapterError> {
-        let mut select = Vec::with_capacity(columns.len());
-        for (name, data_type) in columns {
-            let identifier = quote_identifier(name)?;
-            if DIRECT_TYPES.contains(&data_type.as_str()) {
-                select.push(identifier);
-            } else {
-                select.push(format!("{identifier}::text"));
-            }
-        }
-        if select.is_empty() {
-            return Err(AdapterError::QueryFailed);
-        }
-        let offset = i64::try_from(offset).map_err(|_| AdapterError::QueryFailed)?;
-        let limit = i64::from(limit);
-        let sql = format!(
-            "SELECT {} FROM {relation} ORDER BY ctid OFFSET $1 LIMIT $2",
-            select.join(", ")
-        );
+        self.read_rows_filtered(relation, columns, &[], offset, limit)
+    }
+
+    /// Like [`PostgresAdapter::read_rows`], with `filters` pushed down to the `WHERE` clause
+    /// (ENT-041). Filters are combined with `AND`. Returned rows are the ones that satisfy the
+    /// predicates, so the host counts only what the filter let through.
+    pub fn read_rows_filtered(
+        &mut self,
+        relation: &str,
+        columns: &[(String, String)],
+        filters: &[SqlFilter],
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<Vec<DatasetCell>>, AdapterError> {
+        let statement = rows_statement(relation, columns, filters, offset, limit)?;
+        let params: Vec<&(dyn ToSql + Sync)> = statement
+            .params
+            .iter()
+            .map(|param| param.as_ref())
+            .collect();
         let rows = self
             .client
-            .query(&sql, &[&offset, &limit])
+            .query(&statement.sql, &params)
             .map_err(|_| AdapterError::QueryFailed)?;
         rows.iter()
             .map(|row| {
@@ -670,6 +672,130 @@ fn is_local_host(host: &str) -> bool {
 mod tests;
 
 /// Types read directly; every other type is cast to text in the SELECT list.
+/// Comparison pushed down to PostgreSQL (ENT-041). The set is closed: the SQL operator is
+/// chosen here, never taken from the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterOp {
+    Eq,
+    NotEq,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
+    IsNull,
+    IsNotNull,
+}
+
+/// Value of a pushed-down comparison. It is bound as a parameter with an explicit SQL type,
+/// never concatenated into the statement text.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FilterValue {
+    /// Only valid with [`FilterOp::IsNull`] and [`FilterOp::IsNotNull`].
+    None,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Text(String),
+}
+
+/// One predicate `column op value` of a dataset read.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SqlFilter {
+    pub column: String,
+    pub op: FilterOp,
+    pub value: FilterValue,
+}
+
+/// A batch statement and its parameters, built without a connection.
+pub struct RowsStatement {
+    sql: String,
+    params: Vec<Box<dyn ToSql + Sync>>,
+}
+
+impl RowsStatement {
+    /// The SQL text, with `$n` placeholders for every bound value.
+    pub fn sql(&self) -> &str {
+        &self.sql
+    }
+}
+
+/// Builds the batch statement for [`PostgresAdapter::read_rows_filtered`]. Pure: it only
+/// quotes identifiers and orders parameters, so the pushed predicates can be asserted directly.
+pub fn rows_statement(
+    relation: &str,
+    columns: &[(String, String)],
+    filters: &[SqlFilter],
+    offset: u64,
+    limit: u32,
+) -> Result<RowsStatement, AdapterError> {
+    let mut select = Vec::with_capacity(columns.len());
+    for (name, data_type) in columns {
+        let identifier = quote_identifier(name)?;
+        if DIRECT_TYPES.contains(&data_type.as_str()) {
+            select.push(identifier);
+        } else {
+            select.push(format!("{identifier}::text"));
+        }
+    }
+    if select.is_empty() {
+        return Err(AdapterError::QueryFailed);
+    }
+    let mut params: Vec<Box<dyn ToSql + Sync>> = Vec::new();
+    let mut clauses = Vec::with_capacity(filters.len());
+    for filter in filters {
+        let column = quote_identifier(&filter.column)?;
+        let operator = match filter.op {
+            FilterOp::Eq => "=",
+            FilterOp::NotEq => "<>",
+            FilterOp::Lt => "<",
+            FilterOp::LtEq => "<=",
+            FilterOp::Gt => ">",
+            FilterOp::GtEq => ">=",
+            FilterOp::IsNull => {
+                if filter.value != FilterValue::None {
+                    return Err(AdapterError::QueryFailed);
+                }
+                clauses.push(format!("{column} IS NULL"));
+                continue;
+            }
+            FilterOp::IsNotNull => {
+                if filter.value != FilterValue::None {
+                    return Err(AdapterError::QueryFailed);
+                }
+                clauses.push(format!("{column} IS NOT NULL"));
+                continue;
+            }
+        };
+        let equality_only = matches!(filter.op, FilterOp::Eq | FilterOp::NotEq);
+        let position = params.len() + 1;
+        let (cast, param): (&str, Box<dyn ToSql + Sync>) = match &filter.value {
+            FilterValue::None => return Err(AdapterError::QueryFailed),
+            FilterValue::Bool(value) if equality_only => ("bool", Box::new(*value)),
+            FilterValue::Bool(_) => return Err(AdapterError::QueryFailed),
+            FilterValue::Int(value) => ("int8", Box::new(*value)),
+            FilterValue::Float(value) => ("float8", Box::new(*value)),
+            FilterValue::Text(value) => ("text", Box::new(value.clone())),
+        };
+        params.push(param);
+        clauses.push(format!("{column} {operator} ${position}::{cast}"));
+    }
+    let offset = i64::try_from(offset).map_err(|_| AdapterError::QueryFailed)?;
+    params.push(Box::new(offset));
+    let offset_position = params.len();
+    params.push(Box::new(i64::from(limit)));
+    let limit_position = params.len();
+    let where_clause = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", clauses.join(" AND "))
+    };
+    let sql = format!(
+        "SELECT {} FROM {relation}{where_clause} ORDER BY ctid OFFSET ${offset_position} LIMIT ${limit_position}",
+        select.join(", ")
+    );
+    Ok(RowsStatement { sql, params })
+}
+
 const DIRECT_TYPES: &[&str] = &[
     "bool", "int2", "int4", "int8", "float4", "float8", "text", "varchar", "bpchar", "name",
 ];
@@ -714,4 +840,109 @@ fn decode_cell(row: &Row, index: usize, data_type: &str) -> Result<DatasetCell, 
         }
     };
     decoded.map_err(|_| AdapterError::QueryFailed)
+}
+
+#[cfg(test)]
+mod rows_statement_tests {
+    use super::{rows_statement, FilterOp, FilterValue, SqlFilter};
+
+    fn columns() -> Vec<(String, String)> {
+        vec![
+            ("id".to_owned(), "int4".to_owned()),
+            ("label".to_owned(), "text".to_owned()),
+            ("amount".to_owned(), "numeric".to_owned()),
+        ]
+    }
+
+    fn filter(column: &str, op: FilterOp, value: FilterValue) -> SqlFilter {
+        SqlFilter {
+            column: column.to_owned(),
+            op,
+            value,
+        }
+    }
+
+    #[test]
+    fn pushed_predicate_appears_in_where_with_typed_parameter() {
+        let statement = rows_statement(
+            "\"public\".\"t\"",
+            &columns(),
+            &[filter("id", FilterOp::Gt, FilterValue::Int(10))],
+            0,
+            100,
+        )
+        .expect("statement");
+        assert_eq!(
+            statement.sql(),
+            "SELECT \"id\", \"label\", \"amount\"::text FROM \"public\".\"t\" WHERE \"id\" > $1::int8 ORDER BY ctid OFFSET $2 LIMIT $3"
+        );
+    }
+
+    #[test]
+    fn predicates_are_combined_with_and_and_null_tests_bind_nothing() {
+        let statement = rows_statement(
+            "\"t\"",
+            &columns(),
+            &[
+                filter("label", FilterOp::Eq, FilterValue::Text("x".to_owned())),
+                filter("amount", FilterOp::IsNotNull, FilterValue::None),
+                filter("id", FilterOp::LtEq, FilterValue::Float(2.5)),
+            ],
+            5,
+            10,
+        )
+        .expect("statement");
+        assert!(statement.sql().contains(
+            " WHERE \"label\" = $1::text AND \"amount\" IS NOT NULL AND \"id\" <= $2::float8 "
+        ));
+        assert!(statement.sql().ends_with("OFFSET $3 LIMIT $4"));
+    }
+
+    #[test]
+    fn identifiers_are_quoted_and_values_never_reach_the_text() {
+        let statement = rows_statement(
+            "\"t\"",
+            &columns(),
+            &[filter(
+                "label",
+                FilterOp::Eq,
+                FilterValue::Text("x'; DROP TABLE t; --".to_owned()),
+            )],
+            0,
+            1,
+        )
+        .expect("statement");
+        assert!(!statement.sql().contains("DROP"));
+        assert!(!statement.sql().contains('\''));
+    }
+
+    #[test]
+    fn invalid_combinations_are_refused_before_any_connection() {
+        let ordered_bool = rows_statement(
+            "\"t\"",
+            &columns(),
+            &[filter("id", FilterOp::Lt, FilterValue::Bool(true))],
+            0,
+            1,
+        );
+        assert!(ordered_bool.is_err());
+        let null_with_value = rows_statement(
+            "\"t\"",
+            &columns(),
+            &[filter("id", FilterOp::IsNull, FilterValue::Int(1))],
+            0,
+            1,
+        );
+        assert!(null_with_value.is_err());
+        let hostile_name = rows_statement(
+            "\"t\"",
+            &columns(),
+            &[filter("id\"; --", FilterOp::Eq, FilterValue::Int(1))],
+            0,
+            1,
+        );
+        // The name is quoted as an identifier (embedded quote doubled), never spliced raw.
+        let statement = hostile_name.expect("quoted identifier");
+        assert!(statement.sql().contains("WHERE \"id\"\"; --\" = $1::int8"));
+    }
 }

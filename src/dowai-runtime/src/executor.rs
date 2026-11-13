@@ -3,6 +3,7 @@
 //! resolved at run time with the existing planner and recorded in a flat
 //! invocation history linked by `parent_invocation_id`.
 
+use crate::dataset_query::{self, FilterRequest};
 use crate::python_runtime::{
     self, CallDetails, ChildCall, ChildOutcome, DatasetAnswer, DatasetColumn, HostReply,
     HostRequest, ModelInvocation,
@@ -58,6 +59,8 @@ pub(crate) struct DatasetSource {
     /// Requests served (any operation), bounded by `MAX_DATASET_REQUESTS`.
     requests: usize,
     rows_served: u64,
+    /// Fallback warnings (ENT-041), each recorded once per run.
+    warnings: Vec<String>,
 }
 
 impl DatasetSource {
@@ -74,7 +77,13 @@ impl DatasetSource {
             columns: BTreeMap::new(),
             requests: 0,
             rows_served: 0,
+            warnings: Vec::new(),
         }
+    }
+
+    /// Warnings raised by dataset reads of the run, drained once when the run finishes.
+    pub(crate) fn take_warnings(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.warnings)
     }
 
     /// Authorize a dataset name for the model that asks: a SQL relation of the plan that the
@@ -142,9 +151,14 @@ impl DatasetSource {
         &mut self,
         dataset: &str,
         depends_on: &[String],
-        offset: Option<u64>,
-        limit: Option<u32>,
+        request: RowsRequest<'_>,
     ) -> Result<DatasetAnswer> {
+        let RowsRequest {
+            offset,
+            limit,
+            select,
+            filters,
+        } = request;
         let (Some(offset), Some(limit)) = (offset, limit) else {
             return Err(dataset_error(
                 DATASET_UNAVAILABLE,
@@ -164,21 +178,38 @@ impl DatasetSource {
             ));
         }
         let relation = self.authorize(dataset, depends_on)?;
-        let columns = self.columns(&relation)?;
+        let all_columns = self.columns(&relation)?;
+        let plan = dataset_query::plan(&all_columns, select, filters)?;
+        for warning in plan.warnings {
+            if !self.warnings.contains(&warning) {
+                self.warnings.push(warning);
+            }
+        }
         let rows = self
             .adapter()?
-            .read_rows(&relation, &columns, offset, limit)
+            .read_rows_filtered(&relation, &plan.fetch, &plan.pushed, offset, limit)
             .map_err(|_| dataset_error(DATASET_UNAVAILABLE, "Dataset rows could not be read"))?;
+        // Counted after SQL filtering: only rows that the predicates let through are served.
         self.rows_served += rows.len() as u64;
         let rows = rows
             .into_iter()
             .map(|row| row.into_iter().map(cell_to_json).collect())
             .collect();
         Ok(DatasetAnswer::Rows {
-            columns: columns.into_iter().map(|(name, _)| name).collect(),
+            columns: plan.fetch.into_iter().map(|(name, _)| name).collect(),
             rows,
+            residual: plan.residual,
         })
     }
+}
+
+/// Parameters of one batch read: a window of the relation plus the projection and predicates
+/// of a lazy dataset (ENT-041). `select` and `filters` are absent for a plain `iter_rows`.
+pub(crate) struct RowsRequest<'a> {
+    pub offset: Option<u64>,
+    pub limit: Option<u32>,
+    pub select: Option<&'a [String]>,
+    pub filters: &'a [FilterRequest],
 }
 
 /// JSON form of one cell. Non-finite floats travel as text, since JSON has no NaN.
@@ -446,9 +477,19 @@ impl<'a> Executor<'a> {
                 operation,
                 offset,
                 limit,
-            } => HostReply::Dataset(
-                self.dataset_request(&dataset, &operation, offset, limit, depends_on),
-            ),
+                select,
+                filters,
+            } => HostReply::Dataset(self.dataset_request(
+                &dataset,
+                &operation,
+                RowsRequest {
+                    offset,
+                    limit,
+                    select: select.as_deref(),
+                    filters: &filters,
+                },
+                depends_on,
+            )),
             HostRequest::Command {
                 operation,
                 target,
@@ -511,8 +552,7 @@ impl<'a> Executor<'a> {
         &mut self,
         dataset: &str,
         operation: &str,
-        offset: Option<u64>,
-        limit: Option<u32>,
+        request: RowsRequest<'_>,
         depends_on: &[String],
     ) -> Result<DatasetAnswer> {
         self.cancel.check()?;
@@ -532,7 +572,7 @@ impl<'a> Executor<'a> {
         source.requests += 1;
         match operation {
             "schema" => source.schema(dataset, depends_on),
-            "rows" => source.rows(dataset, depends_on, offset, limit),
+            "rows" => source.rows(dataset, depends_on, request),
             _ => Err(DowaiError::NotImplemented(
                 "This dataset operation is not available yet".to_owned(),
             )),

@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 mod auditor;
+mod dataset_query;
 mod executor;
 mod plugin_exec;
 mod python_runtime;
@@ -1024,6 +1025,10 @@ fn execute_run(
             &trace.root_invocation_id,
         )?;
         trace.audit.variables_published(variable_names(&variables));
+        // Fallback filters of dataset reads are reported, never applied silently (ENT-041).
+        if let Some(datasets) = executor.datasets.as_mut() {
+            execution_plan.warnings.extend(datasets.take_warnings());
+        }
         return Ok(RunResult {
             schema_version: 2,
             session_id: session.session_id,

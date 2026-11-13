@@ -142,6 +142,7 @@ Disponível no modelo Python executado pelo runtime:
 | `plan(target, mode=None)`, `validate()` | Implementado; mesmo JSON do CLI. |
 | `ref(name).schema()` | Implementado para modelos SQL de uma execução mista SQL+Python (somente leitura, apenas relações declaradas em `depends_on`; limite de 10 000 requisições por execução). |
 | `ref(name).iter_rows(batch_size)` | Implementado em lotes de até 10 000 linhas, em ordem física; recusado para views (`DOWAI_DATASET_UNAVAILABLE`). |
+| `ref(name).select(*cols)`, `.filter(col, op, value)`, `.iter_batches(batch_size)` | Implementados (ENT-041). Projeção e comparações (`=`, `!=`, `<`, `<=`, `>`, `>=`, `is_null`, `is_not_null`) em `bool`, inteiros, `float` e texto rodam no SQL com parâmetros tipados. `=`/`!=` em tipos lidos como texto (ex.: `numeric`, datas, UUID) são aplicados pelo worker sobre a forma textual e geram o aviso `DOWAI_DATASET_FILTER_NOT_PUSHED` em `warnings`. Comparações ordenadas nesses tipos são recusadas com `DOWAI_DATASET_FILTER_UNSUPPORTED`; projeção inválida com `DOWAI_DATASET_INVALID_QUERY`. Objeto lazy não pode ser serializado e expira ao fim do model (`DOWAI_DATASET_EXPIRED`). |
 | `ref(name).to_*`, `source()`, `write()`, `generateCSV` com streaming | Não implementado (`STATUS.md`, área "Python subprocess runtime"). |
 | Dependências instaladas pelo modelo | Não implementado. |
 
