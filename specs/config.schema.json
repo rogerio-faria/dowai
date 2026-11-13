@@ -245,6 +245,7 @@
           "additionalProperties": false,
           "required": [
             "allow_external_writes",
+            "deny_direct_library_writes",
             "require_approval_for_destructive",
             "allow_insecure_tls",
             "allowed_paths",
@@ -253,6 +254,11 @@
           ],
           "properties": {
             "allow_external_writes": {
+              "type": "boolean",
+              "default": false,
+              "x-unit": ""
+            },
+            "deny_direct_library_writes": {
               "type": "boolean",
               "default": false,
               "x-unit": ""

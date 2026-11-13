@@ -2,10 +2,10 @@ use auditor::Auditor;
 use dowai_core::{
     admin_config_path, current_time_ms, default_run_store_path, load_project,
     load_workspace_profile, plan, read_planned_model, resolve_effective_configuration, sha256_hex,
-    source_relation_key, user_config_path, verify_planned_model, CancellationToken, DowaiError,
-    ExecutionMode, ExecutionPlan, LogPolicy, Materialization, NewInvocation, NewRun, PlanNode,
-    Result, RunStart, RunStore, SessionStore, TemplateOptions, VariableOrigin, VersionedSnapshot,
-    WorkspaceProfile,
+    source_relation_key, static_direct_write_signals, user_config_path, verify_planned_model,
+    CancellationToken, DowaiError, ExecutionMode, ExecutionPlan, LogPolicy, Materialization,
+    NewInvocation, NewRun, PlanNode, Result, RunStart, RunStore, SessionStore, TemplateOptions,
+    VariableOrigin, VersionedSnapshot, WorkspaceProfile,
 };
 use dowai_postgres::{
     quote_identifier, AdapterError, Materialization as PostgresMaterialization, PgProfile,
@@ -742,6 +742,9 @@ fn execute_run(
         &configuration,
         &execution_plan.nodes,
     )?);
+    // ENT-049: escrita direta por bibliotecas gera aviso no resultado; recusada se configurada.
+    let direct_writes = direct_write_warnings(&root, &configuration, &execution_plan.nodes)?;
+    execution_plan.warnings.extend(direct_writes);
     let python_nodes = execution_plan
         .nodes
         .iter()
@@ -1582,6 +1585,41 @@ fn enforce_profile_policy(
         &profile.host,
         "PostgreSQL host",
     )
+}
+
+/// Verifica modelos Python por AST, sem execução, quanto a escrita direta por bibliotecas
+/// (drivers/ORMs e `to_sql`/`write_database`). Com `security.deny_direct_library_writes`
+/// verdadeiro, recusa com `DOWAI_POLICY_DENIED`; caso contrário devolve um aviso por modelo.
+fn direct_write_warnings(
+    root: &Path,
+    configuration: &Value,
+    nodes: &[PlanNode],
+) -> Result<Vec<String>> {
+    let deny = configuration["effective"]["security"]["deny_direct_library_writes"]
+        .as_bool()
+        .ok_or_else(|| {
+            DowaiError::Config("Effective deny_direct_library_writes is invalid".to_owned())
+        })?;
+    let mut warnings = Vec::new();
+    for node in nodes.iter().filter(|node| is_python_path(&node.path)) {
+        let source = read_planned_model(root, &node.path)?;
+        let signals = static_direct_write_signals(&node.id, &source)?;
+        if signals.is_empty() {
+            continue;
+        }
+        let found = signals.join(", ");
+        if deny {
+            return Err(DowaiError::Policy(format!(
+                "{}: direct library writes are denied by effective security policy ({found})",
+                node.id
+            )));
+        }
+        warnings.push(format!(
+            "DOWAI_DIRECT_WRITE_DETECTED: {}: {found}; efeitos gravados diretamente por bibliotecas não são contabilizados pelo DOWAI (use env.write)",
+            node.id
+        ));
+    }
+    Ok(warnings)
 }
 
 fn enforce_external_write_policy(configuration: &Value) -> Result<()> {

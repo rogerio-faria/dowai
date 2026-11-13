@@ -14,6 +14,7 @@ pub mod plugin_registry;
 pub mod plugin_stubs;
 mod project;
 mod python_ast;
+pub use python_ast::static_direct_write_signals;
 pub mod python_env;
 mod runs;
 mod sessions;

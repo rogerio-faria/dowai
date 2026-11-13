@@ -328,6 +328,14 @@ pub static PARAMETERS: &[Parameter] = &[
     ),
     p(
         "security",
+        "deny_direct_library_writes",
+        BoolKind,
+        Bool(false),
+        "",
+        RequireIfAdminTrue,
+    ),
+    p(
+        "security",
         "require_approval_for_destructive",
         BoolKind,
         Bool(true),

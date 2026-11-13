@@ -219,6 +219,7 @@ Unidades e limites aparecem na tabela. Limites mínimos e máximos são inclusiv
 | Parâmetro | Default | Tipo e validação | Unidade | Teto administrativo | Estado |
 |---|---|---|---|---|---|
 | `security.allow_external_writes` | `false` | booleano | — | administrador `false` proíbe `true` | em uso pelo runtime/CLI |
+| `security.deny_direct_library_writes` | `false` | booleano | — | administrador `true` impõe `true` | em uso pelo runtime: recusa run com escrita direta por biblioteca detectada (ENT-049) |
 | `security.require_approval_for_destructive` | `true` | booleano | — | administrador `true` impõe `true` | em uso pelo runtime/CLI |
 | `security.allow_insecure_tls` | `false` | booleano | — | administrador `false` proíbe `true` | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
 | `security.allowed_paths` | `[]` | lista de textos | caminhos | interseção com a lista administrativa | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |

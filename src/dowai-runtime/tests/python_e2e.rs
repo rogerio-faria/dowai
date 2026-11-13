@@ -369,3 +369,73 @@ fn env_ref_without_sql_datasets_fails_with_a_catchable_code() {
         .expect("load persisted session variables");
     assert_eq!(variables["ref_code"], json!("DOWAI_DATASET_UNAVAILABLE"));
 }
+
+#[test]
+fn direct_library_write_is_reported_in_the_run_result() {
+    let system_interpreter = python_executable();
+    let workspace = TestWorkspace::new(&system_interpreter);
+    // O import fica em ramo nunca executado: a detecção é por AST e não depende do pacote.
+    workspace.write_model(
+        "writer.py",
+        "def model(env):\n    if False:\n        import sqlalchemy\n    return None\n",
+    );
+
+    let result = run_postgres(
+        &workspace.project,
+        RunRequest {
+            targets: vec!["writer.py".to_owned()],
+            mode: None,
+            profile: None,
+            session_id: None,
+            variables: BTreeMap::new(),
+            confirm_destructive: false,
+            full_refresh: false,
+        },
+    )
+    .expect("a direct write warning must not fail the run by default");
+
+    assert_eq!(result.status, "SUCCEEDED");
+    assert!(
+        result.warnings.iter().any(|warning| warning
+            .starts_with("DOWAI_DIRECT_WRITE_DETECTED: writer.py: import:sqlalchemy")),
+        "warnings: {:?}",
+        result.warnings
+    );
+}
+
+#[test]
+fn direct_library_write_is_refused_when_the_policy_denies_it() {
+    let system_interpreter = python_executable();
+    let workspace = TestWorkspace::new(&system_interpreter);
+    let project_manifest = workspace.project.join("dowai_project.json");
+    let mut project_config: Value = serde_json::from_slice(
+        &fs::read(&project_manifest).expect("read generated project config"),
+    )
+    .expect("generated project config is valid JSON");
+    project_config["config"]["security"]["deny_direct_library_writes"] = json!(true);
+    fs::write(
+        &project_manifest,
+        serde_json::to_vec(&project_config).expect("serialize project config"),
+    )
+    .expect("write project config");
+    workspace.write_model(
+        "writer.py",
+        "def model(env):\n    frame.to_sql('t', connection)\n    return None\n",
+    );
+
+    let error = run_postgres(
+        &workspace.project,
+        RunRequest {
+            targets: vec!["writer.py".to_owned()],
+            mode: None,
+            profile: None,
+            session_id: None,
+            variables: BTreeMap::new(),
+            confirm_destructive: false,
+            full_refresh: false,
+        },
+    )
+    .expect_err("the denied direct write must be refused before execution");
+
+    assert_eq!(error.code(), "DOWAI_POLICY_DENIED");
+}

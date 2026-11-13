@@ -33,6 +33,7 @@
     },
     "security": {
       "allow_external_writes": false,
+      "deny_direct_library_writes": false,
       "require_approval_for_destructive": true,
       "allow_insecure_tls": false,
       "allowed_paths": [],

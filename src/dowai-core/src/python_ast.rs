@@ -10,6 +10,7 @@
 use crate::{DowaiError, Result};
 use rustpython_ast::{self as ast, Constant, Expr, Mod, Visitor};
 use rustpython_parser::{parse, Mode};
+use std::collections::BTreeSet;
 
 const ENV_NAME: &str = "env";
 const STATIC_REFERENCES: [&str; 2] = ["ref", "depends_on"];
@@ -133,6 +134,92 @@ impl Visitor for Collector<'_> {
                 "env.{method} used without a call; references must be called with a string literal"
             ));
             return;
+        }
+        self.generic_visit_expr(node);
+    }
+}
+
+/// Módulos de drivers e ORMs cuja presença indica possível escrita direta (ENT-049, AC058).
+const DIRECT_WRITE_MODULES: [&str; 10] = [
+    "sqlalchemy",
+    "psycopg",
+    "psycopg2",
+    "pymysql",
+    "MySQLdb",
+    "mysql",
+    "asyncpg",
+    "pyodbc",
+    "oracledb",
+    "cx_Oracle",
+];
+/// Métodos de bibliotecas de dataframe que gravam diretamente em banco (ENT-049, AC058).
+const DIRECT_WRITE_METHODS: [&str; 2] = ["to_sql", "write_database"];
+
+/// Sinais estáticos de escrita direta por bibliotecas (ENT-049): `import:<módulo>` para drivers
+/// e ORMs conhecidos e `call:<método>` para `.to_sql(...)`/`.write_database(...)`.
+///
+/// Análise sem execução, como as demais deste módulo. Não é prova de escrita: indica uso que
+/// pode gravar fora do `env.write`, por isso gera aviso e, quando configurado, recusa.
+pub fn static_direct_write_signals(model_id: &str, source: &str) -> Result<Vec<String>> {
+    let parsed = parse(source, Mode::Module, model_id).map_err(|error| {
+        DowaiError::Model(format!(
+            "{model_id}: código Python não pôde ser analisado por AST sem execução: {}",
+            error.error
+        ))
+    })?;
+    let Mod::Module(module) = parsed else {
+        return Err(DowaiError::Model(format!(
+            "{model_id}: módulo Python inesperado na análise AST"
+        )));
+    };
+    let mut collector = DirectWriteCollector {
+        signals: BTreeSet::new(),
+    };
+    for statement in module.body {
+        collector.visit_stmt(statement);
+    }
+    Ok(collector.signals.into_iter().collect())
+}
+
+struct DirectWriteCollector {
+    signals: BTreeSet<String>,
+}
+
+impl DirectWriteCollector {
+    fn import(&mut self, module: &str) {
+        let top = module.split('.').next().unwrap_or(module);
+        if DIRECT_WRITE_MODULES.contains(&top) {
+            self.signals.insert(format!("import:{top}"));
+        }
+    }
+}
+
+impl Visitor for DirectWriteCollector {
+    fn visit_stmt(&mut self, node: ast::Stmt) {
+        match &node {
+            ast::Stmt::Import(import) => {
+                for alias in &import.names {
+                    self.import(alias.name.as_str());
+                }
+            }
+            ast::Stmt::ImportFrom(from) => {
+                if let Some(module) = &from.module {
+                    self.import(module.as_str());
+                }
+            }
+            _ => {}
+        }
+        self.generic_visit_stmt(node);
+    }
+
+    fn visit_expr(&mut self, node: Expr) {
+        if let Expr::Call(call) = &node {
+            if let Expr::Attribute(attribute) = call.func.as_ref() {
+                let method = attribute.attr.as_str();
+                if DIRECT_WRITE_METHODS.contains(&method) {
+                    self.signals.insert(format!("call:{method}"));
+                }
+            }
         }
         self.generic_visit_expr(node);
     }
