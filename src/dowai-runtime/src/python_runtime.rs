@@ -297,6 +297,11 @@ def main():
                 raise ValueError("name must be a non-empty string")
             return Dataset(self, name)
 
+        @property
+        def connections(self):
+            """Capability handles for workspace profiles (ENT-043)."""
+            return Connections(self)
+
         def _unsupported(self, *args, **kwargs):
             raise NotImplementedError()
 
@@ -319,6 +324,55 @@ def main():
             return False
         equal = value == predicate["value"]
         return equal if predicate["op"] == "=" else not equal
+
+    class Connection:
+        """Opaque handle to an authorized workspace profile (ENT-043, D05).
+
+        It carries only the profile name and type. It has no URL, host, user, password or
+        secret attribute, its repr is safe to log, and it cannot be pickled or mutated.
+        """
+
+        __slots__ = ("_name", "_kind")
+
+        def __init__(self, name, kind):
+            object.__setattr__(self, "_name", name)
+            object.__setattr__(self, "_kind", kind)
+
+        @property
+        def name(self):
+            return self._name
+
+        @property
+        def kind(self):
+            return self._kind
+
+        def __setattr__(self, name, value):
+            raise AttributeError("connection handles are read-only")
+
+        def __repr__(self):
+            return "<DOWAI connection name=%r kind=%r>" % (self._name, self._kind)
+
+        __str__ = __repr__
+
+        def __reduce_ex__(self, protocol):
+            raise TypeError("connection handles cannot be pickled")
+
+        def __reduce__(self):
+            raise TypeError("connection handles cannot be pickled")
+
+    class Connections:
+        """`env.connections`: resolves a profile name through the host policy (ENT-043)."""
+
+        def __init__(self, environment):
+            self._environment = environment
+
+        def get(self, name):
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("name must be a non-empty string")
+            payload = self._environment._command("connection_get", target=name)
+            if not isinstance(payload.get("name"), str) or not isinstance(payload.get("kind"), str):
+                raise RuntimeError("invalid connection reply")
+            return Connection(payload["name"], payload["kind"])
 
     class Dataset:
         """Lazy relation: select/filter only describe the read; SQL runs it in batches (ENT-041).

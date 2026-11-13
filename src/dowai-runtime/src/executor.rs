@@ -10,13 +10,14 @@ use crate::python_runtime::{
 };
 use crate::resources;
 use crate::{
-    prepare_postgres_plan, resolve_execution_mode, resolve_python_model_path, template_options,
-    InvocationRecord,
+    enforce_profile_policy, prepare_postgres_plan, resolve_execution_mode,
+    resolve_python_model_path, template_options, InvocationRecord,
 };
 use dowai_core::state::NodeStatus;
 use dowai_core::{
-    admin_config_path, plan, user_config_path, validate_project_with_configuration,
-    CancellationToken, DowaiError, ExecutionMode, PlanNode, Result, SessionStore,
+    admin_config_path, load_workspace_profile, plan, user_config_path,
+    validate_project_with_configuration, CancellationToken, DowaiError, ExecutionMode, PlanNode,
+    Result, SessionStore,
 };
 use dowai_postgres::{DatasetCell, PgProfile, PostgresAdapter};
 use serde_json::Value;
@@ -542,10 +543,27 @@ impl<'a> Executor<'a> {
                 );
                 serde_json::to_value(report).map_err(|error| DowaiError::Model(error.to_string()))
             }
+            "connection_get" => self.connection_get(target),
             _ => Err(DowaiError::NotImplemented(
                 "This engine command is not available to models".to_owned(),
             )),
         }
+    }
+
+    /// `env.connections.get(name)` (ENT-043): a capability handle for a workspace profile.
+    /// The profile must pass the same `security.allowed_profiles` and `allowed_hosts` policy
+    /// that a SQL run applies. Only the profile name and its type leave the host; host,
+    /// user, database, `password_env` and any secret stay on the host side.
+    fn connection_get(&self, target: Option<String>) -> Result<serde_json::Value> {
+        let name = target.ok_or_else(|| {
+            DowaiError::Config("env.connections.get requires a profile name".to_owned())
+        })?;
+        let profile = load_workspace_profile(self.root, &name)?;
+        enforce_profile_policy(self.configuration, &name, &profile)?;
+        Ok(serde_json::json!({
+            "name": name,
+            "kind": profile.profile_type,
+        }))
     }
 
     fn dataset_request(
