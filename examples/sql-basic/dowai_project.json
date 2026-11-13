@@ -1,0 +1,19 @@
+{
+  "schema_version": 2,
+  "name": "sql-basic",
+  "models_dir": "models",
+  "config": {
+    "security": {
+      "allow_external_writes": true
+    }
+  },
+  "sources": {
+    "landing": {
+      "schema": "dowai_example_sql_basic_landing",
+      "tables": {
+        "clientes": "clientes",
+        "vendas": "vendas"
+      }
+    }
+  }
+}

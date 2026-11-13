@@ -1,0 +1,18 @@
+{
+  "schema_version": 2,
+  "name": "sql-conditional-vars",
+  "models_dir": "models",
+  "config": {
+    "security": {
+      "allow_external_writes": true
+    }
+  },
+  "sources": {
+    "landing": {
+      "schema": "dowai_example_sql_conditional_landing",
+      "tables": {
+        "vendas": "vendas"
+      }
+    }
+  }
+}
