@@ -508,8 +508,13 @@ fn ac048_invocation_count_limit_uncaught_reports_the_limit_name() {
     assert!(error.message().contains("max_invocations_per_run"));
 }
 
+/// ENT-114: `env.run("x.sql")` needs the run's PostgreSQL profile. This fixture has none, so the
+/// SQL call fails explicitly with the configuration code, after the path was accepted. The
+/// PostgreSQL execution itself is covered by `nested_sql_pg_e2e.rs` (opt-in, with a database).
+const NO_PROFILE: &str = "DOWAI_CONFIG_INVALID";
+
 #[test]
-fn nested_sql_call_fails_explicitly_without_effect_and_can_be_caught() {
+fn nested_sql_call_without_profile_fails_explicitly_and_can_be_caught() {
     let harness = Harness::new();
     harness.model("x.sql", "select 1 as id");
     harness.model(
@@ -523,15 +528,47 @@ fn nested_sql_call_fails_explicitly_without_effect_and_can_be_caught() {
 
     let caught = harness.run("caught.py").expect("parent may catch");
     let variables = harness.snapshot(&caught.session_id);
-    assert_eq!(variables["code"], json!("DOWAI_NOT_IMPLEMENTED"));
+    assert_eq!(variables["code"], json!(NO_PROFILE));
     let sql = find(&caught, "x.sql");
     assert_eq!(sql.len(), 1);
     assert_eq!(sql[0].status, "FAILED");
+    assert_eq!(sql[0].call_type, "imperative");
 
     let error = harness
         .run("uncaught.py")
-        .expect_err("SQL in env.run is unsupported");
-    assert_eq!(error.code(), "DOWAI_NOT_IMPLEMENTED");
+        .expect_err("SQL in env.run needs a profile");
+    assert_eq!(error.code(), NO_PROFILE);
+}
+
+#[test]
+fn nested_sql_targets_outside_the_models_directory_are_rejected_before_any_profile_lookup() {
+    let harness = Harness::new();
+    // Sits in the project root, outside `models/`, so it must never be reachable.
+    let outside = harness.project.join("outside.sql");
+    fs::write(&outside, "select 1").expect("write outside SQL");
+    // The absolute target is the existing file outside `models/`, so the path policy is what
+    // refuses it (deterministic). `/etc/x.sql` does not exist: it is an unknown model.
+    let script = format!(
+        "def model(env):\n    for target in ['../outside.sql', 'outside.sql', {absolute:?}, '/etc/x.sql']:\n        try:\n            env.run(target)\n        except env.DowaiExecutionError as error:\n            env.setVar(target.replace('/', '_').replace('.', '_'), error.code)\n        else:\n            raise AssertionError('target must be rejected: ' + target)\n",
+        absolute = outside.display().to_string(),
+    );
+    harness.model("parent.py", &script);
+
+    let result = harness.run("parent.py").expect("all escapes are rejected");
+
+    let variables = harness.snapshot(&result.session_id);
+    // Escapes are refused by the planner's path policy; a name that is not a model under
+    // `models/` is refused as an invalid plan. Neither reaches the missing profile.
+    let absolute_key = outside
+        .display()
+        .to_string()
+        .replace(['/', '.'], "_");
+    for key in ["___outside_sql", absolute_key.as_str()] {
+        let code = variables[key].as_str().expect("error code is recorded");
+        assert_eq!(code, "DOWAI_POLICY_PATH", "{key}");
+    }
+    assert_eq!(variables["outside_sql"], json!("DOWAI_PLAN_INVALID"));
+    assert_eq!(variables["_etc_x_sql"], json!("DOWAI_PLAN_INVALID"));
 }
 
 #[test]
@@ -548,11 +585,12 @@ fn nested_python_with_sql_predecessor_fails_before_running_the_child() {
     );
     harness.model("parent.py", "def model(env):\n    env.run('child.py')\n");
 
+    // ENT-114: the SQL predecessor runs first and needs the profile, which this fixture lacks.
     let error = harness
         .run("parent.py")
-        .expect_err("mixed SQL is unsupported");
+        .expect_err("the SQL predecessor needs a profile");
 
-    assert_eq!(error.code(), "DOWAI_NOT_IMPLEMENTED");
+    assert_eq!(error.code(), NO_PROFILE);
     assert!(!marker.exists());
 }
 
@@ -699,8 +737,8 @@ fn nested_error_code_is_propagated_only_for_the_call_that_failed() {
         .run("parent.py")
         .expect_err("re-raised error fails the run");
 
-    // The first captured error (SQL unsupported) is re-raised, not the last one.
-    assert_eq!(error.code(), "DOWAI_NOT_IMPLEMENTED");
+    // The first captured error (SQL call without profile) is re-raised, not the last one.
+    assert_eq!(error.code(), NO_PROFILE);
 }
 
 #[test]

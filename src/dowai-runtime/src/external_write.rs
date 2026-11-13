@@ -12,14 +12,19 @@
 //!    the staging, `upsert` merges by keys. Counts are verified, then `COMMIT`.
 //! 4. `abort`: `ROLLBACK` and drop the session. Any error in `rows`/`commit` aborts it.
 //!
+//! The destination profile is `postgres` or `mysql` (ENT-034). MySQL has no transactional DDL
+//! and no `ON CONFLICT`: upsert uses `ON DUPLICATE KEY UPDATE`, and the staging is a temporary
+//! table dropped explicitly at the end of the session.
+//!
 //! The write is atomic on the destination only. It is not atomic with the source of the data,
 //! and the result never claims otherwise.
 
 use crate::{
     enforce_external_write_policy, map_execution_error, postgres_profile, resolve_profile,
 };
-use dowai_core::{DowaiError, Result};
-use dowai_postgres::{quote_identifier, AdapterError, PostgresAdapter, SqlAdapter};
+use dowai_core::{DowaiError, Result, WorkspaceProfile};
+use dowai_mysql::{MysqlAdapter, MysqlError, MysqlProfile};
+use dowai_postgres::{quote_identifier, AdapterError, PostgresAdapter, SqlAdapter, TlsMode};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -77,7 +82,7 @@ impl WriteMode {
 
 /// An open write session. Holds the destination connection and its transaction.
 pub(crate) struct ExternalWrite {
-    adapter: PostgresAdapter,
+    adapter: Backend,
     table: String,
     mode: WriteMode,
     keys: Vec<String>,
@@ -186,15 +191,14 @@ impl ExternalWrite {
 
         // Authorization of the destination profile: the same policy as every profile.
         let (_, profile) = resolve_profile(root, configuration, Some(target_profile))?;
-        let pg_profile = postgres_profile(profile, configuration)?;
-        let mut adapter = PostgresAdapter::connect(&pg_profile).map_err(map_execution_error)?;
+        let mut adapter = Backend::connect(profile, configuration)?;
         let prepared = (|| -> Result<()> {
-            adapter.begin_transaction().map_err(map_adapter)?;
+            adapter.begin_transaction()?;
             let described = adapter
-                .describe_relation(&quoted_table)
+                .describe(&table, &quoted_table)
                 .map_err(|_| precondition("destination table does not exist or is not readable"))?;
             for column in &columns {
-                if !described.iter().any(|(name, _)| name == column) {
+                if !described.iter().any(|name| name == column) {
                     return Err(DowaiError::Write {
                         code: WRITE_SCHEMA_MISMATCH,
                         message: "a written column does not exist in the destination table"
@@ -202,16 +206,12 @@ impl ExternalWrite {
                     });
                 }
             }
-            if mode == WriteMode::Upsert
-                && !adapter.has_unique_key(&table, &keys).map_err(map_adapter)?
-            {
+            if mode == WriteMode::Upsert && !adapter.has_unique_key(&table, &keys)? {
                 return Err(precondition(
                     "destination has no unique key exactly on the upsert keys",
                 ));
             }
-            adapter
-                .create_staging(&table, STAGING)
-                .map_err(map_adapter)?;
+            adapter.create_staging(&table, STAGING)?;
             Ok(())
         })();
         match prepared {
@@ -225,7 +225,7 @@ impl ExternalWrite {
                 depth,
             }),
             Err(error) => {
-                let _ = adapter.rollback();
+                adapter.rollback_quietly();
                 Err(error)
             }
         }
@@ -268,8 +268,7 @@ impl ExternalWrite {
         })?;
         let inserted = self
             .adapter
-            .write_staging_json(STAGING, &self.columns, &payload)
-            .map_err(map_adapter)?;
+            .write_staging(STAGING, &self.columns, rows, &payload)?;
         self.staged += inserted;
         Ok(inserted)
     }
@@ -279,11 +278,11 @@ impl ExternalWrite {
         let outcome = self.apply();
         match outcome {
             Ok(payload) => {
-                self.adapter.commit().map_err(map_adapter)?;
+                self.adapter.commit()?;
                 Ok(payload)
             }
             Err(error) => {
-                let _ = self.adapter.rollback();
+                self.adapter.rollback_quietly();
                 Err(error)
             }
         }
@@ -294,24 +293,21 @@ impl ExternalWrite {
             WriteMode::Append => {
                 let inserted = self
                     .adapter
-                    .append_staging(STAGING, &self.table, &self.columns)
-                    .map_err(map_adapter)?;
+                    .append_staging(STAGING, &self.table, &self.columns)?;
                 (inserted, 0, 0)
             }
             WriteMode::Replace => {
-                let deleted = self.adapter.delete_all(&self.table).map_err(map_adapter)?;
+                let deleted = self.adapter.delete_all(&self.table)?;
                 let inserted = self
                     .adapter
-                    .append_staging(STAGING, &self.table, &self.columns)
-                    .map_err(map_adapter)?;
+                    .append_staging(STAGING, &self.table, &self.columns)?;
                 (inserted, 0, deleted)
             }
             WriteMode::Upsert => {
-                let counters = self
-                    .adapter
-                    .merge_staging(STAGING, &self.table, &self.columns, &self.keys)
-                    .map_err(map_adapter)?;
-                (counters.inserted, counters.updated, 0)
+                let (inserted, updated) =
+                    self.adapter
+                        .merge(STAGING, &self.table, &self.columns, &self.keys)?;
+                (inserted, updated, 0)
             }
         };
         let accounted = match self.mode {
@@ -335,6 +331,207 @@ impl ExternalWrite {
 
     /// Rolls back the transaction and discards the staging table.
     pub(crate) fn abort(mut self) {
-        let _ = self.adapter.rollback();
+        self.adapter.rollback_quietly();
+    }
+}
+
+fn map_mysql(error: MysqlError) -> DowaiError {
+    match error {
+        MysqlError::DuplicateMergeKey => DowaiError::Write {
+            code: WRITE_DUPLICATE_KEY,
+            message: "staged rows repeat a merge key".to_owned(),
+        },
+        MysqlError::InvalidIdentifier => invalid("table or column name is not a valid identifier"),
+        MysqlError::InvalidProfile(_) => {
+            DowaiError::Config("Invalid MySQL connection profile".to_owned())
+        }
+        MysqlError::InsecureTlsDisabled => {
+            DowaiError::Policy("TLS may only be disabled for a local MySQL host".to_owned())
+        }
+        MysqlError::MissingPassword
+        | MysqlError::TlsConfigurationFailed
+        | MysqlError::ConnectionFailed => DowaiError::Connection(error.to_string()),
+        MysqlError::QueryFailed
+        | MysqlError::TransientFailure
+        | MysqlError::InvalidTransactionState
+        | MysqlError::InvalidStreamLimit
+        | MysqlError::InflightLimitExceeded
+        | MysqlError::InvalidWriteSpec(_)
+        | MysqlError::Unsupported(_) => DowaiError::Execution(error.to_string()),
+    }
+}
+
+/// Destination connection of a write session: one transaction on one database. A transfer
+/// between two databases is two independent transactions, never one atomic unit.
+enum Backend {
+    Postgres(Box<PostgresAdapter>),
+    Mysql(MysqlAdapter),
+}
+
+impl Backend {
+    fn connect(profile: WorkspaceProfile, configuration: &Value) -> Result<Self> {
+        if profile.profile_type == "mysql" {
+            let database = &configuration["effective"]["database"];
+            let mut adapter_profile = MysqlProfile::new(
+                profile.host,
+                profile.port,
+                profile.user,
+                profile.database,
+                profile.password_env,
+            );
+            if profile.tls == dowai_core::ProfileTlsMode::Disabled {
+                adapter_profile.set_tls_mode(TlsMode::Disabled);
+            }
+            if let Some(seconds) = database["connect_timeout_seconds"].as_u64() {
+                adapter_profile.set_connect_timeout(std::time::Duration::from_secs(seconds));
+            }
+            if let Some(seconds) = database["query_timeout_seconds"].as_u64() {
+                adapter_profile.set_query_timeout(Some(std::time::Duration::from_secs(seconds)));
+            }
+            return MysqlAdapter::connect(&adapter_profile)
+                .map(Self::Mysql)
+                .map_err(map_mysql);
+        }
+        let pg_profile = postgres_profile(profile, configuration)?;
+        PostgresAdapter::connect(&pg_profile)
+            .map(|adapter| Self::Postgres(Box::new(adapter)))
+            .map_err(map_execution_error)
+    }
+
+    fn begin_transaction(&mut self) -> Result<()> {
+        match self {
+            Self::Postgres(adapter) => adapter.begin_transaction().map_err(map_adapter),
+            Self::Mysql(adapter) => adapter.begin_transaction().map_err(map_mysql),
+        }
+    }
+
+    fn commit(&mut self) -> Result<()> {
+        match self {
+            Self::Postgres(adapter) => adapter.commit().map_err(map_adapter),
+            Self::Mysql(adapter) => adapter.commit().map_err(map_mysql),
+        }
+    }
+
+    fn rollback_quietly(&mut self) {
+        match self {
+            Self::Postgres(adapter) => {
+                let _ = adapter.rollback();
+            }
+            Self::Mysql(adapter) => {
+                let _ = adapter.rollback();
+            }
+        }
+    }
+
+    /// Column names of the destination table.
+    fn describe(&mut self, table: &str, quoted_table: &str) -> Result<Vec<String>> {
+        match self {
+            Self::Postgres(adapter) => adapter
+                .describe_relation(quoted_table)
+                .map(|columns| columns.into_iter().map(|(name, _)| name).collect())
+                .map_err(map_adapter),
+            Self::Mysql(adapter) => adapter
+                .introspect_table(table)
+                .map(|columns| columns.into_iter().map(|column| column.name).collect())
+                .map_err(map_mysql),
+        }
+    }
+
+    fn has_unique_key(&mut self, table: &str, keys: &[String]) -> Result<bool> {
+        match self {
+            Self::Postgres(adapter) => adapter.has_unique_key(table, keys).map_err(map_adapter),
+            Self::Mysql(adapter) => adapter.has_unique_key(table, keys).map_err(map_mysql),
+        }
+    }
+
+    fn create_staging(&mut self, table: &str, staging: &str) -> Result<()> {
+        match self {
+            Self::Postgres(adapter) => adapter.create_staging(table, staging).map_err(map_adapter),
+            Self::Mysql(adapter) => adapter.create_staging(table, staging).map_err(map_mysql),
+        }
+    }
+
+    /// `rows` are validated objects with exactly `columns`; `payload` is their JSON text.
+    fn write_staging(
+        &mut self,
+        staging: &str,
+        columns: &[String],
+        rows: &[Value],
+        payload: &str,
+    ) -> Result<u64> {
+        match self {
+            Self::Postgres(adapter) => adapter
+                .write_staging_json(staging, columns, payload)
+                .map_err(map_adapter),
+            Self::Mysql(adapter) => {
+                let values: Vec<Vec<dowai_mysql::Value>> = rows
+                    .iter()
+                    .map(|row| {
+                        columns
+                            .iter()
+                            .map(|column| json_to_mysql(&row[column.as_str()]))
+                            .collect()
+                    })
+                    .collect();
+                adapter
+                    .write_staging_batch(staging, columns, &values)
+                    .map_err(map_mysql)
+            }
+        }
+    }
+
+    fn append_staging(&mut self, staging: &str, table: &str, columns: &[String]) -> Result<u64> {
+        match self {
+            Self::Postgres(adapter) => adapter
+                .append_staging(staging, table, columns)
+                .map_err(map_adapter),
+            Self::Mysql(adapter) => adapter
+                .append_staging(staging, table, columns)
+                .map_err(map_mysql),
+        }
+    }
+
+    fn delete_all(&mut self, table: &str) -> Result<u64> {
+        match self {
+            Self::Postgres(adapter) => adapter.delete_all(table).map_err(map_adapter),
+            Self::Mysql(adapter) => adapter.delete_all(table).map_err(map_mysql),
+        }
+    }
+
+    /// Inserted and updated counts of the merge.
+    fn merge(
+        &mut self,
+        staging: &str,
+        table: &str,
+        columns: &[String],
+        keys: &[String],
+    ) -> Result<(u64, u64)> {
+        match self {
+            Self::Postgres(adapter) => adapter
+                .merge_staging(staging, table, columns, keys)
+                .map(|counters| (counters.inserted, counters.updated))
+                .map_err(map_adapter),
+            Self::Mysql(adapter) => adapter
+                .merge(staging, table, columns, keys)
+                .map(|counters| (counters.inserted, counters.updated))
+                .map_err(map_mysql),
+        }
+    }
+}
+
+/// JSON value to MySQL parameter. Booleans become 0/1 (MySQL has no real boolean); arrays and
+/// objects are sent as JSON text.
+fn json_to_mysql(value: &Value) -> dowai_mysql::Value {
+    match value {
+        Value::Null => dowai_mysql::Value::NULL,
+        Value::Bool(flag) => dowai_mysql::Value::Int(i64::from(*flag)),
+        Value::Number(number) => number
+            .as_i64()
+            .map(dowai_mysql::Value::Int)
+            .or_else(|| number.as_u64().map(dowai_mysql::Value::UInt))
+            .or_else(|| number.as_f64().map(dowai_mysql::Value::Double))
+            .unwrap_or(dowai_mysql::Value::NULL),
+        Value::String(text) => dowai_mysql::Value::Bytes(text.clone().into_bytes()),
+        other => dowai_mysql::Value::Bytes(other.to_string().into_bytes()),
     }
 }

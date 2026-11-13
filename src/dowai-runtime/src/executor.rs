@@ -11,8 +11,9 @@ use crate::python_runtime::{
 };
 use crate::resources;
 use crate::{
-    enforce_profile_policy, prepare_postgres_plan, resolve_execution_mode,
-    resolve_python_model_path, template_options, InvocationRecord,
+    build_relations, enforce_profile_policy, prepare_postgres_plan, render_checked,
+    resolve_execution_mode, resolve_python_model_path, template_options, InvocationRecord,
+    SqlExecution,
 };
 use dowai_core::state::NodeStatus;
 use dowai_core::{
@@ -293,6 +294,9 @@ pub(crate) struct Executor<'a> {
     session_id: Option<String>,
     /// Open `env.write` session (ENT-048). At most one; it belongs to the model that opened it.
     writer: Option<ExternalWrite>,
+    /// PostgreSQL side of the run, for SQL models run by nested `env.run` (ENT-114). Set by the
+    /// run that owns the executor.
+    pub(crate) sql: Option<SqlExecution>,
 }
 
 /// Interpreter and per-worker timeout used by every Python model of a run.
@@ -341,6 +345,7 @@ impl<'a> Executor<'a> {
             run_id: identity.run_id,
             session_id: identity.session_id,
             writer: None,
+            sql: None,
         })
     }
 
@@ -892,22 +897,17 @@ impl<'a> Executor<'a> {
             ));
         };
         self.set_target(invocation_id, &node.id);
+        // The run-time plan of the target: in automatic mode its predecessors (Python and SQL
+        // alike) run first. It never changes the static DAG of the caller (ENT-114).
+        let scope = plan(self.root, &targets, mode)?;
+        let relations = build_relations(self.root, &scope)?;
         let mut predecessors = Vec::new();
         if mode == ExecutionMode::Automatic {
-            let full = plan(self.root, &targets, ExecutionMode::Automatic)?;
-            predecessors = full
+            predecessors = scope
                 .nodes
                 .into_iter()
                 .filter(|candidate| candidate.id != node.id)
                 .collect();
-        }
-        for candidate in std::iter::once(node).chain(predecessors.iter()) {
-            if !is_python(&candidate.path) {
-                return Err(DowaiError::NotImplemented(format!(
-                    "env.run() of SQL models is not available yet: {}",
-                    candidate.path
-                )));
-            }
         }
         let mut current = variables;
         for predecessor in &predecessors {
@@ -919,9 +919,9 @@ impl<'a> Executor<'a> {
                     &predecessor.id,
                     mode,
                     |this, dependency_id| {
-                        this.execute_node(
-                            &predecessor.path,
-                            &predecessor.depends_on,
+                        this.execute_step(
+                            predecessor,
+                            &relations,
                             mode,
                             input,
                             dependency_id,
@@ -933,14 +933,62 @@ impl<'a> Executor<'a> {
             // A failed predecessor fails the call; both records stay FAILED.
             current = outcome?;
         }
-        self.execute_node(
-            &node.path,
-            &node.depends_on,
+        self.execute_step(
+            node,
+            &relations,
             mode,
             current,
             invocation_id,
             Some(deadline),
         )
+    }
+
+    /// One model of a call: a Python model runs in a worker, a SQL model is materialized (ENT-114).
+    fn execute_step(
+        &mut self,
+        node: &PlanNode,
+        relations: &BTreeMap<String, String>,
+        mode: ExecutionMode,
+        variables: Variables,
+        invocation_id: &str,
+        parent_deadline: Option<Instant>,
+    ) -> Result<Variables> {
+        if is_python(&node.path) {
+            return self.execute_node(
+                &node.path,
+                &node.depends_on,
+                mode,
+                variables,
+                invocation_id,
+                parent_deadline,
+            );
+        }
+        self.execute_sql(node, relations, mode, &variables)
+    }
+
+    /// Renders and materializes one SQL model with the run's PostgreSQL side. The variables it
+    /// defines are returned to the caller, which merges them like any Python model's variables.
+    fn execute_sql(
+        &mut self,
+        node: &PlanNode,
+        relations: &BTreeMap<String, String>,
+        mode: ExecutionMode,
+        variables: &Variables,
+    ) -> Result<Variables> {
+        self.cancel.check()?;
+        let sql = self.sql.as_mut().ok_or_else(|| {
+            DowaiError::Execution("SQL execution is not configured for this run".to_owned())
+        })?;
+        let (prepared, next_variables) = render_checked(
+            self.root,
+            node,
+            variables,
+            &sql.template_options,
+            relations,
+            self.store,
+        )?;
+        sql.materialize(node, mode, None, None, &prepared)?;
+        Ok(next_variables)
     }
 }
 

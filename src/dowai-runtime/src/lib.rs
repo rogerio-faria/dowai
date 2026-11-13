@@ -495,6 +495,15 @@ fn finish_audit(trace: &mut Trace, outcome: &Result<RunResult>) {
     }
     for record in nested.iter().filter(|record| record.call_type != "static") {
         trace.audit.python_invocation(record);
+        // A nested or predecessor SQL call that succeeded wrote its relation (ENT-114): the same
+        // `external_write` event that a static SQL node emits.
+        if record.status == "SUCCEEDED" && is_sql_path(&record.target) {
+            if let Ok(relation) = model_stem(&record.target) {
+                trace
+                    .audit
+                    .external_write(&record.invocation_id, &record.target, &relation);
+            }
+        }
     }
     if let Ok(result) = outcome {
         trace.audit.session_id = Some(result.session_id.clone());
@@ -624,10 +633,10 @@ fn journal_run(
             invocation_id: record.invocation_id.clone(),
             parent_invocation_id: Some(record.parent_invocation_id.clone())
                 .filter(|parent| *parent != trace.root_invocation_id),
-            kind: if record.call_type == "imperative" || is_python_path(&record.target) {
-                "python"
-            } else {
+            kind: if is_sql_path(&record.target) {
                 "sql"
+            } else {
+                "python"
             }
             .to_owned(),
             target: record.target.clone(),
@@ -826,6 +835,20 @@ fn execute_run(
                     .map(|session| session.session_id.clone()),
             },
         )?;
+        // ENT-114: `env.run("x.sql")` uses the default profile of the run. A missing profile fails
+        // only the SQL call that needs it; the connection opens on that first call.
+        let sql_profile = resolve_profile(&root, &configuration, None)
+            .and_then(|(_, workspace_profile)| postgres_profile(workspace_profile, &configuration))
+            .map_err(|error| error.message());
+        executor.sql = Some(SqlExecution::new(
+            sql_profile,
+            None,
+            template_options(&configuration)?,
+            replacement_approval(&configuration, request.confirm_destructive)?,
+            request.full_refresh,
+            retry_policy,
+            cancel.clone(),
+        ));
         // ENT-111: declared sources are readable in Python-only runs. The profile comes from the
         // configuration only; the connection opens on the first dataset read. A Python-only plan
         // has no SQL relation, so model datasets are refused (see `DatasetSource::authorize`).
@@ -956,8 +979,18 @@ fn execute_run(
             declared_source_relations(&root)?,
         ));
         let pg_profile = postgres_profile(profile, &configuration)?;
-        let mut adapter = PostgresAdapter::connect(&pg_profile)
+        // Connected before the first node, as before ENT-114; nested SQL calls reuse it.
+        let adapter = PostgresAdapter::connect(&pg_profile)
             .map_err(|error| DowaiError::Connection(error.to_string()))?;
+        executor.sql = Some(SqlExecution::new(
+            Ok(pg_profile),
+            Some(adapter),
+            template_options.clone(),
+            allow_replace,
+            request.full_refresh,
+            retry_policy,
+            cancel.clone(),
+        ));
         let mut completed_nodes = Vec::with_capacity(execution_plan.nodes.len());
         for (index, node) in execution_plan.nodes.iter().enumerate() {
             if let Err(error) = cancel.check() {
@@ -991,17 +1024,14 @@ fn execute_run(
                 continue;
             }
             let hash = model_hash(&root, node);
-            let rendered = render_sql_node(&root, node, &variables, &template_options, &relations)
-                .and_then(|(prepared, next_variables)| {
-                    if prepared.sql.trim().is_empty() {
-                        return Err(DowaiError::Template(format!(
-                            "{} renders to an empty SQL statement",
-                            prepared.id
-                        )));
-                    }
-                    store.validate_variables(&next_variables)?;
-                    Ok((prepared, next_variables))
-                });
+            let rendered = render_checked(
+                &root,
+                node,
+                &variables,
+                &template_options,
+                &relations,
+                &store,
+            );
             let (prepared, next_variables) = match rendered {
                 Ok(rendered) => rendered,
                 Err(error) => {
@@ -1025,27 +1055,13 @@ fn execute_run(
                     return Err(error);
                 }
             };
-            let materialization = match prepared.materialization {
-                Materialization::Table => PostgresMaterialization::Table,
-                Materialization::View => PostgresMaterialization::View,
+            let materialized = match executor.sql.as_mut() {
+                Some(sql) => sql.materialize(node, mode, hash, Some(&mut *trace), &prepared),
+                None => Err(DowaiError::Execution(
+                    "SQL execution is not configured for this run".to_owned(),
+                )),
             };
-            if let Err(error) = materialize_with_retry(
-                &mut adapter,
-                &pg_profile,
-                node,
-                hash,
-                mode,
-                trace,
-                retry_policy,
-                cancel,
-                SqlWrite {
-                    relation: &prepared.relation,
-                    materialization,
-                    sql: &prepared.sql,
-                    allow_replace,
-                    full_refresh: request.full_refresh,
-                },
-            ) {
+            if let Err(error) = materialized {
                 trace.python = std::mem::take(&mut executor.invocations);
                 trace.skip(&execution_plan.nodes[index + 1..], mode);
                 return Err(error);
@@ -1129,7 +1145,7 @@ fn execute_run(
             plan_node,
             model_hash(&root, plan_node),
             mode,
-            trace,
+            Some(&mut *trace),
             retry_policy,
             cancel,
             SqlWrite {
@@ -1431,6 +1447,35 @@ fn is_python_path(path: &str) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("py"))
 }
 
+fn is_sql_path(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("sql"))
+}
+
+/// Renders one SQL node and refuses an empty statement or variables the store rejects. Shared by
+/// the SQL nodes of a run and by nested `env.run("x.sql")` calls (ENT-114).
+pub(crate) fn render_checked(
+    project_dir: &Path,
+    node: &PlanNode,
+    variables: &BTreeMap<String, Value>,
+    template_options: &TemplateOptions,
+    relations: &BTreeMap<String, String>,
+    store: &SessionStore,
+) -> Result<(PreparedNode, BTreeMap<String, Value>)> {
+    let (prepared, next_variables) =
+        render_sql_node(project_dir, node, variables, template_options, relations)?;
+    if prepared.sql.trim().is_empty() {
+        return Err(DowaiError::Template(format!(
+            "{} renders to an empty SQL statement",
+            prepared.id
+        )));
+    }
+    store.validate_variables(&next_variables)?;
+    Ok((prepared, next_variables))
+}
+
 fn render_sql_node(
     project_dir: &Path,
     node: &dowai_core::PlanNode,
@@ -1670,6 +1715,13 @@ fn enforce_allowlist(
 /// (`connect_timeout_seconds`, `query_timeout_seconds`). The password is never copied: only the
 /// name of the environment variable that holds it.
 fn postgres_profile(profile: WorkspaceProfile, configuration: &Value) -> Result<PgProfile> {
+    // `mysql` profiles are valid workspace profiles but only `env.write` destinations (ENT-034).
+    if profile.profile_type != "postgres" {
+        return Err(DowaiError::Config(format!(
+            "This operation requires a PostgreSQL profile; a '{}' profile is only supported as an env.write destination",
+            profile.profile_type
+        )));
+    }
     let database = &configuration["effective"]["database"];
     let mut adapter_profile = PgProfile::new(
         profile.host,
@@ -1719,6 +1771,88 @@ fn map_execution_error(error: AdapterError) -> DowaiError {
     }
 }
 
+/// PostgreSQL side of a run (ENT-114). The connection, profile and SQL options are shared by the
+/// SQL nodes of the plan and by nested `env.run("x.sql")` calls, so both reach the database
+/// through the same materialization path (retry, staging, full refresh).
+pub(crate) struct SqlExecution {
+    /// The run's profile, or the reason it is unavailable. The reason fails only the SQL work
+    /// that needs a database, so a Python-only run without a profile keeps working.
+    profile: std::result::Result<PgProfile, String>,
+    /// Connection kept between calls; opened by the first SQL work when not given.
+    adapter: Option<PostgresAdapter>,
+    template_options: TemplateOptions,
+    allow_replace: bool,
+    full_refresh: bool,
+    retry_policy: RetryPolicy,
+    cancel: CancellationToken,
+}
+
+impl SqlExecution {
+    pub(crate) fn new(
+        profile: std::result::Result<PgProfile, String>,
+        adapter: Option<PostgresAdapter>,
+        template_options: TemplateOptions,
+        allow_replace: bool,
+        full_refresh: bool,
+        retry_policy: RetryPolicy,
+        cancel: CancellationToken,
+    ) -> Self {
+        Self {
+            profile,
+            adapter,
+            template_options,
+            allow_replace,
+            full_refresh,
+            retry_policy,
+            cancel,
+        }
+    }
+
+    /// Materializes one rendered node. `trace` receives the audit events and the attempt records
+    /// of a static node; a nested call passes `None` and is recorded by the executor history.
+    fn materialize(
+        &mut self,
+        node: &PlanNode,
+        mode: ExecutionMode,
+        hash: Option<String>,
+        trace: Option<&mut Trace>,
+        prepared: &PreparedNode,
+    ) -> Result<()> {
+        let profile = self
+            .profile
+            .as_ref()
+            .map_err(|reason| DowaiError::Config(reason.clone()))?;
+        let mut adapter = match self.adapter.take() {
+            Some(adapter) => adapter,
+            None => PostgresAdapter::connect(profile)
+                .map_err(|error| DowaiError::Connection(error.to_string()))?,
+        };
+        let materialization = match prepared.materialization {
+            Materialization::Table => PostgresMaterialization::Table,
+            Materialization::View => PostgresMaterialization::View,
+        };
+        let outcome = materialize_with_retry(
+            &mut adapter,
+            profile,
+            node,
+            hash,
+            mode,
+            trace,
+            self.retry_policy,
+            &self.cancel,
+            SqlWrite {
+                relation: &prepared.relation,
+                materialization,
+                sql: &prepared.sql,
+                allow_replace: self.allow_replace,
+                full_refresh: self.full_refresh,
+            },
+        );
+        self.adapter = Some(adapter);
+        outcome
+    }
+}
+
 /// One SQL materialization of a node, already rendered.
 struct SqlWrite<'a> {
     relation: &'a str,
@@ -1740,7 +1874,7 @@ fn materialize_with_retry(
     node: &PlanNode,
     hash: Option<String>,
     mode: ExecutionMode,
-    trace: &mut Trace,
+    mut trace: Option<&mut Trace>,
     policy: RetryPolicy,
     cancel: &CancellationToken,
     write: SqlWrite<'_>,
@@ -1751,9 +1885,11 @@ fn materialize_with_retry(
         |_attempt| {
             let invocation_id = Uuid::new_v4().to_string();
             let started = Instant::now();
-            trace
-                .audit
-                .node_started(&invocation_id, &node.id, hash.clone());
+            if let Some(trace) = trace.as_mut() {
+                trace
+                    .audit
+                    .node_started(&invocation_id, &node.id, hash.clone());
+            }
             let connected = if adapter.is_closed() {
                 PostgresAdapter::connect(profile).map(|fresh| *adapter = fresh)
             } else {
@@ -1779,25 +1915,29 @@ fn materialize_with_retry(
             });
             match &result {
                 Ok(()) => {
-                    trace
-                        .audit
-                        .external_write(&invocation_id, &node.id, write.relation);
-                    trace.audit.node_finished(&invocation_id, &node.id, None);
-                    trace.node(invocation_id, node, mode, "SUCCEEDED", started, None);
+                    if let Some(trace) = trace.as_mut() {
+                        trace
+                            .audit
+                            .external_write(&invocation_id, &node.id, write.relation);
+                        trace.audit.node_finished(&invocation_id, &node.id, None);
+                        trace.node(invocation_id, node, mode, "SUCCEEDED", started, None);
+                    }
                 }
                 Err(error) => {
                     let mapped = map_execution_error(*error);
-                    trace
-                        .audit
-                        .node_finished(&invocation_id, &node.id, Some(&mapped));
-                    trace.node(
-                        invocation_id,
-                        node,
-                        mode,
-                        node_failure_status(&mapped),
-                        started,
-                        Some(&mapped),
-                    );
+                    if let Some(trace) = trace.as_mut() {
+                        trace
+                            .audit
+                            .node_finished(&invocation_id, &node.id, Some(&mapped));
+                        trace.node(
+                            invocation_id,
+                            node,
+                            mode,
+                            node_failure_status(&mapped),
+                            started,
+                            Some(&mapped),
+                        );
+                    }
                 }
             }
             result

@@ -3,6 +3,7 @@ members = [
     "src/dowai-core",
     "src/dowai-cli",
     "src/dowai-postgres",
+    "src/dowai-mysql",
     "src/dowai-runtime",
 ]
 resolver = "2"

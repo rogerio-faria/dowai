@@ -63,7 +63,7 @@ fn parse_workspace_profile(
     let profile: WorkspaceProfile = serde_json::from_value(value.clone()).map_err(|error| {
         config_error(path, &format!("Invalid profile '{profile_name}': {error}"))
     })?;
-    if profile.profile_type != "postgres" {
+    if !matches!(profile.profile_type.as_str(), "postgres" | "mysql") {
         return Err(config_error(
             path,
             &format!(

@@ -78,6 +78,19 @@ or view is separately subject to `security.require_approval_for_destructive`;
 when approval is required, pass `--yes` to confirm replacement. Administrator
 ceilings cannot be weakened by project or user settings.
 
+MySQL profiles (ENT-034) use the same fields with `"type": "mysql"` (typically
+port 3306) and `password_env` holding a variable name. A `mysql` profile is
+supported only as an `env.write` destination (`append`, `replace`, `upsert`),
+under the same `security.allowed_profiles`, `allowed_hosts` and
+`allow_external_writes` policy as PostgreSQL; TLS is required unless disabled
+for a loopback host. Using it as the SQL execution profile (`--profile`,
+`execution.default_profile`, `doctor --check-connections`) is refused with a
+configuration error. MySQL has no transactional DDL (the adapter refuses DDL
+inside a transaction instead of letting it commit implicitly) and no
+`ON CONFLICT`; upsert uses `ON DUPLICATE KEY UPDATE`. A PostgreSQL to MySQL
+transfer is two independent transactions: there is no atomicity across
+databases.
+
 Projects can declare external PostgreSQL relations for static `source()`
 macros in `dowai_project.json`. The source and table names are template lookup
 names; schema and relation names are quoted as PostgreSQL identifiers:
@@ -124,17 +137,20 @@ Python-only model execution is configured separately from database profiles:
 
 `python.interpreter` must point to an interpreter inside the project virtual
 environment and the project directory; it is not selected implicitly from
-`PATH`. Python-only runs do not use a PostgreSQL profile, but are still gated by
-`security.allow_external_writes` because project code can perform arbitrary
-side effects. The first worker version supports JSON session variables,
+`PATH`. Python-only runs do not use a PostgreSQL profile, except that
+`env.run("x.sql")` uses `execution.default_profile` (ENT-114); they are still
+gated by `security.allow_external_writes` because project code can perform
+arbitrary side effects. The first worker version supports JSON session variables,
 literal `env.depends_on()` and `None` returns. Declaring Python dependencies or
 enabling unlisted packages currently fails explicitly because package
 installation/authorization is not implemented. Python execution is not a
 sandbox; execute only trusted project code. The worker inherits only a small
 allowlist of runtime variables, not arbitrary host environment variables.
 Unix models can detach subprocesses from the supervised process group, so
-timeout termination is not a security boundary. Mixed SQL/Python plans and
-dataset, `ref`, `source`, `run`, and write APIs are unsupported.
+timeout termination is not a security boundary. `env.run` executes `.py` and
+`.sql` models (ENT-114). A SQL model called this way runs with the caller's profile and
+session, its `ref()` predecessors run first in automatic mode, and it is not added to the
+static DAG. Dataset, `ref`, `source`, and write APIs are documented in their own sections.
 Non-default `python.package_policy` settings are also rejected until package
 authorization is implemented.
 
