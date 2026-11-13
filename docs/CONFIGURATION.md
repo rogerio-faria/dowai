@@ -103,8 +103,8 @@ names; schema and relation names are quoted as PostgreSQL identifiers:
 are external inputs, not executable plan nodes, and currently use the same
 connection profile selected for model execution. Undeclared sources, dynamic
 arguments, and unsupported adapters fail explicitly. Other profile types,
-profile layering, full-refresh, and live database verification are not
-implemented.
+profile layering, and live database verification are not implemented. Full refresh
+is implemented only for PostgreSQL (staging and swap, `--yes` required).
 
 Python-only model execution is configured separately from database profiles:
 

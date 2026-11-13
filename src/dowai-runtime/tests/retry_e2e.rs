@@ -125,6 +125,7 @@ fn request(targets: &[&str], variables: BTreeMap<String, Value>) -> RunRequest {
         session_id: None,
         variables,
         confirm_destructive: false,
+        full_refresh: false,
     }
 }
 

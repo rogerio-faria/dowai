@@ -96,6 +96,7 @@ impl Env {
             session_id: session.map(str::to_owned),
             variables: BTreeMap::new(),
             confirm_destructive: false,
+            full_refresh: false,
         }
     }
 

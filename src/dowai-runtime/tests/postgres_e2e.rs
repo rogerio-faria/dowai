@@ -179,6 +179,7 @@ fn run_executes_sources_and_refs_and_requires_approval_to_replace_relations() {
         session_id: None,
         variables: BTreeMap::from([("e2e_marker".to_owned(), json!("persisted"))]),
         confirm_destructive: false,
+        full_refresh: false,
     };
     let result = run_postgres(&workspace.project, request.clone())
         .expect("run should execute SQL models and declared sources");

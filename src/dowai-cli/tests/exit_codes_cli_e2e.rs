@@ -98,24 +98,26 @@ fn unknown_state_entities_return_two_with_stable_code() {
 }
 
 #[test]
-fn not_implemented_command_returns_six() {
+fn full_refresh_without_yes_is_refused_with_five() {
     let sandbox = Sandbox::new();
     let output = sandbox.cli(&["run", "--full-refresh", "model.sql"]);
-    assert_eq!(output.status.code(), Some(6));
+    assert_eq!(output.status.code(), Some(5));
     assert!(
         output.stdout.is_empty(),
         "human mode writes no stdout on error"
     );
-    assert!(String::from_utf8_lossy(&output.stderr).contains("DOWAI_NOT_IMPLEMENTED"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("DOWAI_POLICY_DENIED"), "{stderr}");
+    assert!(stderr.contains("--yes"), "{stderr}");
 }
 
 #[test]
-fn not_implemented_command_in_json_mode_returns_six() {
+fn full_refresh_without_yes_in_json_mode_is_refused_with_five() {
     let sandbox = Sandbox::new();
     let output = sandbox.cli(&["run", "--full-refresh", "model.sql", "--json"]);
-    assert_eq!(output.status.code(), Some(6));
+    assert_eq!(output.status.code(), Some(5));
     let value = json_stdout(&output);
-    assert_eq!(value["error_code"], "DOWAI_NOT_IMPLEMENTED");
+    assert_eq!(value["error_code"], "DOWAI_POLICY_DENIED");
 }
 
 #[test]

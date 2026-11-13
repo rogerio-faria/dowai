@@ -260,7 +260,10 @@ struct RunArgs {
     session: Option<String>,
     #[arg(long)]
     vars: Option<String>,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Rebuild the selected PostgreSQL relations through staging and swap (requires --yes)"
+    )]
     full_refresh: bool,
     #[arg(long, help = "Confirm replacement of existing PostgreSQL relations")]
     yes: bool,
@@ -670,9 +673,10 @@ fn retry_command(args: RetryArgs) -> std::result::Result<Option<Value>, CliFailu
 }
 
 fn run_command(args: RunArgs) -> std::result::Result<Option<Value>, CliFailure> {
-    if args.full_refresh {
-        return Err(DowaiError::NotImplemented(
-            "The separate full-refresh operation is not implemented yet".to_owned(),
+    // ENT-033: refused before the project is read, so nothing is started or written.
+    if args.full_refresh && !args.yes {
+        return Err(DowaiError::Policy(
+            dowai_runtime::FULL_REFRESH_CONFIRMATION_REQUIRED.to_owned(),
         )
         .into());
     }
@@ -693,6 +697,7 @@ fn run_command(args: RunArgs) -> std::result::Result<Option<Value>, CliFailure> 
             session_id: args.session,
             variables: parse_vars(args.vars.as_deref())?,
             confirm_destructive: args.yes,
+            full_refresh: args.full_refresh,
         },
         &cancel,
     )

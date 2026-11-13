@@ -26,7 +26,7 @@ ENT-078 e ENT-010).
 | `dowai plan --manual <targets>... [--vars JSON] [--json]` | Parcial | Ordem informada pelo usuário com dependências. Verificado com `faturamento.sql stg_vendas.sql`. |
 | `dowai run <targets>|all [--profile NAME] [--vars JSON] [--session ID] [--json]` | Parcial | SQL (tabelas/views no PostgreSQL) e Python em venv do projeto. Exige banco configurado; **não executado** nesta revisão (P-09). Full refresh e demais adaptadores: ver §1.3. |
 | `dowai run --manual <targets>... [--session ID]` | Parcial | Mesma restrição de `run`. |
-| `dowai run <target> --full-refresh [--yes]` | Não implementado | Flag existe no `--help`, mas o comportamento de full refresh não está implementado (`STATUS.md`, linha "SQL execution"). |
+| `dowai run <target> --full-refresh --yes` | Parcial | PostgreSQL: reconstrói as tabelas/views selecionadas em staging no mesmo banco e troca pelo nome numa única transação; sem `--yes` recusa com exit 5 antes de qualquer escrita; colunas (nome e tipo, em ordem) divergentes do destino falham com exit 3 e mantêm a relação anterior. Não altera schema automaticamente. |
 | `dowai session start [--project-dir PATH] [--json]` | Parcial | Verificado: retorna `session_id`, `status: ACTIVE`, TTL. |
 | `dowai session show <session_id> [--json]` | Parcial | Verificado. |
 | `dowai session end <session_id> [--json]` | Parcial | Verificado: `status: ENDED`. |

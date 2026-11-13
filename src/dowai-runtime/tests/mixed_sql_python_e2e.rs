@@ -181,6 +181,7 @@ impl Fixture {
                 session_id,
                 variables: BTreeMap::new(),
                 confirm_destructive: false,
+                full_refresh: false,
             },
         )
     }
@@ -455,6 +456,7 @@ fn manual_mode_respects_the_given_order() {
         session_id: None,
         variables: BTreeMap::new(),
         confirm_destructive: true,
+        full_refresh: false,
     };
     let result = run_postgres(&fx.project, request.clone()).expect("manual run sql first");
     assert_eq!(ids(&result), [sql_file.as_str(), py_file.as_str()]);

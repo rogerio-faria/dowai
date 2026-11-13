@@ -201,6 +201,7 @@ fn request(file: &str, variables: Value) -> RunRequest {
         session_id: None,
         variables: serde_json::from_value(variables).expect("variables object"),
         confirm_destructive: false,
+        full_refresh: false,
     }
 }
 

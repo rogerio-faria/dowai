@@ -96,6 +96,7 @@ impl Harness {
                 session_id: None,
                 variables,
                 confirm_destructive: false,
+                full_refresh: false,
             },
         )
     }

@@ -136,6 +136,7 @@ impl Harness {
                 session_id,
                 variables: BTreeMap::new(),
                 confirm_destructive: false,
+                full_refresh: false,
             },
         )
     }

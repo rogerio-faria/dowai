@@ -29,6 +29,10 @@ mod python_runtime;
 mod resources;
 mod retry;
 
+/// Refusal message of a full refresh without `--yes` (ENT-033).
+pub const FULL_REFRESH_CONFIRMATION_REQUIRED: &str =
+    "Full refresh replaces existing relations and requires explicit confirmation (--yes)";
+
 #[derive(Clone, Debug)]
 pub struct RunRequest {
     pub targets: Vec<String>,
@@ -37,6 +41,9 @@ pub struct RunRequest {
     pub session_id: Option<String>,
     pub variables: BTreeMap<String, Value>,
     pub confirm_destructive: bool,
+    /// Full refresh (ENT-033): rebuilds the selected SQL relations through staging and swap.
+    /// Requires `confirm_destructive`; refused before any run starts otherwise.
+    pub full_refresh: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -176,6 +183,13 @@ pub fn run_postgres_detailed_with_cancel(
     request: RunRequest,
     cancel: &CancellationToken,
 ) -> std::result::Result<RunResult, RunFailure> {
+    if request.full_refresh && !request.confirm_destructive {
+        // ENT-033: refused before a run exists, so nothing is journaled or written.
+        return Err(RunFailure {
+            run_id: None,
+            error: DowaiError::Policy(FULL_REFRESH_CONFIRMATION_REQUIRED.to_owned()),
+        });
+    }
     run_selected(project_dir, request, None, cancel)
 }
 
@@ -311,6 +325,7 @@ fn prepare_retry(
             session_id: source.session_id.clone(),
             variables: request.variables,
             confirm_destructive: request.confirm_destructive,
+            full_refresh: false,
         },
         selection,
     ))
@@ -994,6 +1009,7 @@ fn execute_run(
                     materialization,
                     sql: &prepared.sql,
                     allow_replace,
+                    full_refresh: request.full_refresh,
                 },
             ) {
                 trace.python = std::mem::take(&mut executor.invocations);
@@ -1087,6 +1103,7 @@ fn execute_run(
                 materialization,
                 sql: &node.sql,
                 allow_replace,
+                full_refresh: request.full_refresh,
             },
         ) {
             trace.skip(&execution_plan.nodes[index + 1..], mode);
@@ -1624,6 +1641,7 @@ fn map_execution_error(error: AdapterError) -> DowaiError {
         | AdapterError::InflightLimitExceeded
         | AdapterError::InvalidWriteSpec(_)
         | AdapterError::DuplicateMergeKey
+        | AdapterError::SchemaMismatch
         | AdapterError::MultipleStatements => DowaiError::Execution(error.to_string()),
         AdapterError::Cancelled => DowaiError::cancelled(),
         AdapterError::MissingPassword
@@ -1638,6 +1656,8 @@ struct SqlWrite<'a> {
     materialization: PostgresMaterialization,
     sql: &'a str,
     allow_replace: bool,
+    /// ENT-033: staging and swap instead of replacement in place.
+    full_refresh: bool,
 }
 
 /// Runs one SQL node under the retry policy (ENT-037, ADR 0005). Each attempt has its own
@@ -1671,13 +1691,22 @@ fn materialize_with_retry(
                 Ok(())
             };
             let result = connected.and_then(|()| {
-                adapter.materialize_cancellable(
-                    write.relation,
-                    write.materialization,
-                    write.sql,
-                    write.allow_replace,
-                    &|| cancel.is_cancelled(),
-                )
+                if write.full_refresh {
+                    adapter.full_refresh_cancellable(
+                        write.relation,
+                        write.materialization,
+                        write.sql,
+                        &|| cancel.is_cancelled(),
+                    )
+                } else {
+                    adapter.materialize_cancellable(
+                        write.relation,
+                        write.materialization,
+                        write.sql,
+                        write.allow_replace,
+                        &|| cancel.is_cancelled(),
+                    )
+                }
             });
             match &result {
                 Ok(()) => {
@@ -1973,6 +2002,7 @@ mod tests {
                 session_id: None,
                 variables: BTreeMap::new(),
                 confirm_destructive: false,
+                full_refresh: false,
             },
         )
         .expect_err("Python execution must not pretend to run");
@@ -2018,6 +2048,7 @@ mod tests {
                     session_id: None,
                     variables: BTreeMap::new(),
                     confirm_destructive,
+                    full_refresh: false,
                 },
             )
             .expect_err("external database writes must be opt-in");
@@ -2025,6 +2056,28 @@ mod tests {
             assert_eq!(error.code(), "DOWAI_POLICY_DENIED");
             assert!(error.message().contains("External writes are disabled"));
         }
+    }
+
+    #[test]
+    fn full_refresh_without_confirmation_is_refused_before_any_run() {
+        let request = RunRequest {
+            targets: vec!["model.sql".to_owned()],
+            mode: None,
+            profile: None,
+            session_id: None,
+            variables: BTreeMap::new(),
+            confirm_destructive: false,
+            full_refresh: true,
+        };
+        let failure = run_postgres_detailed_with_cancel(
+            std::path::Path::new("/nonexistent-dowai-full-refresh"),
+            request,
+            &CancellationToken::new(),
+        )
+        .expect_err("full refresh without --yes must be refused");
+        assert!(failure.run_id.is_none(), "no run may start");
+        assert_eq!(failure.error.code(), "DOWAI_POLICY_DENIED");
+        assert_eq!(failure.error.exit_code(), 5);
     }
 
     #[test]
@@ -2089,6 +2142,7 @@ mod tests {
                 session_id: None,
                 variables: BTreeMap::new(),
                 confirm_destructive: false,
+                full_refresh: false,
             },
             &CancellationToken::new(),
         )
@@ -2148,6 +2202,7 @@ mod tests {
                 session_id: None,
                 variables: BTreeMap::from([("enabled".to_owned(), json!(false))]),
                 confirm_destructive: false,
+                full_refresh: false,
             },
         )
         .expect_err("empty models must fail before attempting database connection");

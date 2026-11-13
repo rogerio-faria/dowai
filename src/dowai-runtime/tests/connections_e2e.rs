@@ -134,6 +134,7 @@ fn run_model_variables(workspace: &TestWorkspace, body: &str) -> BTreeMap<String
             session_id: None,
             variables: BTreeMap::new(),
             confirm_destructive: false,
+            full_refresh: false,
         },
     )
     .expect("Python-only run should succeed when the model handles its outcome");

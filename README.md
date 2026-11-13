@@ -159,7 +159,7 @@ By default, the model's file stem is its PostgreSQL relation name. A SQL run
 replaces an existing table/view of that name atomically for each model, but
 previously completed models are not rolled back if a later model fails.
 `source()` resolves only project-declared PostgreSQL relations using the same
-connection profile as models. `--full-refresh` remains unsupported. Remote database
+connection profile as models. `--full-refresh --yes` rebuilds PostgreSQL relations through staging and swap; schema drift fails by default. Remote database
 connections and TLS remain unverified as noted in
 [docs/STATUS.md](docs/STATUS.md).
 

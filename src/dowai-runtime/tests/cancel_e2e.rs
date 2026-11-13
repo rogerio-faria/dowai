@@ -80,6 +80,7 @@ impl Harness {
             session_id: None,
             variables: BTreeMap::new(),
             confirm_destructive: true,
+            full_refresh: false,
         }
     }
 

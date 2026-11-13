@@ -10,6 +10,7 @@ use postgres::{Client, Config, Row};
 use postgres_native_tls::MakeTlsConnector;
 
 mod adapter;
+mod full_refresh;
 mod stream;
 mod write;
 
@@ -155,6 +156,9 @@ pub enum AdapterError {
     InvalidWriteSpec(&'static str),
     /// The staging table holds more than one row for the same merge key in one merge.
     DuplicateMergeKey,
+    /// Full refresh: the rebuilt relation's columns (name or type, in order) differ from the
+    /// existing destination. Nothing is swapped; the destination is kept.
+    SchemaMismatch,
 }
 
 impl AdapterError {
@@ -198,6 +202,9 @@ impl std::fmt::Display for AdapterError {
                 formatter.write_str("invalid PostgreSQL transaction state")
             }
             Self::InvalidStreamLimit => formatter.write_str("invalid PostgreSQL stream limits"),
+            Self::SchemaMismatch => formatter.write_str(
+                "full refresh rejected: the rebuilt relation's columns differ from the destination",
+            ),
             Self::InflightLimitExceeded => {
                 formatter.write_str("PostgreSQL batch exceeds the in-flight byte limit")
             }
@@ -420,6 +427,19 @@ impl PostgresAdapter {
         allow_replace: bool,
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<(), AdapterError> {
+        self.with_cancel_watch(cancelled, |adapter| {
+            adapter.materialize(relation, materialization, query, allow_replace)
+        })
+    }
+
+    /// Runs `operation` while a watcher sends PostgreSQL cancel requests as soon as
+    /// `cancelled()` turns true. A failure observed after cancellation is reported as
+    /// [`AdapterError::Cancelled`].
+    pub(crate) fn with_cancel_watch(
+        &mut self,
+        cancelled: &(dyn Fn() -> bool + Sync),
+        operation: impl FnOnce(&mut Self) -> Result<(), AdapterError>,
+    ) -> Result<(), AdapterError> {
         if cancelled() {
             return Err(AdapterError::Cancelled);
         }
@@ -442,7 +462,7 @@ impl PostgresAdapter {
                     std::thread::sleep(Duration::from_millis(20));
                 }
             });
-            let result = self.materialize(relation, materialization, query, allow_replace);
+            let result = operation(self);
             done.store(true, Ordering::SeqCst);
             result
         });

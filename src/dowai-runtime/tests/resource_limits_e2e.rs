@@ -82,6 +82,7 @@ impl TestWorkspace {
                 session_id: None,
                 variables: BTreeMap::new(),
                 confirm_destructive: false,
+                full_refresh: false,
             },
         )
     }

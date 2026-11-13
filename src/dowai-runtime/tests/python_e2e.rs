@@ -163,6 +163,7 @@ fn supervised_python_dag_persists_variables_and_does_not_commit_failed_runs() {
             session_id: None,
             variables: BTreeMap::from([("input".to_owned(), json!({"batch": 7}))]),
             confirm_destructive: false,
+            full_refresh: false,
         },
     )
     .expect("Python dependency DAG should execute without a database profile");
@@ -199,6 +200,7 @@ fn supervised_python_dag_persists_variables_and_does_not_commit_failed_runs() {
             session_id: Some(result.session_id.clone()),
             variables: BTreeMap::new(),
             confirm_destructive: false,
+            full_refresh: false,
         },
     )
     .expect_err("mixed SQL/Python plans need a PostgreSQL profile; none is configured here");
@@ -219,6 +221,7 @@ fn supervised_python_dag_persists_variables_and_does_not_commit_failed_runs() {
             session_id: Some(result.session_id.clone()),
             variables: BTreeMap::new(),
             confirm_destructive: false,
+            full_refresh: false,
         },
     )
     .expect_err("Python exception must be reported as a failed model");
@@ -242,6 +245,7 @@ fn supervised_python_dag_persists_variables_and_does_not_commit_failed_runs() {
             session_id: Some(result.session_id.clone()),
             variables: BTreeMap::new(),
             confirm_destructive: false,
+            full_refresh: false,
         },
     )
     .expect_err("unsupported data APIs must not simulate success");
@@ -257,6 +261,7 @@ fn supervised_python_dag_persists_variables_and_does_not_commit_failed_runs() {
             session_id: Some(result.session_id.clone()),
             variables: BTreeMap::new(),
             confirm_destructive: false,
+            full_refresh: false,
         },
     )
     .expect_err("dataset returns are not implemented");
@@ -275,6 +280,7 @@ fn supervised_python_dag_persists_variables_and_does_not_commit_failed_runs() {
             session_id: Some(result.session_id.clone()),
             variables: BTreeMap::new(),
             confirm_destructive: false,
+            full_refresh: false,
         },
     )
     .expect_err("malformed worker output must be reported");
@@ -304,6 +310,7 @@ fn supervised_python_dag_persists_variables_and_does_not_commit_failed_runs() {
             session_id: Some(result.session_id.clone()),
             variables: BTreeMap::new(),
             confirm_destructive: false,
+            full_refresh: false,
         },
     )
     .expect_err("timed-out models must be terminated");
@@ -348,6 +355,7 @@ fn env_ref_without_sql_datasets_fails_with_a_catchable_code() {
             session_id: None,
             variables: BTreeMap::new(),
             confirm_destructive: false,
+            full_refresh: false,
         },
     )
     .expect("Python-only run should succeed when the model handles the refusal");
