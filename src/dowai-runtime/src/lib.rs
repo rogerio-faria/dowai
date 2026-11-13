@@ -904,6 +904,7 @@ fn execute_run(
             postgres_profile(profile.clone(), &configuration)?,
             relations.clone(),
             sql_relations,
+            declared_source_relations(&root)?,
         ));
         let pg_profile = postgres_profile(profile, &configuration)?;
         let mut adapter = PostgresAdapter::connect(&pg_profile)
@@ -1294,6 +1295,25 @@ pub fn check_postgres_connection(
         .test_connection()
         .map_err(|error| DowaiError::Connection(error.to_string()))?;
     Ok(profile_name)
+}
+
+/// Quoted relations of the tables declared by the project's sources (ENT-042), keyed by
+/// `(source, table)`. Only these pairs are reachable through `env.source`.
+fn declared_source_relations(project_dir: &Path) -> Result<BTreeMap<(String, String), String>> {
+    let mut relations = BTreeMap::new();
+    for (source_name, source) in load_project(project_dir)?.sources {
+        let schema = quote_identifier(&source.schema)
+            .map_err(|error| DowaiError::Model(error.to_string()))?;
+        for (table_name, relation_name) in source.tables {
+            let table = quote_identifier(&relation_name)
+                .map_err(|error| DowaiError::Model(error.to_string()))?;
+            relations.insert(
+                (source_name.clone(), table_name),
+                format!("{schema}.{table}"),
+            );
+        }
+    }
+    Ok(relations)
 }
 
 fn build_relations(

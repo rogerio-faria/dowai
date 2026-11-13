@@ -32,6 +32,8 @@ pub(crate) const DATASET_UNAVAILABLE: &str = "DOWAI_DATASET_UNAVAILABLE";
 pub(crate) const DATASET_NOT_SQL: &str = "DOWAI_DATASET_NOT_SQL";
 pub(crate) const DATASET_UNDECLARED: &str = "DOWAI_DATASET_UNDECLARED";
 pub(crate) const DATASET_LIMIT: &str = "DOWAI_DATASET_LIMIT";
+/// `env.source(name, table)` for a source that the project does not declare (ENT-042).
+pub(crate) const DATASET_SOURCE_UNDECLARED: &str = "DOWAI_DATASET_SOURCE_UNDECLARED";
 /// Dataset requests served per run; a model cannot probe the database without bound.
 const MAX_DATASET_REQUESTS: usize = 10_000;
 /// Rows served per run through `iter_rows` (AC002): a bounded read, not a data export.
@@ -46,15 +48,26 @@ fn dataset_error(code: &'static str, message: &str) -> DowaiError {
     }
 }
 
-/// Read-only dataset access (`env.ref`) for a mixed run. Only the relations of SQL models
-/// of the plan are reachable, and only through a model that declares them as dependencies,
-/// so the predecessor has already committed when the request is served.
+/// What a worker asks to read: a model (`env.ref`) or a project-declared source
+/// (`env.source`, ENT-042).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DatasetRef {
+    Model(String),
+    Source { source: String, table: String },
+}
+
+/// Read-only dataset access (`env.ref`, `env.source`) for a mixed run. Model relations are
+/// reachable only when they are SQL relations of the plan and the requesting model declares
+/// them as dependencies, so the predecessor has already committed when the request is served.
+/// Declared sources are reachable by `(source, table)` pair, independently of the plan.
 pub(crate) struct DatasetSource {
     profile: PgProfile,
     /// Every plan name (id, path, stem) to its quoted relation.
     relations: BTreeMap<String, String>,
     /// Quoted relations written by SQL models of the plan.
     sql_relations: BTreeSet<String>,
+    /// Tables declared by the project, `(source, table)` to their quoted relation.
+    sources: BTreeMap<(String, String), String>,
     adapter: Option<PostgresAdapter>,
     columns: BTreeMap<String, Vec<(String, String)>>,
     /// Requests served (any operation), bounded by `MAX_DATASET_REQUESTS`.
@@ -69,11 +82,13 @@ impl DatasetSource {
         profile: PgProfile,
         relations: BTreeMap<String, String>,
         sql_relations: BTreeSet<String>,
+        sources: BTreeMap<(String, String), String>,
     ) -> Self {
         Self {
             profile,
             relations,
             sql_relations,
+            sources,
             adapter: None,
             columns: BTreeMap::new(),
             requests: 0,
@@ -87,9 +102,25 @@ impl DatasetSource {
         std::mem::take(&mut self.warnings)
     }
 
-    /// Authorize a dataset name for the model that asks: a SQL relation of the plan that the
-    /// model declares as a dependency. Returns the quoted relation.
-    fn authorize(&self, dataset: &str, depends_on: &[String]) -> Result<String> {
+    /// Authorize a dataset for the model that asks. A model must be a SQL relation of the plan
+    /// that the model declares as a dependency; a source must be declared by the project.
+    /// Returns the quoted relation.
+    fn authorize(&self, target: &DatasetRef, depends_on: &[String]) -> Result<String> {
+        let dataset = match target {
+            DatasetRef::Source { source, table } => {
+                return self
+                    .sources
+                    .get(&(source.clone(), table.clone()))
+                    .cloned()
+                    .ok_or_else(|| {
+                        dataset_error(
+                            DATASET_SOURCE_UNDECLARED,
+                            "Source table is not declared in the project",
+                        )
+                    });
+            }
+            DatasetRef::Model(dataset) => dataset,
+        };
         let relation =
             self.relations.get(dataset).cloned().ok_or_else(|| {
                 dataset_error(DATASET_UNAVAILABLE, "Dataset is not part of the plan")
@@ -137,8 +168,8 @@ impl DatasetSource {
         Ok(columns)
     }
 
-    fn schema(&mut self, dataset: &str, depends_on: &[String]) -> Result<DatasetAnswer> {
-        let relation = self.authorize(dataset, depends_on)?;
+    fn schema(&mut self, target: &DatasetRef, depends_on: &[String]) -> Result<DatasetAnswer> {
+        let relation = self.authorize(target, depends_on)?;
         let columns = self.columns(&relation)?;
         Ok(DatasetAnswer::Columns(
             columns
@@ -150,7 +181,7 @@ impl DatasetSource {
 
     fn rows(
         &mut self,
-        dataset: &str,
+        target: &DatasetRef,
         depends_on: &[String],
         request: RowsRequest<'_>,
     ) -> Result<DatasetAnswer> {
@@ -178,7 +209,7 @@ impl DatasetSource {
                 "Dataset row limit reached for this run",
             ));
         }
-        let relation = self.authorize(dataset, depends_on)?;
+        let relation = self.authorize(target, depends_on)?;
         let all_columns = self.columns(&relation)?;
         let plan = dataset_query::plan(&all_columns, select, filters)?;
         for warning in plan.warnings {
@@ -474,14 +505,14 @@ impl<'a> Executor<'a> {
                 HostReply::Call(self.handle_call(call, parent_invocation_id, deadline))
             }
             HostRequest::Dataset {
-                dataset,
+                target,
                 operation,
                 offset,
                 limit,
                 select,
                 filters,
             } => HostReply::Dataset(self.dataset_request(
-                &dataset,
+                &target,
                 &operation,
                 RowsRequest {
                     offset,
@@ -568,7 +599,7 @@ impl<'a> Executor<'a> {
 
     fn dataset_request(
         &mut self,
-        dataset: &str,
+        target: &DatasetRef,
         operation: &str,
         request: RowsRequest<'_>,
         depends_on: &[String],
@@ -589,8 +620,8 @@ impl<'a> Executor<'a> {
         // Every request counts, including unknown operations (bounded per run).
         source.requests += 1;
         match operation {
-            "schema" => source.schema(dataset, depends_on),
-            "rows" => source.rows(dataset, depends_on, request),
+            "schema" => source.schema(target, depends_on),
+            "rows" => source.rows(target, depends_on, request),
             _ => Err(DowaiError::NotImplemented(
                 "This dataset operation is not available yet".to_owned(),
             )),

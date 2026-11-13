@@ -767,3 +767,84 @@ fn ent041_fallback_is_warned_and_refusals_have_stable_codes() {
     );
     assert_eq!(variables["pickle_refused"], json!(true));
 }
+
+/// ENT-042: `env.source(name, table)` reads a table declared by the project, with its schema
+/// and in batches, and refuses an undeclared source or table with a stable code.
+#[test]
+#[ignore = "opt-in E2E; requires a dedicated disposable PostgreSQL database"]
+fn ent042_declared_source_is_read_and_undeclared_source_is_refused() {
+    let fx = Fixture::new("ent042-source");
+    let (table, py, sql) = (fx.name("raw_users"), fx.name("reader"), fx.name("anchor"));
+    let _cleanup = TableCleanup(vec![table.clone(), sql.clone()]);
+    // A SQL predecessor makes this a mixed run: datasets (ref and source) exist only in mixed runs.
+    fx.write_model(&format!("{sql}.sql"), "select 1::int4 as v");
+    {
+        let mut adapter = PostgresAdapter::connect(&test_profile()).expect("connect");
+        let identifier = quote_identifier(&table).expect("identifier");
+        adapter
+            .execute(
+                &format!("CREATE TABLE {identifier} (id int4, label text)"),
+                &[],
+            )
+            .expect("create source table");
+        adapter
+            .execute(
+                &format!("INSERT INTO {identifier} VALUES (1, 'a'), (2, 'b')"),
+                &[],
+            )
+            .expect("seed source table");
+    }
+    let manifest_path = fx.project.join("dowai_project.json");
+    let mut manifest: Value =
+        serde_json::from_slice(&fs::read(&manifest_path).expect("read manifest"))
+            .expect("manifest is JSON");
+    manifest["sources"] = json!({
+        "raw": { "schema": "public", "tables": { "users": table } }
+    });
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec(&manifest).expect("serialize"),
+    )
+    .expect("write manifest");
+    fx.write_model(
+        &format!("{py}.py"),
+        &format!(
+            "def model(env):\n\
+         \x20   env.depends_on('{sql}')\n\
+         \x20   columns = env.source('raw', 'users').schema()\n\
+         \x20   env.setVar('src_columns', ','.join(c['name'] for c in columns))\n\
+         \x20   rows = list(env.source('raw', 'users').iter_rows(batch_size=1))\n\
+         \x20   env.setVar('src_rows', len(rows))\n\
+         \x20   env.setVar('src_id_sum', sum(r['id'] for r in rows))\n\
+         \x20   for name, tab in [('other', 'users'), ('raw', 'missing')]:\n\
+         \x20       try:\n\
+         \x20           env.source(name, tab).schema()\n\
+         \x20       except Exception as error:\n\
+         \x20           env.setVar('undeclared_' + name + '_' + tab, error.code)\n\
+         \x20   try:\n\
+         \x20       env.source('', 'users')\n\
+         \x20   except ValueError:\n\
+         \x20       env.setVar('empty_name_refused', True)\n\
+         \x20   return None\n"
+        ),
+    );
+
+    let result = fx
+        .run(&[&format!("{py}.py")], None, None)
+        .expect("source run");
+
+    assert_eq!(result.status, "SUCCEEDED");
+    let variables = fx.variables(&result.session_id);
+    assert_eq!(variables["src_columns"], json!("id,label"));
+    assert_eq!(variables["src_rows"], json!(2));
+    assert_eq!(variables["src_id_sum"], json!(3));
+    assert_eq!(
+        variables["undeclared_other_users"],
+        json!("DOWAI_DATASET_SOURCE_UNDECLARED")
+    );
+    assert_eq!(
+        variables["undeclared_raw_missing"],
+        json!("DOWAI_DATASET_SOURCE_UNDECLARED")
+    );
+    assert_eq!(variables["empty_name_refused"], json!(true));
+}

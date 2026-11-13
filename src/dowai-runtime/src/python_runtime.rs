@@ -1,4 +1,5 @@
 use crate::dataset_query::FilterRequest;
+use crate::executor::DatasetRef;
 use dowai_core::{CancellationToken, DowaiError, ProjectPython, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -236,18 +237,28 @@ def main():
         def validate(self):
             return self._command("validate")
 
-        def _dataset_exchange(self, name, operation, **fields):
+        def _dataset_exchange(self, name, operation, origin=None, **fields):
             if self._closed:
                 raise ExecutionError(
                     "DOWAI_DATASET_EXPIRED",
                     "lazy dataset was used after its model finished",
                 )
-            if not isinstance(name, str) or name not in self._dependencies:
-                raise ExecutionError(
-                    "DOWAI_DATASET_UNDECLARED",
-                    "dataset was not declared as a dependency of this model",
-                )
-            message = {"protocol_version": 1, "kind": "dataset", "dataset": name, "operation": operation}
+            if origin is None:
+                if not isinstance(name, str) or name not in self._dependencies:
+                    raise ExecutionError(
+                        "DOWAI_DATASET_UNDECLARED",
+                        "dataset was not declared as a dependency of this model",
+                    )
+                message = {"protocol_version": 1, "kind": "dataset", "dataset": name, "operation": operation}
+            else:
+                # env.source (ENT-042): the host checks the project declaration.
+                message = {
+                    "protocol_version": 1,
+                    "kind": "dataset",
+                    "source": origin[0],
+                    "table": origin[1],
+                    "operation": operation,
+                }
             message.update(fields)
             respond(message)
             line = _in.readline()
@@ -263,20 +274,20 @@ def main():
                 )
             return reply
 
-        def _dataset_request(self, name, operation, **fields):
-            reply = self._dataset_exchange(name, operation, **fields)
+        def _dataset_request(self, name, operation, origin=None, **fields):
+            reply = self._dataset_exchange(name, operation, origin=origin, **fields)
             if reply.get("kind") == "dataset_ok" and isinstance(reply.get("columns"), list):
                 return [dict(column) for column in reply["columns"]]
             raise RuntimeError("invalid dataset reply")
 
-        def _dataset_batch(self, name, offset, limit, select, filters):
+        def _dataset_batch(self, name, offset, limit, select, filters, origin=None):
             """Raw batch of a read plus the indexes of predicates the worker must apply."""
             fields = {"offset": offset, "limit": limit}
             if select is not None:
                 fields["select"] = list(select)
             if filters:
                 fields["filters"] = list(filters)
-            reply = self._dataset_exchange(name, "rows", **fields)
+            reply = self._dataset_exchange(name, "rows", origin=origin, **fields)
             if (
                 reply.get("kind") != "dataset_rows"
                 or not isinstance(reply.get("columns"), list)
@@ -297,6 +308,14 @@ def main():
                 raise ValueError("name must be a non-empty string")
             return Dataset(self, name)
 
+        def source(self, name, table):
+            """`env.source(name, table)`: a table declared by the project (ENT-042)."""
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("name must be a non-empty string")
+            if not isinstance(table, str) or not table.strip():
+                raise ValueError("table must be a non-empty string")
+            return Dataset(self, "%s.%s" % (name, table), origin=(name, table))
+
         @property
         def connections(self):
             """Capability handles for workspace profiles (ENT-043)."""
@@ -305,7 +324,6 @@ def main():
         def _unsupported(self, *args, **kwargs):
             raise NotImplementedError()
 
-        source = _unsupported
         write = _unsupported
         generateCsv = _unsupported
 
@@ -383,11 +401,12 @@ def main():
 
         OPERATORS = ("=", "!=", "<", "<=", ">", ">=", "is_null", "is_not_null")
 
-        def __init__(self, environment, name, select=None, filters=()):
+        def __init__(self, environment, name, select=None, filters=(), origin=None):
             self._environment = environment
             self._name = name
             self._select = select
             self._filters = filters
+            self._origin = origin
 
         def __reduce_ex__(self, protocol):
             raise TypeError("a lazy dataset cannot leave the DOWAI process")
@@ -400,7 +419,7 @@ def main():
             return self._name
 
         def schema(self):
-            return self._environment._dataset_request(self._name, "schema")
+            return self._environment._dataset_request(self._name, "schema", origin=self._origin)
 
         def select(self, *columns):
             if not columns:
@@ -409,7 +428,7 @@ def main():
                 check_name(column)
             if len(set(columns)) != len(columns):
                 raise ValueError("select names the same column twice")
-            return Dataset(self._environment, self._name, tuple(columns), self._filters)
+            return Dataset(self._environment, self._name, tuple(columns), self._filters, self._origin)
 
         def filter(self, column, op, value=None):
             check_name(column)
@@ -424,7 +443,7 @@ def main():
                 if isinstance(value, float) and (value != value or value in (float("inf"), float("-inf"))):
                     raise ValueError("filter value must be finite")
             predicate = {"column": column, "op": op, "value": value}
-            return Dataset(self._environment, self._name, self._select, self._filters + (predicate,))
+            return Dataset(self._environment, self._name, self._select, self._filters + (predicate,), self._origin)
 
         def iter_batches(self, batch_size=1000):
             check_batch_size(batch_size)
@@ -437,7 +456,7 @@ def main():
             offset = 0
             while True:
                 raw, residual = self._environment._dataset_batch(
-                    self._name, offset, batch_size, self._select, self._filters
+                    self._name, offset, batch_size, self._select, self._filters, origin=self._origin
                 )
                 kept = [
                     row
@@ -515,6 +534,11 @@ struct WorkerMessage {
     invocation_id: Option<String>,
     #[serde(default)]
     dataset: Option<String>,
+    /// `env.source` (ENT-042): the declared source and its table, instead of `dataset`.
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    table: Option<String>,
     #[serde(default)]
     operation: Option<String>,
     #[serde(default)]
@@ -539,7 +563,7 @@ pub(crate) struct DatasetColumn {
 pub(crate) enum HostRequest {
     Call(ChildCall),
     Dataset {
-        dataset: String,
+        target: DatasetRef,
         operation: String,
         offset: Option<u64>,
         limit: Option<u32>,
@@ -937,11 +961,18 @@ impl Supervision {
                 Ok(())
             }
             "dataset" => {
-                let (Some(dataset), Some(operation)) = (message.dataset, message.operation) else {
+                let Some(operation) = message.operation else {
                     return Err(protocol_error());
                 };
+                // Exactly one origin: a plan model (`dataset`) or a declared source
+                // (`source` and `table`). Any other combination is a protocol error.
+                let target = match (message.dataset, message.source, message.table) {
+                    (Some(dataset), None, None) => DatasetRef::Model(dataset),
+                    (None, Some(source), Some(table)) => DatasetRef::Source { source, table },
+                    _ => return Err(protocol_error()),
+                };
                 let HostReply::Dataset(result) = on_request(HostRequest::Dataset {
-                    dataset,
+                    target,
                     operation,
                     offset: message.offset,
                     limit: message.limit,
