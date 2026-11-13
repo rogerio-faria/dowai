@@ -1,0 +1,18 @@
+{
+  "schema_version": 2,
+  "id": "files",
+  "version": "1.0.0",
+  "entrypoints": {
+    "read_rows": "files:read_rows",
+    "write_rows": "files:write_rows",
+    "copy": "files:copy"
+  },
+  "permissions": {
+    "network": [],
+    "filesystem": ["project_files"],
+    "secrets": []
+  },
+  "timeout_seconds": 600,
+  "side_effects": true,
+  "idempotency_key_required": true
+}
