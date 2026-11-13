@@ -14,7 +14,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 /// Current `PRAGMA user_version` of the run journal database.
-pub const RUN_SCHEMA_VERSION: i64 = 5;
+pub const RUN_SCHEMA_VERSION: i64 = 6;
 
 /// Reason recorded for a run whose process died before its final record (ENT-062).
 pub const RUN_INTERRUPTED_CODE: &str = "DOWAI_RUN_INTERRUPTED";
@@ -31,6 +31,8 @@ pub struct RunStart {
     pub requested_targets: Option<Vec<String>>,
     pub profile: Option<String>,
     pub variable_count: Option<u32>,
+    /// Whether the run was a `--full-refresh` (ENT-112). `None` for runs recorded before schema 6.
+    pub full_refresh: Option<bool>,
 }
 
 /// Proof that a run is alive. While it exists, the OS-level locks of the run and the shared
@@ -81,6 +83,8 @@ pub struct NewRun {
     pub profile: Option<String>,
     /// Number of variables passed to the run. Values are never stored (D-013).
     pub variable_count: Option<u32>,
+    /// Whether the run was a `--full-refresh` (ENT-112). `None` for runs recorded before schema 6.
+    pub full_refresh: Option<bool>,
 }
 
 /// What `dowai retry` needs from a journaled run. Holds no variable values.
@@ -94,6 +98,8 @@ pub struct RetrySource {
     pub requested_targets: Option<Vec<String>>,
     pub profile: Option<String>,
     pub variable_count: Option<u32>,
+    /// `full_refresh` of the original run; `None` when it was recorded before schema 6 (ENT-112).
+    pub full_refresh: Option<bool>,
     /// Plan nodes whose invocation finished `FAILED` in the original run.
     pub failed_nodes: Vec<String>,
     /// Plan nodes whose invocation finished `SUCCEEDED` in the original run.
@@ -300,8 +306,8 @@ impl RunStore {
             .execute(
                 "INSERT INTO runs (run_id, session_id, project, status, execution_mode,
                    started_at_ms, finished_at_ms, started_at, finished_at, duration_ms, error_code,
-                   requested_targets, profile, variable_count)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                   requested_targets, profile, variable_count, full_refresh)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 params![
                     run.run_id,
                     run.session_id,
@@ -317,6 +323,7 @@ impl RunStore {
                     targets_json(run.requested_targets.as_deref())?,
                     run.profile.as_deref().map(bounded),
                     run.variable_count.map(i64::from),
+                    run.full_refresh.map(i64::from),
                 ],
             )
             .map_err(state_error)?;
@@ -362,8 +369,8 @@ impl RunStore {
         connection
             .execute(
                 "INSERT INTO run_inflight (run_id, project, session_id, execution_mode,
-                   started_at_ms, requested_targets, profile, variable_count)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                   started_at_ms, requested_targets, profile, variable_count, full_refresh)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     start.run_id,
                     bounded(&start.project),
@@ -373,6 +380,7 @@ impl RunStore {
                     targets_json(start.requested_targets.as_deref())?,
                     start.profile.as_deref().map(bounded),
                     start.variable_count.map(i64::from),
+                    start.full_refresh.map(i64::from),
                 ],
             )
             .map_err(state_error)?;
@@ -522,7 +530,7 @@ impl RunStore {
         let row = connection
             .query_row(
                 "SELECT status, project, session_id, execution_mode, requested_targets, profile,
-                   variable_count
+                   variable_count, full_refresh
                  FROM runs WHERE run_id = ?1",
                 [run_id],
                 |row| {
@@ -534,6 +542,7 @@ impl RunStore {
                         row.get::<_, Option<String>>(4)?,
                         row.get::<_, Option<String>>(5)?,
                         row.get::<_, Option<i64>>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
                     ))
                 },
             )
@@ -580,6 +589,7 @@ impl RunStore {
             requested_targets,
             profile: row.5,
             variable_count: row.6.and_then(|count| u32::try_from(count).ok()),
+            full_refresh: row.7.map(|flag| flag != 0),
             failed_nodes,
             succeeded_nodes,
         })
@@ -619,17 +629,24 @@ impl RunStore {
                 migrate_v2_to_v3(&mut connection)?;
                 migrate_v3_to_v4(&mut connection)?;
                 migrate_v4_to_v5(&mut connection)?;
+                migrate_v5_to_v6(&mut connection)?;
             }
             2 => {
                 migrate_v2_to_v3(&mut connection)?;
                 migrate_v3_to_v4(&mut connection)?;
                 migrate_v4_to_v5(&mut connection)?;
+                migrate_v5_to_v6(&mut connection)?;
             }
             3 => {
                 migrate_v3_to_v4(&mut connection)?;
                 migrate_v4_to_v5(&mut connection)?;
+                migrate_v5_to_v6(&mut connection)?;
             }
-            4 => migrate_v4_to_v5(&mut connection)?,
+            4 => {
+                migrate_v4_to_v5(&mut connection)?;
+                migrate_v5_to_v6(&mut connection)?;
+            }
+            5 => migrate_v5_to_v6(&mut connection)?,
             RUN_SCHEMA_VERSION => {}
             other => {
                 return Err(DowaiError::State(format!(
@@ -761,6 +778,27 @@ fn migrate_v4_to_v5(connection: &mut Connection) -> Result<()> {
     transaction.commit().map_err(state_error)
 }
 
+/// Schema 6 adds `full_refresh` to `runs` and `run_inflight` (ENT-112), so `dowai retry` can
+/// reapply the mode of a `--full-refresh` run. Rows recorded before it keep NULL, which means
+/// "unknown" and is never read as a full refresh.
+fn migrate_v5_to_v6(connection: &mut Connection) -> Result<()> {
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(state_error)?;
+    if user_version(&transaction)? == 5 {
+        transaction
+            .execute_batch(
+                "ALTER TABLE runs ADD COLUMN full_refresh INTEGER
+                   CHECK (full_refresh IS NULL OR full_refresh IN (0, 1));
+                 ALTER TABLE run_inflight ADD COLUMN full_refresh INTEGER
+                   CHECK (full_refresh IS NULL OR full_refresh IN (0, 1));
+                 PRAGMA user_version = 6;",
+            )
+            .map_err(state_error)?;
+    }
+    transaction.commit().map_err(state_error)
+}
+
 /// JSON array of the requested targets; `None` stays NULL.
 fn targets_json(targets: Option<&[String]>) -> Result<Option<String>> {
     targets
@@ -790,7 +828,7 @@ fn read_inflight(connection: &rusqlite::Connection) -> Result<Vec<RunStart>> {
     let mut statement = connection
         .prepare(
             "SELECT run_id, project, session_id, execution_mode, started_at_ms,
-               requested_targets, profile, variable_count
+               requested_targets, profile, variable_count, full_refresh
              FROM run_inflight ORDER BY started_at_ms, run_id",
         )
         .map_err(state_error)?;
@@ -798,6 +836,7 @@ fn read_inflight(connection: &rusqlite::Connection) -> Result<Vec<RunStart>> {
         .query_map([], |row| {
             let targets: Option<String> = row.get(5)?;
             let variable_count: Option<i64> = row.get(7)?;
+            let full_refresh: Option<i64> = row.get(8)?;
             Ok(RunStart {
                 run_id: row.get(0)?,
                 project: row.get(1)?,
@@ -807,6 +846,7 @@ fn read_inflight(connection: &rusqlite::Connection) -> Result<Vec<RunStart>> {
                 requested_targets: targets.and_then(|text| serde_json::from_str(&text).ok()),
                 profile: row.get(6)?,
                 variable_count: variable_count.and_then(|count| u32::try_from(count).ok()),
+                full_refresh: full_refresh.map(|flag| flag != 0),
             })
         })
         .map_err(state_error)?;
@@ -831,6 +871,7 @@ fn interrupted_run(start: &RunStart, now_ms: i64) -> NewRun {
         requested_targets: start.requested_targets.clone(),
         profile: start.profile.clone(),
         variable_count: start.variable_count,
+        full_refresh: start.full_refresh,
     }
 }
 
@@ -1001,6 +1042,7 @@ mod tests {
             requested_targets: Some(vec!["model.py".to_owned()]),
             profile: None,
             variable_count: Some(0),
+            full_refresh: None,
         }
     }
 
@@ -1437,6 +1479,65 @@ mod tests {
         assert_eq!(source.variable_count, None);
         assert_eq!(fixture.store.list(5).expect("list").len(), 1);
     }
+
+    #[test]
+    fn full_refresh_flag_is_journaled_and_legacy_rows_stay_unknown() {
+        // ENT-112: the flag is kept for retry; a run recorded before schema 6 has NULL, which
+        // is read as unknown (never as a full refresh).
+        let fixture = Fixture::new();
+        let id = "44444444-4444-4444-8444-444444444444";
+        let mut record = run(id, 1_700_000_000_000, "FAILED");
+        record.full_refresh = Some(true);
+        fixture.store.record(&record, &[]).expect("record");
+        assert_eq!(
+            fixture.store.retry_source(id).expect("source").full_refresh,
+            Some(true)
+        );
+
+        let legacy_id = "55555555-5555-4555-8555-555555555555";
+        let mut legacy = run(legacy_id, 1_700_000_000_100, "FAILED");
+        legacy.full_refresh = None;
+        fixture.store.record(&legacy, &[]).expect("record legacy");
+        assert_eq!(
+            fixture
+                .store
+                .retry_source(legacy_id)
+                .expect("source")
+                .full_refresh,
+            None
+        );
+    }
+
+    #[test]
+    fn schema_five_journal_gains_full_refresh_columns() {
+        let fixture = Fixture::new();
+        let journal = &fixture.store;
+        journal.schema_version().expect("create");
+        let connection = Connection::open(fixture.dir.join("state/runs.sqlite3")).expect("open");
+        connection
+            .execute_batch(
+                "ALTER TABLE runs DROP COLUMN full_refresh;
+                 ALTER TABLE run_inflight DROP COLUMN full_refresh;
+                 PRAGMA user_version = 5;",
+            )
+            .expect("downgrade to schema 5");
+        drop(connection);
+
+        assert_eq!(
+            journal.schema_version().expect("migrated"),
+            RUN_SCHEMA_VERSION
+        );
+        let id = "66666666-6666-4666-8666-666666666666";
+        let mut record = run(id, 1_700_000_000_000, "FAILED");
+        record.full_refresh = Some(false);
+        journal
+            .record(&record, &[])
+            .expect("record after migration");
+        assert_eq!(
+            journal.retry_source(id).expect("source").full_refresh,
+            Some(false)
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1481,6 +1582,7 @@ mod recovery_tests {
             requested_targets: Some(vec!["model.py".to_owned()]),
             profile: None,
             variable_count: Some(0),
+            full_refresh: None,
         }
     }
 
@@ -1498,6 +1600,7 @@ mod recovery_tests {
             requested_targets: Some(vec!["model.py".to_owned()]),
             profile: None,
             variable_count: Some(0),
+            full_refresh: None,
         }
     }
 
@@ -1689,7 +1792,11 @@ mod recovery_tests {
         journal.schema_version().expect("create");
         let connection = Connection::open(fixture.dir.join("state/runs.sqlite3")).expect("open");
         connection
-            .execute_batch("DROP TABLE run_inflight; PRAGMA user_version = 4;")
+            .execute_batch(
+                "DROP TABLE run_inflight;
+                 ALTER TABLE runs DROP COLUMN full_refresh;
+                 PRAGMA user_version = 4;",
+            )
             .expect("downgrade to schema 4");
         drop(connection);
 

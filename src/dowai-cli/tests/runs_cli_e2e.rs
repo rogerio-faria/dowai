@@ -60,6 +60,7 @@ impl State {
                         requested_targets: Some(vec!["model.py".to_owned()]),
                         profile: None,
                         variable_count: Some(0),
+                        full_refresh: None,
                     },
                     &[NewInvocation {
                         invocation_id: format!("inv-{id}"),

@@ -260,6 +260,7 @@ mod tests {
             requested_targets: Some(vec!["all".to_owned()]),
             profile: None,
             variable_count: Some(0),
+            full_refresh: None,
         }
     }
 

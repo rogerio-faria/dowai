@@ -273,6 +273,14 @@ fn prepare_retry(
             message: "The run belongs to a different project".to_owned(),
         });
     }
+    // ENT-112: a full refresh is destructive by definition. Its retry needs the same explicit
+    // confirmation, and it reapplies the mode. Runs without the flag (`None`) are not full.
+    let full_refresh = source.full_refresh == Some(true);
+    if full_refresh && !request.confirm_destructive {
+        return Err(DowaiError::Policy(
+            FULL_REFRESH_CONFIRMATION_REQUIRED.to_owned(),
+        ));
+    }
     let original_variables = source.variable_count.unwrap_or(0);
     if original_variables > 0 && request.variables.is_empty() {
         return Err(DowaiError::Retry {
@@ -325,7 +333,7 @@ fn prepare_retry(
             session_id: source.session_id.clone(),
             variables: request.variables,
             confirm_destructive: request.confirm_destructive,
-            full_refresh: false,
+            full_refresh,
         },
         selection,
     ))
@@ -346,6 +354,7 @@ fn run_selected(
         targets: request.targets.clone(),
         profile: request.profile.clone(),
         variable_count: u32::try_from(request.variables.len()).ok(),
+        full_refresh: request.full_refresh,
     };
     let requested_mode = request.mode;
     let root_invocation_id = Uuid::new_v4().to_string();
@@ -403,6 +412,7 @@ fn run_selected(
                 requested_targets: Some(journal_request.targets.clone()),
                 profile: journal_request.profile.clone(),
                 variable_count: journal_request.variable_count,
+                full_refresh: Some(journal_request.full_refresh),
             })
             .map_err(|error| eprintln!("Warning: the run start could not be journaled: {error}"))
             .ok()
@@ -564,6 +574,7 @@ struct JournalRequest {
     targets: Vec<String>,
     profile: Option<String>,
     variable_count: Option<u32>,
+    full_refresh: bool,
 }
 
 fn journal_run(
@@ -639,6 +650,7 @@ fn journal_run(
             requested_targets: Some(request.targets.clone()),
             profile: request.profile.clone(),
             variable_count: request.variable_count,
+            full_refresh: Some(request.full_refresh),
         },
         &invocations,
     )

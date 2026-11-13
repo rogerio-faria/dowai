@@ -73,6 +73,7 @@ fn start(run_id: &str, session_id: Option<String>) -> RunStart {
         requested_targets: Some(vec!["model.py".to_owned()]),
         profile: None,
         variable_count: Some(0),
+        full_refresh: None,
     }
 }
 
@@ -90,6 +91,7 @@ fn final_record(run_id: &str, status: &str) -> NewRun {
         requested_targets: Some(vec!["model.py".to_owned()]),
         profile: None,
         variable_count: Some(0),
+        full_refresh: None,
     }
 }
 

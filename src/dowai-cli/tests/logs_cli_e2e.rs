@@ -57,6 +57,7 @@ impl State {
                     requested_targets: Some(vec!["root.sql".to_owned()]),
                     profile: None,
                     variable_count: Some(0),
+                    full_refresh: None,
                 },
                 &[
                     invocation("i1", None, "root.sql", "SUCCEEDED", None),

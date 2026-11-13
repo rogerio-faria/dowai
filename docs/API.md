@@ -33,7 +33,7 @@ ENT-078 e ENT-010).
 | `dowai runs list [--limit N] [--json]` | Parcial | Diário local de execuções. Verificado (padrão 20). |
 | `dowai runs show <run_id> [--json]` | Parcial | Execução com invocações. |
 | `dowai logs <run_id> [--node NODE] [--level LEVEL] [--json]` | Parcial | Árvore de invocações do diário. Não há mensagens livres. |
-| `dowai retry <run_id> [--failed-only] [--vars JSON] [--yes] [--json]` | Parcial | Reexecuta execução `FAILED` ou `CANCELLED` como nova execução. Variáveis não são armazenadas e devem ser informadas novamente. |
+| `dowai retry <run_id> [--failed-only] [--vars JSON] [--yes] [--json]` | Parcial | Reexecuta execução `FAILED` ou `CANCELLED` como nova execução. Variáveis não são armazenadas e devem ser informadas novamente. Execução de `--full-refresh` reaplica o modo (staging e swap, checagem de schema) e exige `--yes`; runs gravadas antes do schema 6 do journal são tratadas como não-full-refresh. |
 | `dowai plugins list [--scope project\|global\|all]` | Parcial | Apenas leitura de manifestos. |
 | `dowai plugins info <id>` | Parcial | Apenas leitura de manifestos. |
 | `dowai plugins sync` | Parcial | Gera stubs `.pyi` em `.dowai/stubs`, sem importar código de plugin. |
