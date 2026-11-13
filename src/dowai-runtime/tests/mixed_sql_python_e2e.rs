@@ -1014,3 +1014,99 @@ fn ent047_missing_frame_library_is_refused_with_stable_code() {
         );
     }
 }
+
+/// ENT-111: a Python-only run reads a declared source. There is no SQL model in the plan, so the
+/// run has no profile of its own; the dataset connection opens on the first read.
+#[test]
+#[ignore = "opt-in E2E; requires a dedicated disposable PostgreSQL database"]
+fn ent111_python_only_run_reads_declared_source() {
+    let fx = Fixture::new("ent111-source");
+    let (table, py) = (fx.name("raw_users"), fx.name("reader"));
+    let _cleanup = TableCleanup(vec![table.clone()]);
+    {
+        let mut adapter = PostgresAdapter::connect(&test_profile()).expect("connect");
+        let identifier = quote_identifier(&table).expect("identifier");
+        adapter
+            .execute(
+                &format!("CREATE TABLE {identifier} (id int4, label text)"),
+                &[],
+            )
+            .expect("create source table");
+        adapter
+            .execute(
+                &format!("INSERT INTO {identifier} VALUES (1, 'a'), (2, 'b')"),
+                &[],
+            )
+            .expect("seed source table");
+    }
+    let manifest_path = fx.project.join("dowai_project.json");
+    let mut manifest: Value =
+        serde_json::from_slice(&fs::read(&manifest_path).expect("read manifest"))
+            .expect("manifest is JSON");
+    manifest["sources"] = json!({
+        "raw": { "schema": "public", "tables": { "users": table } }
+    });
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec(&manifest).expect("serialize"),
+    )
+    .expect("write manifest");
+    fx.write_model(
+        &format!("{py}.py"),
+        "def model(env):\n    rows = list(env.source('raw', 'users').iter_rows(batch_size=1))\n    env.setVar('py_rows', len(rows))\n    env.setVar('py_id_sum', sum(r['id'] for r in rows))\n    return None\n",
+    );
+
+    let result = fx
+        .run(&[&format!("{py}.py")], None, None)
+        .expect("Python-only run with a declared source");
+
+    assert_eq!(result.status, "SUCCEEDED");
+    assert_eq!(result.profile, "python");
+    let variables = fx.variables(&result.session_id);
+    assert_eq!(variables["py_rows"], json!(2));
+    assert_eq!(variables["py_id_sum"], json!(3));
+}
+
+/// ENT-111: without a dataset profile, a Python-only run that does not read datasets succeeds,
+/// and a declared-source read fails with a catchable `DOWAI_DATASET_UNAVAILABLE`, never a
+/// connection attempt or a credential in the message.
+#[test]
+#[ignore = "opt-in E2E; needs python3 and the DOWAI_TEST_PG_* variables for the fixture"]
+fn ent111_python_only_without_profile_keeps_plain_runs_and_refuses_source_reads() {
+    let fx = Fixture::new("ent111-noprofile");
+    let (plain, reader) = (fx.name("plain"), fx.name("reader"));
+    // No profile in the workspace: nothing can be resolved for datasets.
+    fs::write(fx.root.join("workspace.json"), b"{\"schema_version\":2}").expect("workspace");
+    let manifest_path = fx.project.join("dowai_project.json");
+    let mut manifest: Value =
+        serde_json::from_slice(&fs::read(&manifest_path).expect("read manifest"))
+            .expect("manifest is JSON");
+    manifest["sources"] = json!({
+        "raw": { "schema": "public", "tables": { "users": "unused_table" } }
+    });
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec(&manifest).expect("serialize"),
+    )
+    .expect("write manifest");
+    fx.write_model(
+        &format!("{plain}.py"),
+        "def model(env):\n    env.setVar('plain_ok', True)\n    return None\n",
+    );
+    fx.write_model(
+        &format!("{reader}.py"),
+        "def model(env):\n    try:\n        env.source('raw', 'users').schema()\n    except Exception as error:\n        env.setVar('source_code', error.code)\n    return None\n",
+    );
+
+    let plain_result = fx
+        .run(&[&format!("{plain}.py")], None, None)
+        .expect("plain Python-only run needs no dataset profile");
+    assert_eq!(plain_result.status, "SUCCEEDED");
+
+    let result = fx
+        .run(&[&format!("{reader}.py")], None, None)
+        .expect("reader handles the refusal and succeeds");
+    assert_eq!(result.status, "SUCCEEDED");
+    let variables = fx.variables(&result.session_id);
+    assert_eq!(variables["source_code"], json!("DOWAI_DATASET_UNAVAILABLE"));
+}

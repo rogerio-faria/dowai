@@ -190,8 +190,10 @@ terminated on timeout. The worker receives a minimal environment allowlist,
 not arbitrary host variables. This is **not a security sandbox**. Python code
 can access the operating system, and models must be trusted; detached Unix
 subprocesses can escape their process group. `env.ref()`, `env.source()`,
-`env.run()` of `.sql` files, datasets, non-`None` results, and package
-installation fail explicitly as unsupported.
+`env.run()` of `.sql` files, non-`None` results, and package installation
+fail explicitly as unsupported. Datasets (`env.ref()`, `env.source()`) are
+read-only and need a configured PostgreSQL profile; `env.ref()` of a model
+needs a SQL model in the run.
 
 ## Development
 

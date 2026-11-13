@@ -822,6 +822,18 @@ fn execute_run(
                     .map(|session| session.session_id.clone()),
             },
         )?;
+        // ENT-111: declared sources are readable in Python-only runs. The profile comes from the
+        // configuration only; the connection opens on the first dataset read. A Python-only plan
+        // has no SQL relation, so model datasets are refused (see `DatasetSource::authorize`).
+        let dataset_profile = resolve_profile(&root, &configuration, None)
+            .and_then(|(_, workspace_profile)| postgres_profile(workspace_profile, &configuration))
+            .map_err(|_| "No PostgreSQL profile is available for datasets");
+        executor.datasets = Some(executor::DatasetSource::new(
+            dataset_profile,
+            build_relations(&root, &execution_plan)?,
+            BTreeSet::new(),
+            declared_source_relations(&root)?,
+        ));
         let mut completed_nodes = Vec::with_capacity(execution_plan.nodes.len());
         for (index, node) in execution_plan.nodes.iter().enumerate() {
             if let Err(error) = cancel.check() {
@@ -851,6 +863,12 @@ fn execute_run(
                 materialization: "none".to_owned(),
                 status: "SUCCEEDED".to_owned(),
             });
+        }
+        // ENT-111: the dataset profile is resolved from configuration only. A failure is kept
+        // by the source and reported on the first dataset read; the connection opens only then.
+        // Fallback warnings of dataset reads are reported as in mixed runs (ENT-041).
+        if let Some(datasets) = executor.datasets.as_mut() {
+            execution_plan.warnings.extend(datasets.take_warnings());
         }
         let invocations = executor.invocations;
         trace.python = invocations.clone();
@@ -928,7 +946,7 @@ fn execute_run(
             .filter_map(|node| relations.get(&node.id.replace('\\', "/")).cloned())
             .collect();
         executor.datasets = Some(executor::DatasetSource::new(
-            postgres_profile(profile.clone(), &configuration)?,
+            Ok(postgres_profile(profile.clone(), &configuration)?),
             relations.clone(),
             sql_relations,
             declared_source_relations(&root)?,

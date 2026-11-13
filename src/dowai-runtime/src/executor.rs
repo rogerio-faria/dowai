@@ -62,7 +62,8 @@ pub(crate) enum DatasetRef {
 /// them as dependencies, so the predecessor has already committed when the request is served.
 /// Declared sources are reachable by `(source, table)` pair, independently of the plan.
 pub(crate) struct DatasetSource {
-    profile: PgProfile,
+    /// Resolved from configuration. An `Err` is reported on the first read (ENT-111).
+    profile: std::result::Result<PgProfile, &'static str>,
     /// Every plan name (id, path, stem) to its quoted relation.
     relations: BTreeMap<String, String>,
     /// Quoted relations written by SQL models of the plan.
@@ -80,7 +81,7 @@ pub(crate) struct DatasetSource {
 
 impl DatasetSource {
     pub(crate) fn new(
-        profile: PgProfile,
+        profile: std::result::Result<PgProfile, &'static str>,
         relations: BTreeMap<String, String>,
         sql_relations: BTreeSet<String>,
         sources: BTreeMap<(String, String), String>,
@@ -126,6 +127,13 @@ impl DatasetSource {
             self.relations.get(dataset).cloned().ok_or_else(|| {
                 dataset_error(DATASET_UNAVAILABLE, "Dataset is not part of the plan")
             })?;
+        // A Python-only plan has no SQL model: no model relation can be served (ENT-111).
+        if self.sql_relations.is_empty() {
+            return Err(dataset_error(
+                DATASET_UNAVAILABLE,
+                "Model datasets require a SQL model in the run",
+            ));
+        }
         if !self.sql_relations.contains(&relation) {
             return Err(dataset_error(
                 DATASET_NOT_SQL,
@@ -146,7 +154,11 @@ impl DatasetSource {
 
     fn adapter(&mut self) -> Result<&mut PostgresAdapter> {
         if self.adapter.is_none() {
-            let adapter = PostgresAdapter::connect(&self.profile).map_err(|_| {
+            let profile = self
+                .profile
+                .as_ref()
+                .map_err(|reason| dataset_error(DATASET_UNAVAILABLE, reason))?;
+            let adapter = PostgresAdapter::connect(profile).map_err(|_| {
                 dataset_error(DATASET_UNAVAILABLE, "Dataset source connection failed")
             })?;
             self.adapter = Some(adapter);
