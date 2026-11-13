@@ -1,0 +1,14 @@
+{
+  "schema_version": 2,
+  "name": "manual-sequence",
+  "models_dir": "models",
+  "python": {
+    "interpreter": "__VENV_PYTHON__",
+    "timeout_seconds": 60
+  },
+  "config": {
+    "security": {
+      "allow_external_writes": true
+    }
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "schema_version": 2,
+  "name": "python-pandas-cross-db",
+  "models_dir": "models",
+  "python": {
+    "interpreter": "__VENV_PYTHON__",
+    "timeout_seconds": 120
+  },
+  "config": {
+    "security": {
+      "allow_external_writes": true,
+      "allowed_profiles": [
+        "warehouse",
+        "financeiro"
+      ]
+    }
+  }
+}
