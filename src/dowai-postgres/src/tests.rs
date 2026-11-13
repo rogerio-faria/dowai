@@ -171,3 +171,56 @@ fn only_transient_sqlstates_are_retryable() {
     assert!(!AdapterError::QueryFailed.is_transient());
     assert!(!AdapterError::Cancelled.is_transient());
 }
+
+#[test]
+fn remote_host_refuses_disabled_tls_by_default() {
+    let mut profile = profile("db.example.test");
+    profile.set_tls_mode(TlsMode::Disabled);
+    assert_eq!(profile.validate(), Err(AdapterError::InsecureTlsDisabled));
+}
+
+#[test]
+fn loopback_host_may_disable_tls_for_local_development() {
+    let mut profile = profile("127.0.0.1");
+    profile.set_tls_mode(TlsMode::Disabled);
+    profile.validate().unwrap();
+}
+
+#[test]
+fn connect_timeout_is_bounded_between_one_second_and_ten_minutes() {
+    let mut profile = profile("db.example.test");
+    profile.set_connect_timeout(std::time::Duration::ZERO);
+    assert_eq!(
+        profile.validate(),
+        Err(AdapterError::InvalidProfile("connect timeout"))
+    );
+    profile.set_connect_timeout(std::time::Duration::from_secs(601));
+    assert_eq!(
+        profile.validate(),
+        Err(AdapterError::InvalidProfile("connect timeout"))
+    );
+    profile.set_connect_timeout(std::time::Duration::from_secs(600));
+    profile.validate().unwrap();
+}
+
+#[test]
+fn query_timeout_is_bounded_and_applied_as_statement_timeout() {
+    let mut profile = profile("db.example.test");
+    assert_eq!(profile.query_timeout(), None);
+    assert_eq!(
+        super::session_options(&profile),
+        "-c standard_conforming_strings=on"
+    );
+
+    profile.set_query_timeout(Some(std::time::Duration::from_secs(1800)));
+    assert_eq!(
+        super::session_options(&profile),
+        "-c standard_conforming_strings=on -c statement_timeout=1800000"
+    );
+
+    profile.set_query_timeout(Some(std::time::Duration::from_secs(86_401)));
+    assert_eq!(
+        profile.validate(),
+        Err(AdapterError::InvalidProfile("query timeout"))
+    );
+}

@@ -900,11 +900,11 @@ fn execute_run(
             .filter_map(|node| relations.get(&node.id.replace('\\', "/")).cloned())
             .collect();
         executor.datasets = Some(executor::DatasetSource::new(
-            postgres_profile(profile.clone()),
+            postgres_profile(profile.clone(), &configuration)?,
             relations.clone(),
             sql_relations,
         ));
-        let pg_profile = postgres_profile(profile);
+        let pg_profile = postgres_profile(profile, &configuration)?;
         let mut adapter = PostgresAdapter::connect(&pg_profile)
             .map_err(|error| DowaiError::Connection(error.to_string()))?;
         let mut completed_nodes = Vec::with_capacity(execution_plan.nodes.len());
@@ -1051,7 +1051,7 @@ fn execute_run(
         )));
     }
     store.validate_variables(&prepared.variables)?;
-    let pg_profile = postgres_profile(profile);
+    let pg_profile = postgres_profile(profile, &configuration)?;
     let mut adapter = PostgresAdapter::connect(&pg_profile)
         .map_err(|error| DowaiError::Connection(error.to_string()))?;
     let allow_replace = replacement_approval(&configuration, request.confirm_destructive)?;
@@ -1283,7 +1283,7 @@ pub fn check_postgres_connection(
     })?;
     let configuration = effective_configuration(&root)?;
     let (profile_name, profile) = resolve_profile(&root, &configuration, requested_profile)?;
-    let mut adapter = PostgresAdapter::connect(&postgres_profile(profile))
+    let mut adapter = PostgresAdapter::connect(&postgres_profile(profile, &configuration)?)
         .map_err(|error| DowaiError::Connection(error.to_string()))?;
     adapter
         .test_connection()
@@ -1555,7 +1555,11 @@ fn enforce_allowlist(
     Ok(())
 }
 
-fn postgres_profile(profile: WorkspaceProfile) -> PgProfile {
+/// Builds the adapter profile from the workspace profile and the effective `database` policy
+/// (`connect_timeout_seconds`, `query_timeout_seconds`). The password is never copied: only the
+/// name of the environment variable that holds it.
+fn postgres_profile(profile: WorkspaceProfile, configuration: &Value) -> Result<PgProfile> {
+    let database = &configuration["effective"]["database"];
     let mut adapter_profile = PgProfile::new(
         profile.host,
         profile.port,
@@ -1566,7 +1570,13 @@ fn postgres_profile(profile: WorkspaceProfile) -> PgProfile {
     if profile.tls == dowai_core::ProfileTlsMode::Disabled {
         adapter_profile.set_tls_mode(TlsMode::Disabled);
     }
-    adapter_profile
+    if let Some(seconds) = database["connect_timeout_seconds"].as_u64() {
+        adapter_profile.set_connect_timeout(std::time::Duration::from_secs(seconds));
+    }
+    if let Some(seconds) = database["query_timeout_seconds"].as_u64() {
+        adapter_profile.set_query_timeout(Some(std::time::Duration::from_secs(seconds)));
+    }
+    Ok(adapter_profile)
 }
 
 fn map_execution_error(error: AdapterError) -> DowaiError {
@@ -2213,5 +2223,34 @@ mod tests {
                 .as_str(),
             "automatic"
         );
+    }
+
+    #[test]
+    fn postgres_profile_applies_effective_database_timeouts_without_copying_secrets() {
+        let workspace = dowai_core::WorkspaceProfile {
+            profile_type: "postgres".to_owned(),
+            host: "db.example.test".to_owned(),
+            port: 5432,
+            user: "dowai".to_owned(),
+            database: "analytics".to_owned(),
+            password_env: "DOWAI_ENT030_UNIT_PASSWORD".to_owned(),
+            tls: dowai_core::ProfileTlsMode::Required,
+        };
+        let configuration = serde_json::json!({
+            "effective": {
+                "database": { "connect_timeout_seconds": 25, "query_timeout_seconds": 600 }
+            }
+        });
+        let profile = super::postgres_profile(workspace, &configuration).expect("profile");
+        assert_eq!(
+            profile.connect_timeout(),
+            std::time::Duration::from_secs(25)
+        );
+        assert_eq!(
+            profile.query_timeout(),
+            Some(std::time::Duration::from_secs(600))
+        );
+        assert_eq!(profile.tls_mode(), dowai_postgres::TlsMode::Required);
+        assert!(!format!("{profile:?}").contains("secret"));
     }
 }

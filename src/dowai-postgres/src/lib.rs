@@ -28,7 +28,14 @@ pub struct PgProfile {
     database: String,
     password_env_var: String,
     tls_mode: TlsMode,
+    connect_timeout: Duration,
+    query_timeout: Option<Duration>,
 }
+
+/// Bounds of `database.connect_timeout_seconds` (catalog: 1..=600 s).
+const CONNECT_TIMEOUT_MAX: Duration = Duration::from_secs(600);
+/// Bounds of `database.query_timeout_seconds` (catalog: 1..=86400 s).
+const QUERY_TIMEOUT_MAX: Duration = Duration::from_secs(86_400);
 
 impl PgProfile {
     pub fn new(
@@ -45,6 +52,8 @@ impl PgProfile {
             database: database.into(),
             password_env_var: password_env_var.into(),
             tls_mode: TlsMode::Required,
+            connect_timeout: Duration::from_secs(10),
+            query_timeout: None,
         }
     }
 
@@ -54,6 +63,25 @@ impl PgProfile {
 
     pub fn set_tls_mode(&mut self, tls_mode: TlsMode) {
         self.tls_mode = tls_mode;
+    }
+
+    /// Connection timeout (`database.connect_timeout_seconds`). Default 10 s.
+    pub fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
+    }
+
+    pub fn set_connect_timeout(&mut self, timeout: Duration) {
+        self.connect_timeout = timeout;
+    }
+
+    /// Server-side `statement_timeout` applied to every statement of the session
+    /// (`database.query_timeout_seconds`). `None` leaves the server default.
+    pub fn query_timeout(&self) -> Option<Duration> {
+        self.query_timeout
+    }
+
+    pub fn set_query_timeout(&mut self, timeout: Option<Duration>) {
+        self.query_timeout = timeout;
     }
 
     pub fn validate(&self) -> Result<(), AdapterError> {
@@ -79,6 +107,14 @@ impl PgProfile {
         }
         if self.tls_mode == TlsMode::Disabled && !is_local_host(&self.host) {
             return Err(AdapterError::InsecureTlsDisabled);
+        }
+        if self.connect_timeout.is_zero() || self.connect_timeout > CONNECT_TIMEOUT_MAX {
+            return Err(AdapterError::InvalidProfile("connect timeout"));
+        }
+        if let Some(query_timeout) = self.query_timeout {
+            if query_timeout.is_zero() || query_timeout > QUERY_TIMEOUT_MAX {
+                return Err(AdapterError::InvalidProfile("query timeout"));
+            }
         }
         Ok(())
     }
@@ -192,8 +228,8 @@ impl PostgresAdapter {
             .user(&profile.user)
             .password(password)
             .dbname(&profile.database)
-            .options("-c standard_conforming_strings=on")
-            .connect_timeout(std::time::Duration::from_secs(10))
+            .options(&session_options(profile))
+            .connect_timeout(profile.connect_timeout)
             .ssl_mode(match profile.tls_mode {
                 TlsMode::Required => SslMode::Require,
                 TlsMode::Disabled => SslMode::Disable,
@@ -599,6 +635,18 @@ fn valid_env_var_name(name: &str) -> bool {
     let mut chars = name.chars();
     matches!(chars.next(), Some(c) if c == '_' || c.is_ascii_alphabetic())
         && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+/// Session options applied at connect time: standard strings and the query timeout, if any.
+fn session_options(profile: &PgProfile) -> String {
+    let mut options = String::from("-c standard_conforming_strings=on");
+    if let Some(query_timeout) = profile.query_timeout {
+        options.push_str(&format!(
+            " -c statement_timeout={}",
+            query_timeout.as_millis()
+        ));
+    }
+    options
 }
 
 fn is_local_host(host: &str) -> bool {
