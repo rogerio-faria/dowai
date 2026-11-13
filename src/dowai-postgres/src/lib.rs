@@ -10,8 +10,10 @@ use postgres::{Client, Config, Row};
 use postgres_native_tls::MakeTlsConnector;
 
 mod adapter;
+mod stream;
 
 pub use adapter::{Capabilities, ColumnInfo, SqlAdapter, POSTGRES_CAPABILITIES};
+pub use stream::{Batch, BatchStream, RowCount, StreamLimits, STREAM_BATCH_ROWS_MAX};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TlsMode {
@@ -143,6 +145,10 @@ pub enum AdapterError {
     TransientFailure,
     /// `begin_transaction` with a transaction already open, or commit/rollback without one.
     InvalidTransactionState,
+    /// Stream limits out of range: `batch_rows` in 1..=1000000 and `max_inflight_bytes` > 0.
+    InvalidStreamLimit,
+    /// A batch exceeded `max_inflight_bytes`. The stream fails closed; no rows are truncated.
+    InflightLimitExceeded,
 }
 
 impl AdapterError {
@@ -184,6 +190,10 @@ impl std::fmt::Display for AdapterError {
             Self::Cancelled => formatter.write_str("PostgreSQL operation cancelled"),
             Self::InvalidTransactionState => {
                 formatter.write_str("invalid PostgreSQL transaction state")
+            }
+            Self::InvalidStreamLimit => formatter.write_str("invalid PostgreSQL stream limits"),
+            Self::InflightLimitExceeded => {
+                formatter.write_str("PostgreSQL batch exceeds the in-flight byte limit")
             }
         }
     }

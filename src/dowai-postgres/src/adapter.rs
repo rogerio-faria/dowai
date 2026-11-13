@@ -2,10 +2,11 @@
 //!
 //! Cada SGBD declara [`Capabilities`] verdadeiras. Operações ainda não implementadas por um
 //! adapter ficam com a capability `false`; o motor não deve depender delas sem checar a flag.
-//! `stream_query`, `write_batch` e `merge` serão acrescentados por ENT-031 e ENT-032.
+//! `write_batch` e `merge` serão acrescentados por ENT-032.
 
 use postgres::types::ToSql;
 
+use crate::stream::{BatchStream, StreamLimits};
 use crate::{classify_failure, quote_identifier, AdapterError, PostgresAdapter};
 
 /// Capacidades declaradas por um adapter. Todas `false` significa "não suportado".
@@ -62,6 +63,13 @@ pub trait SqlAdapter {
     fn begin_transaction(&mut self) -> Result<(), AdapterError>;
     fn commit(&mut self) -> Result<(), AdapterError>;
     fn rollback(&mut self) -> Result<(), AdapterError>;
+    /// Leitura em lotes com backpressure: nada além do lote pedido é buscado (ENT-031).
+    fn stream_query<'a>(
+        &'a mut self,
+        sql: &str,
+        params: &[&(dyn ToSql + Sync)],
+        limits: StreamLimits,
+    ) -> Result<BatchStream<'a>, AdapterError>;
 }
 
 /// Capabilities reais do adapter PostgreSQL. Só declara o que os testes de contrato verificam.
@@ -71,7 +79,7 @@ pub const POSTGRES_CAPABILITIES: Capabilities = Capabilities {
     schemas: false,
     staging: false,
     bulk_load: false,
-    stream: false,
+    stream: true,
     merge_upsert: false,
     tls: true,
     parameters: true,
@@ -138,6 +146,15 @@ impl SqlAdapter for PostgresAdapter {
         self.in_transaction = false;
         Ok(())
     }
+
+    fn stream_query<'a>(
+        &'a mut self,
+        sql: &str,
+        params: &[&(dyn ToSql + Sync)],
+        limits: StreamLimits,
+    ) -> Result<BatchStream<'a>, AdapterError> {
+        PostgresAdapter::stream_query(self, sql, params, limits)
+    }
 }
 
 #[cfg(test)]
@@ -153,8 +170,8 @@ mod tests {
         assert!(capabilities.row_count);
         assert!(capabilities.tls);
         assert!(capabilities.cancellation);
-        // Ainda não implementadas (ENT-031, ENT-032 e staging/schemas fora da fatia).
-        assert!(!capabilities.stream);
+        assert!(capabilities.stream);
+        // Ainda não implementadas (ENT-032 e staging/schemas fora da fatia).
         assert!(!capabilities.merge_upsert);
         assert!(!capabilities.staging);
         assert!(!capabilities.bulk_load);
