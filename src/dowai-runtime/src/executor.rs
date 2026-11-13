@@ -22,7 +22,8 @@ use dowai_core::{
 use dowai_postgres::{DatasetCell, PgProfile, PostgresAdapter};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::fs;
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -528,6 +529,108 @@ impl<'a> Executor<'a> {
                 mode,
                 variables,
             } => HostReply::Command(self.command(&operation, target, mode, variables)),
+            HostRequest::Export { path } => HostReply::Export(self.export_destination(&path)),
+        }
+    }
+
+    /// Authorizes the destination of `env.generateCsv` (ENT-050).
+    ///
+    /// The destination must stay inside the project directory: no `..`, no absolute path
+    /// outside it, no symbolic link in any component, no directory as target, and no
+    /// reserved project entry (`models`, `.dowai`, `.venv`, `dowai_project.json`). Missing
+    /// directories inside the project are created. Returns the absolute target path. The
+    /// worker writes a temporary file next to it and renames it only after the last row.
+    fn export_destination(&self, requested: &str) -> Result<String> {
+        self.cancel.check()?;
+        if requested.trim().is_empty() || requested.contains('\0') || requested.len() > 4096 {
+            return Err(DowaiError::Path(
+                "Export path must be a non-empty path without NUL bytes".to_owned(),
+            ));
+        }
+        let root = fs::canonicalize(self.root)?;
+        let candidate = Path::new(requested);
+        let relative: PathBuf = if candidate.is_absolute() {
+            candidate
+                .strip_prefix(self.root)
+                .or_else(|_| candidate.strip_prefix(&root))
+                .map(Path::to_path_buf)
+                .map_err(|_| {
+                    DowaiError::Policy(
+                        "Export destination is outside the project directory".to_owned(),
+                    )
+                })?
+        } else {
+            candidate.to_path_buf()
+        };
+        let mut normal = PathBuf::new();
+        for component in relative.components() {
+            match component {
+                Component::Normal(part) => normal.push(part),
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    return Err(DowaiError::Path(
+                        "Export path must not contain '..'".to_owned(),
+                    ))
+                }
+                _ => {
+                    return Err(DowaiError::Path(
+                        "Export path must be relative to the project directory".to_owned(),
+                    ))
+                }
+            }
+        }
+        // Lowercased: reserved names must also match on case-insensitive file systems.
+        let first = normal
+            .components()
+            .next()
+            .and_then(|component| component.as_os_str().to_str().map(str::to_lowercase));
+        let Some(file_name) = normal.file_name().map(|name| name.to_owned()) else {
+            return Err(DowaiError::Path(
+                "Export path must name a file inside the project directory".to_owned(),
+            ));
+        };
+        let manifest_target =
+            normal.components().count() == 1 && first.as_deref() == Some("dowai_project.json");
+        if manifest_target || matches!(first.as_deref(), Some("models" | ".dowai" | ".venv")) {
+            return Err(DowaiError::Policy(
+                "Export destination uses a reserved project directory".to_owned(),
+            ));
+        }
+        let directories = normal.parent().map(Path::to_path_buf).unwrap_or_default();
+        let mut current = root;
+        for part in directories.components() {
+            current.push(part.as_os_str());
+            match fs::symlink_metadata(&current) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(DowaiError::Policy(
+                        "Export destination crosses a symbolic link".to_owned(),
+                    ))
+                }
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => {
+                    return Err(DowaiError::Path(
+                        "Export destination component is not a directory".to_owned(),
+                    ))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    fs::create_dir(&current)?;
+                }
+                Err(error) => return Err(DowaiError::Io(error)),
+            }
+        }
+        let target = current.join(&file_name);
+        match fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.file_type().is_symlink() => Err(DowaiError::Policy(
+                "Export destination is a symbolic link".to_owned(),
+            )),
+            Ok(metadata) if metadata.is_dir() => Err(DowaiError::Path(
+                "Export destination is a directory".to_owned(),
+            )),
+            Ok(_) => Ok(target.to_string_lossy().into_owned()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(target.to_string_lossy().into_owned())
+            }
+            Err(error) => Err(DowaiError::Io(error)),
         }
     }
 

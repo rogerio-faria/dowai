@@ -54,11 +54,18 @@ const CHANNEL_CAPACITY: usize = 4;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const WORKER: &str = r#"
 import contextlib
+import csv
+import datetime
+import decimal
+import itertools
 import json
+import os
 import pathlib
 import runpy
+import secrets
 import sys
 import types
+from collections.abc import Mapping
 
 _out = sys.stdout
 _in = sys.stdin.buffer
@@ -324,8 +331,133 @@ def main():
         def _unsupported(self, *args, **kwargs):
             raise NotImplementedError()
 
+        def _export_destination(self, path):
+            """Asks the host to authorize the destination of an export (ENT-050)."""
+            respond({"protocol_version": 1, "kind": "export", "path": path})
+            line = _in.readline()
+            if not line:
+                raise RuntimeError("the DOWAI host closed the export channel")
+            reply = json.loads(line)
+            if reply.get("protocol_version") != 1:
+                raise RuntimeError("invalid export reply")
+            if reply.get("kind") == "export_failed":
+                raise ExecutionError(
+                    str(reply.get("code") or "DOWAI_POLICY_DENIED"),
+                    "export destination is not authorized",
+                )
+            if reply.get("kind") != "export_ok" or not isinstance(reply.get("path"), str):
+                raise RuntimeError("invalid export reply")
+            return reply["path"]
+
+        def generateCsv(self, data, path, **options):
+            """`env.generateCsv(data, path, **options)`: streaming CSV export (ENT-050).
+
+            `data` is a Dataset (read in batches) or an iterable of mappings with the same keys.
+            Options: delimiter (default ","), header (default True), null (default ""),
+            timezone (IANA name, applied to timezone-aware datetime values only). The file is
+            written as UTF-8 to a temporary sibling and renamed after the last row, so a failed
+            export never leaves a partial file at the destination. Returns the number of rows.
+            """
+            check_path(path)
+            settings = csv_settings(options)
+            target = self._export_destination(path)
+            return write_csv(data, target, settings)
+
         write = _unsupported
-        generateCsv = _unsupported
+
+    def check_path(value):
+        if not isinstance(value, str) or not value.strip() or "\x00" in value:
+            raise ValueError("path must be a non-empty string without NUL bytes")
+
+    def csv_settings(options):
+        allowed = {"delimiter", "header", "null", "timezone"}
+        unknown = sorted(set(options) - allowed)
+        if unknown:
+            raise ValueError("unsupported generateCsv option: %s" % unknown[0])
+        delimiter = options.get("delimiter", ",")
+        if not isinstance(delimiter, str) or len(delimiter) != 1 or delimiter in '"\r\n':
+            raise ValueError("delimiter must be one character, other than quote or line break")
+        header = options.get("header", True)
+        if not isinstance(header, bool):
+            raise ValueError("header must be a bool")
+        null = options.get("null", "")
+        if not isinstance(null, str):
+            raise ValueError("null must be a string")
+        zone = None
+        timezone = options.get("timezone")
+        if timezone is not None:
+            if not isinstance(timezone, str) or not timezone.strip():
+                raise ValueError("timezone must be an IANA zone name")
+            import zoneinfo
+
+            try:
+                zone = zoneinfo.ZoneInfo(timezone)
+            except Exception:
+                raise ValueError("timezone is not a known IANA zone name") from None
+        return {"delimiter": delimiter, "header": header, "null": null, "zone": zone}
+
+    def csv_value(value, settings):
+        if value is None:
+            return settings["null"]
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, datetime.datetime):
+            if settings["zone"] is not None:
+                if value.tzinfo is None:
+                    raise ValueError("a naive datetime cannot be converted to the export timezone")
+                value = value.astimezone(settings["zone"])
+            return value.isoformat()
+        if isinstance(value, (datetime.date, datetime.time)):
+            return value.isoformat()
+        if isinstance(value, (int, float, decimal.Decimal)):
+            return str(value)
+        if isinstance(value, str):
+            return value
+        raise ValueError("unsupported value type for CSV export: %s" % type(value).__name__)
+
+    def write_csv(data, target, settings):
+        if isinstance(data, Dataset):
+            names = [column["name"] for column in data.schema()]
+            source = data.iter_rows(batch_size=1000)
+        else:
+            if isinstance(data, (str, bytes, Mapping)):
+                raise ValueError("data must be a Dataset or an iterable of mappings")
+            source = iter(data)
+            sentinel = object()
+            first = next(source, sentinel)
+            if first is sentinel:
+                names = []
+            elif isinstance(first, Mapping):
+                names = list(first.keys())
+                source = itertools.chain([first], source)
+            else:
+                raise ValueError("every row must be a mapping")
+        width = len(names)
+
+        def fields(row):
+            if not isinstance(row, Mapping) or len(row) != width or any(name not in row for name in names):
+                raise ValueError("every row must have the same columns")
+            return [csv_value(row[name], settings) for name in names]
+
+        directory, base = os.path.split(target)
+        temporary = os.path.join(directory, ".%s.%s.dowai-tmp" % (base, secrets.token_hex(8)))
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+        descriptor = os.open(temporary, flags, 0o644)
+        count = 0
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
+                writer = csv.writer(handle, delimiter=settings["delimiter"], lineterminator="\n")
+                if settings["header"] and names:
+                    writer.writerow(names)
+                for row in source:
+                    writer.writerow(fields(row))
+                    count += 1
+            os.replace(temporary, target)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.remove(temporary)
+            raise
+        return count
 
     def check_name(value):
         if not isinstance(value, str) or not value.strip():
@@ -549,6 +681,9 @@ struct WorkerMessage {
     select: Option<Vec<String>>,
     #[serde(default)]
     filters: Option<Vec<FilterRequest>>,
+    /// `export` (ENT-050): the destination requested by `env.generateCsv`.
+    #[serde(default)]
+    path: Option<String>,
 }
 
 /// One column of a dataset, as the worker sees it.
@@ -576,6 +711,10 @@ pub(crate) enum HostRequest {
         mode: Option<String>,
         variables: BTreeMap<String, Value>,
     },
+    /// Destination of `env.generateCsv` (ENT-050), as requested by the model.
+    Export {
+        path: String,
+    },
 }
 
 /// Successful answer of a dataset operation.
@@ -594,6 +733,8 @@ pub(crate) enum HostReply {
     Call(ChildOutcome),
     Dataset(Result<DatasetAnswer>),
     Command(Result<Value>),
+    /// Absolute target path authorized for the export.
+    Export(Result<String>),
 }
 
 #[derive(Serialize)]
@@ -636,6 +777,16 @@ struct CallReply<'a> {
     duration_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     status: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct ExportReply<'a> {
+    protocol_version: u32,
+    kind: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -823,7 +974,10 @@ pub(crate) fn execute_model(
             return Err(protocol_error());
         }
         let message = parse_message(&line)?;
-        if matches!(message.kind.as_str(), "call" | "dataset" | "command") {
+        if matches!(
+            message.kind.as_str(),
+            "call" | "dataset" | "command" | "export"
+        ) {
             return Err(protocol_error());
         }
         final_message = Some(message);
@@ -1061,6 +1215,34 @@ impl Supervision {
                     })
                     .map_err(|_| protocol_error())?;
                 }
+                bytes.push(b'\n');
+                self.replies.send(bytes).map_err(|_| protocol_error())?;
+                Ok(())
+            }
+            "export" => {
+                let Some(path) = message.path else {
+                    return Err(protocol_error());
+                };
+                let HostReply::Export(result) = on_request(HostRequest::Export { path }) else {
+                    return Err(protocol_error());
+                };
+                // The reply carries only the authorized path or a static code, never host detail.
+                let bytes = match &result {
+                    Ok(resolved) => serde_json::to_vec(&ExportReply {
+                        protocol_version: IPC_PROTOCOL_VERSION,
+                        kind: "export_ok",
+                        path: Some(resolved.as_str()),
+                        code: None,
+                    }),
+                    Err(error) => serde_json::to_vec(&ExportReply {
+                        protocol_version: IPC_PROTOCOL_VERSION,
+                        kind: "export_failed",
+                        path: None,
+                        code: Some(error.code()),
+                    }),
+                }
+                .map_err(|_| protocol_error())?;
+                let mut bytes = bytes;
                 bytes.push(b'\n');
                 self.replies.send(bytes).map_err(|_| protocol_error())?;
                 Ok(())
