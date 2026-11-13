@@ -32,8 +32,10 @@ evidence is in [docs/STATUS.md](docs/STATUS.md). In short:
 - MySQL is supported as an `env.write()` destination and as an `env.source()`
   origin. It is not a SQL-model execution profile.
 
-Not available yet: plugins, AI features, OpenLineage, installers and release
-packages. Remote PostgreSQL TLS, Windows real-signal cancellation and
+Plugins run through `dowai plugins run`. The official `files` plugin (CSV, JSON
+Lines and Parquet) is available and tested. The `sftp` plugin is available as
+code only: it has not been run against a real server. Not available yet: AI
+features, OpenLineage, installers and release packages. Remote PostgreSQL TLS, Windows real-signal cancellation and
 production credentials have not been verified.
 
 ## Build
@@ -239,6 +241,7 @@ jitter; other failures, and Python models, are not retried.
 - `dowai run <model|all> [--profile NAME] [--session ID] [--vars JSON] [--full-refresh] [--yes] [--json]`
 - `dowai retry <run_id> [--failed-only] [--vars JSON] [--yes] [--json]`
 - `dowai runs list|show`, `dowai logs <run_id>`
+- `dowai plugins list|info|sync|resolve|run` (`run` needs `--idempotency-key` when the manifest requires it)
 - `dowai session start|show|end`
 - `dowai config show --effective [--json]`
 - `dowai doctor [--check-connections] [--json]`
@@ -263,7 +266,9 @@ Every command prints machine-readable JSON with `--json`, and errors use stable
   supported yet, and MySQL tables cannot be SQL models. A transfer from
   PostgreSQL to MySQL is two independent transactions, not one atomic unit.
 - **TLS** is verified only against local loopback servers with TLS disabled.
-- Plugins, AI features, OpenLineage and installers are not implemented.
+- The `sftp` plugin has no test run against an SFTP server, and its
+  requirements are not yet hash-locked. AI features, OpenLineage and installers
+  are not implemented.
 
 Details and evidence for every item: [docs/STATUS.md](docs/STATUS.md). The
 roadmap is in [docs/ROADMAP.md](docs/ROADMAP.md).

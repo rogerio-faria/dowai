@@ -1,0 +1,17 @@
+{
+  "schema_version": 2,
+  "id": "sftp",
+  "version": "1.0.0",
+  "entrypoints": {
+    "download": "sftp:download",
+    "upload": "sftp:upload"
+  },
+  "permissions": {
+    "network": ["sftp_server"],
+    "filesystem": ["project_files"],
+    "secrets": ["sftp_credentials"]
+  },
+  "timeout_seconds": 600,
+  "side_effects": true,
+  "idempotency_key_required": true
+}
