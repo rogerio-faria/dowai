@@ -559,10 +559,7 @@ fn nested_sql_targets_outside_the_models_directory_are_rejected_before_any_profi
     let variables = harness.snapshot(&result.session_id);
     // Escapes are refused by the planner's path policy; a name that is not a model under
     // `models/` is refused as an invalid plan. Neither reaches the missing profile.
-    let absolute_key = outside
-        .display()
-        .to_string()
-        .replace(['/', '.'], "_");
+    let absolute_key = outside.display().to_string().replace(['/', '.'], "_");
     for key in ["___outside_sql", absolute_key.as_str()] {
         let code = variables[key].as_str().expect("error code is recorded");
         assert_eq!(code, "DOWAI_POLICY_PATH", "{key}");
