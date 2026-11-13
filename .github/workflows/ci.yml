@@ -30,17 +30,18 @@ jobs:
         run: cargo test --workspace --locked
 
   python-sdk:
-    name: Python SDK (${{ matrix.os }})
+    name: Python SDK (${{ matrix.os }}, py ${{ matrix.python }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
+        python: ["3.10", "3.12"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
       - name: Unit tests
         working-directory: src/dowai-sdk
         env:
