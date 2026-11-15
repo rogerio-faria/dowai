@@ -30,6 +30,9 @@ mod plugin_exec;
 mod python_runtime;
 mod resources;
 mod retry;
+// ENT-120a: consumido pela execução concorrente por ondas (ENT-120b/c); até lá só pelos testes.
+#[allow(dead_code)]
+mod waves;
 
 /// Refusal message of a full refresh without `--yes` (ENT-033).
 pub const FULL_REFRESH_CONFIRMATION_REQUIRED: &str =

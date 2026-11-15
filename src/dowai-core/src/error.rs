@@ -44,6 +44,8 @@ pub enum DowaiError {
     Session(String),
     /// Concurrent writes to the same session variable (AC040, `conflict_policy = "error"`).
     SessionConflict(String),
+    /// Two nodes of the same concurrency wave write the same session variable (ENT-120, ADR 0008 §4).
+    VariableConflict(String),
     State(String),
     Connection(String),
     Execution(String),
@@ -102,6 +104,7 @@ impl DowaiError {
             Self::Cycle(_) => "DOWAI_PLAN_CYCLE",
             Self::Session(_) => "DOWAI_SESSION_INVALID",
             Self::SessionConflict(_) => "DOWAI_SESSION_CONFLICT",
+            Self::VariableConflict(_) => "DOWAI_VARIABLE_CONFLICT",
             Self::State(_) => "DOWAI_STATE_ERROR",
             Self::Connection(_) => "DOWAI_CONNECTION_FAILED",
             Self::Execution(_) => "DOWAI_EXECUTION_FAILED",
@@ -145,6 +148,7 @@ impl DowaiError {
             Self::Execution(_)
             // A run that lost a write race is a failed run execution (plan 6.4: exit 3).
             | Self::SessionConflict(_)
+            | Self::VariableConflict(_)
             | Self::PythonFailure(_)
             | Self::PythonTimeout(_)
             | Self::PythonProtocol(_)
@@ -169,6 +173,7 @@ impl DowaiError {
             | Self::Cycle(message)
             | Self::Session(message)
             | Self::SessionConflict(message)
+            | Self::VariableConflict(message)
             | Self::State(message)
             | Self::Connection(message)
             | Self::Execution(message)
