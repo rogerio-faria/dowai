@@ -48,6 +48,8 @@ enum Command {
         command: ConfigCommand,
     },
     Run(RunArgs),
+    /// Run a workload several times and report duration, peak memory and the host (ENT-076).
+    Benchmark(BenchmarkArgs),
     /// Run again a FAILED or CANCELLED run as a new run (B-05c). Variables are required
     /// again when the original run used any; their values are not stored.
     Retry(RetryArgs),
@@ -244,6 +246,17 @@ struct RetryArgs {
     vars: Option<String>,
     #[arg(long, help = "Confirm replacement of existing PostgreSQL relations")]
     yes: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct BenchmarkArgs {
+    #[arg(required = true, num_args = 1..)]
+    targets: Vec<String>,
+    /// Repetitions of the workload (1 to 20).
+    #[arg(long, default_value_t = 3)]
+    repeat: u32,
     #[arg(long)]
     json: bool,
 }
@@ -648,6 +661,7 @@ fn dispatch(command: Command) -> Result<Option<Value>> {
         // Reached only through `execute`, which handles these two commands with run ids.
         Command::Retry(args) => retry_command(args).map_err(|failure| failure.error),
         Command::Run(args) => run_command(args).map_err(|failure| failure.error),
+        Command::Benchmark(args) => benchmark_command(args),
     }
 }
 
@@ -706,6 +720,72 @@ fn run_command(args: RunArgs) -> std::result::Result<Option<Value>, CliFailure> 
         run_id: failure.run_id,
     })?;
     run_result_output(result, args.json).map_err(CliFailure::from)
+}
+
+/// `dowai benchmark`: repeated runs, reported with the host and the memory limit (ENT-076).
+fn benchmark_command(args: BenchmarkArgs) -> Result<Option<Value>> {
+    let project_dir = find_project_root(&current_dir()?)?;
+    let report = dowai_runtime::benchmark::benchmark(&project_dir, args.targets, args.repeat)?;
+    if args.json {
+        return Ok(Some(
+            serde_json::to_value(report).map_err(|error| DowaiError::Model(error.to_string()))?,
+        ));
+    }
+    println!(
+        "Benchmark: {} repetition(s) of {} (engine {}, schema {})",
+        report.repeat,
+        report.workload.join(", "),
+        report.engine_version,
+        report.schema_version
+    );
+    for (index, run) in report.runs.iter().enumerate() {
+        println!(
+            "  run {}: {} ms, {} node(s), status {} ({})",
+            index + 1,
+            run.duration_ms,
+            run.nodes,
+            run.status,
+            run.run_id
+        );
+    }
+    println!(
+        "Duration (ms): min {}, median {}, max {}",
+        report.duration_ms.min, report.duration_ms.median, report.duration_ms.max
+    );
+    match (
+        report.peak_rss_kib,
+        report.memory_limit_mb,
+        report.within_memory_limit,
+    ) {
+        (Some(peak), Some(limit), Some(within)) => println!(
+            "Peak worker RSS: {peak} KiB; runtime.max_memory_mb={limit}: {}",
+            if within {
+                "within limit"
+            } else {
+                "ABOVE limit"
+            }
+        ),
+        (Some(peak), _, _) => println!("Peak worker RSS: {peak} KiB (no memory limit configured)"),
+        _ => println!("Peak worker RSS: not measured on this platform"),
+    }
+    println!(
+        "Host: {}, kernel {}, CPU {} ({} logical), RAM {} KiB",
+        report.host.os,
+        report.host.kernel.as_deref().unwrap_or("unknown"),
+        report.host.cpu_model.as_deref().unwrap_or("unknown"),
+        report
+            .host
+            .logical_cpus
+            .map_or("unknown".to_owned(), |n| n.to_string()),
+        report
+            .host
+            .mem_total_kib
+            .map_or("unknown".to_owned(), |n| n.to_string())
+    );
+    for note in &report.notes {
+        println!("Note: {note}");
+    }
+    Ok(None)
 }
 
 /// Current directory as a CLI error when it is unavailable.
@@ -788,6 +868,7 @@ fn wants_json(command: &Command) -> bool {
             ConfigCommand::Show { json, .. } | ConfigCommand::Migrate { json, .. } => *json,
         },
         Command::Run(args) => args.json,
+        Command::Benchmark(args) => args.json,
         Command::Retry(args) => args.json,
         Command::Logs { json, .. } => *json,
         Command::Runs { command } => match command {

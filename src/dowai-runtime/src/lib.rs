@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 mod auditor;
+pub mod benchmark;
 mod dataset_query;
 mod executor;
 mod external_write;

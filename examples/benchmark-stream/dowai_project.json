@@ -1,0 +1,9 @@
+{
+  "schema_version": 2,
+  "name": "benchmark-stream",
+  "models_dir": "models",
+  "config": {
+    "security": { "allow_external_writes": true },
+    "runtime": { "max_memory_mb": 128 }
+  }
+}
