@@ -5,7 +5,7 @@ The CSV is about 25 bytes per row (about 150 MB for N = 6 000 000), larger than 
 memory: `env.generateCsv` streams them and the read-back is line by line.
 
 Set `python.interpreter` in dowai_project.json to the project's virtual environment before running
-(`python3 -m venv .venv`). See docs/PERFORMANCE.md for the procedure and the measured results.
+(`python3 -m venv --without-pip .venv`; the workload uses no packages). See docs/PERFORMANCE.md for the procedure and the measured results.
 """
 
 import csv

@@ -60,9 +60,15 @@ Hardware de referência (declarado pelo host no relatório):
 - Não há baseline de comparação entre versões nem latências p50/p95/p99 nesta medição.
 - Os resultados valem para o hardware acima; outros hosts devem repetir o procedimento.
 
+## Reprodução verificada
+
+Em 2026-11-15 o procedimento abaixo foi executado a partir de uma cópia de `examples/benchmark-stream`
+(E-131): venv com `--without-pip`, `dowai benchmark models/stream_count.py --repeat 1 --json`.
+Resultado: `SUCCEEDED`, 54 881 ms, pico de RSS 20 548 KiB, `within_memory_limit: true`.
+
 ## Procedimento para reproduzir
 
-1. Criar o venv do projeto: `python3 -m venv .venv`, e apontar `python.interpreter` no
+1. Criar o venv do projeto: `python3 -m venv --without-pip .venv` (o workload não usa pacotes; `--without-pip` evita depender de `ensurepip`), e apontar `python.interpreter` no
    `dowai_project.json` para `.venv/bin/python`.
 2. Executar `dowai benchmark models/stream_count.py --repeat 3 --json`.
 3. Registrar o relatório, a versão do engine e o hardware do host.
