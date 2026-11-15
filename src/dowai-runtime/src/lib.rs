@@ -16,7 +16,7 @@ pub use plugin_exec::{execute_plugin, PluginExecution, PluginPolicy, DEFAULT_MAX
 use retry::{run_with_retry, wait_unless_cancelled, RetryPolicy};
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -30,8 +30,6 @@ mod plugin_exec;
 mod python_runtime;
 mod resources;
 mod retry;
-// ENT-120a: consumido pela execução concorrente por ondas (ENT-120b/c); até lá só pelos testes.
-#[allow(dead_code)]
 mod waves;
 
 /// Refusal message of a full refresh without `--yes` (ENT-033).
@@ -135,6 +133,22 @@ impl Trace {
             duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             error_code: error.map(|error| error.code().to_owned()),
         });
+    }
+
+    /// Records of one node of a concurrent wave (ADR 0008 §6), merged by `absorb` in plan order.
+    fn fork(&self) -> Trace {
+        Trace {
+            audit: self.audit.fork(),
+            root_invocation_id: self.root_invocation_id.clone(),
+            execution_mode: self.execution_mode.clone(),
+            python: Vec::new(),
+            extra: Vec::new(),
+        }
+    }
+
+    fn absorb(&mut self, child: Trace) {
+        self.audit.absorb(child.audit);
+        self.extra.extend(child.extra);
     }
 
     fn skip(&mut self, nodes: &[PlanNode], mode: ExecutionMode) {
@@ -1102,66 +1116,107 @@ fn execute_run(
         });
     }
 
-    let prepared = prepare_postgres_plan(&root, &execution_plan, &variables, &template_options)?;
-    if let Some(node) = prepared
-        .nodes
-        .iter()
-        .find(|node| node.sql.trim().is_empty())
-    {
-        return Err(DowaiError::Template(format!(
-            "{} renders to an empty SQL statement",
-            node.id
-        )));
-    }
-    store.validate_variables(&prepared.variables)?;
-    let pg_profile = postgres_profile(profile, &configuration)?;
-    let mut adapter = PostgresAdapter::connect(&pg_profile)
-        .map_err(|error| DowaiError::Connection(error.to_string()))?;
-    let allow_replace = replacement_approval(&configuration, request.confirm_destructive)?;
-    let mut completed_nodes = Vec::with_capacity(prepared.nodes.len());
-    for (index, node) in prepared.nodes.iter().enumerate() {
-        if let Err(error) = cancel.check() {
-            trace.skip(&execution_plan.nodes[index..], mode);
-            return Err(error);
-        }
-        let materialization = match node.materialization {
-            Materialization::Table => PostgresMaterialization::Table,
-            Materialization::View => PostgresMaterialization::View,
-        };
-        // `prepared.nodes` mirrors `execution_plan.nodes` one to one.
-        let plan_node = &execution_plan.nodes[index];
-        if let Err(error) = materialize_with_retry(
-            &mut adapter,
-            &pg_profile,
-            plan_node,
-            model_hash(&root, plan_node),
+    let (completed_nodes, final_variables) = if matches!(mode, ExecutionMode::Automatic) {
+        // ENT-120b (ADR 0008): automatic SQL runs go wave by wave, with the waves' concurrency.
+        // The manual mode keeps the sequential loop below, unchanged.
+        let wave_plan = waves::waves(&execution_plan.nodes)?;
+        let concurrency = wave_concurrency(&configuration)?;
+        let relations = build_relations(&root, &execution_plan)?;
+        let (rendered, final_variables) = render_sql_waves(
+            &root,
+            &execution_plan.nodes,
+            &wave_plan,
+            &variables,
+            &template_options,
+            &relations,
+            &store,
+        )?;
+        let pg_profile = postgres_profile(profile, &configuration)?;
+        let mut adapter = PostgresAdapter::connect(&pg_profile)
+            .map_err(|error| DowaiError::Connection(error.to_string()))?;
+        let context = WaveContext {
+            root: &root,
+            profile: &pg_profile,
             mode,
-            Some(&mut *trace),
             retry_policy,
+            allow_replace: replacement_approval(&configuration, request.confirm_destructive)?,
+            full_refresh: request.full_refresh,
             cancel,
-            SqlWrite {
-                relation: &node.relation,
-                materialization,
-                sql: &node.sql,
-                allow_replace,
-                full_refresh: request.full_refresh,
-            },
-        ) {
-            trace.skip(&execution_plan.nodes[index + 1..], mode);
-            return Err(error);
+            concurrency,
+        };
+        let completed = run_sql_waves(
+            trace,
+            &execution_plan.nodes,
+            &wave_plan,
+            rendered,
+            &mut adapter,
+            &context,
+        )?;
+        (completed, final_variables)
+    } else {
+        let prepared =
+            prepare_postgres_plan(&root, &execution_plan, &variables, &template_options)?;
+        if let Some(node) = prepared
+            .nodes
+            .iter()
+            .find(|node| node.sql.trim().is_empty())
+        {
+            return Err(DowaiError::Template(format!(
+                "{} renders to an empty SQL statement",
+                node.id
+            )));
         }
-        completed_nodes.push(RunNodeResult {
-            id: node.id.clone(),
-            relation: node.relation.clone(),
-            materialization: match node.materialization {
-                Materialization::Table => "table",
-                Materialization::View => "view",
+        store.validate_variables(&prepared.variables)?;
+        let pg_profile = postgres_profile(profile, &configuration)?;
+        let mut adapter = PostgresAdapter::connect(&pg_profile)
+            .map_err(|error| DowaiError::Connection(error.to_string()))?;
+        let allow_replace = replacement_approval(&configuration, request.confirm_destructive)?;
+        let mut completed_nodes = Vec::with_capacity(prepared.nodes.len());
+        for (index, node) in prepared.nodes.iter().enumerate() {
+            if let Err(error) = cancel.check() {
+                trace.skip(&execution_plan.nodes[index..], mode);
+                return Err(error);
             }
-            .to_owned(),
-            status: "SUCCEEDED".to_owned(),
-        });
-    }
+            let materialization = match node.materialization {
+                Materialization::Table => PostgresMaterialization::Table,
+                Materialization::View => PostgresMaterialization::View,
+            };
+            // `prepared.nodes` mirrors `execution_plan.nodes` one to one.
+            let plan_node = &execution_plan.nodes[index];
+            if let Err(error) = materialize_with_retry(
+                &mut adapter,
+                &pg_profile,
+                plan_node,
+                model_hash(&root, plan_node),
+                mode,
+                Some(&mut *trace),
+                retry_policy,
+                cancel,
+                SqlWrite {
+                    relation: &node.relation,
+                    materialization,
+                    sql: &node.sql,
+                    allow_replace,
+                    full_refresh: request.full_refresh,
+                },
+            ) {
+                trace.skip(&execution_plan.nodes[index + 1..], mode);
+                return Err(error);
+            }
+            completed_nodes.push(RunNodeResult {
+                id: node.id.clone(),
+                relation: node.relation.clone(),
+                materialization: match node.materialization {
+                    Materialization::Table => "table",
+                    Materialization::View => "view",
+                }
+                .to_owned(),
+                status: "SUCCEEDED".to_owned(),
+            });
+        }
 
+        (completed_nodes, prepared.variables)
+    };
     let session = match prior_session {
         Some(session) => session,
         None => store.create(&root, dowai_core::session_ttl_from_config(&configuration)?)?,
@@ -1171,13 +1226,13 @@ fn execute_run(
         &store,
         &session.session_id,
         &base,
-        &prepared.variables,
+        &final_variables,
         run_id,
         &trace.root_invocation_id,
     )?;
     trace
         .audit
-        .variables_published(variable_names(&prepared.variables));
+        .variables_published(variable_names(&final_variables));
     Ok(RunResult {
         schema_version: 2,
         session_id: session.session_id,
@@ -1222,6 +1277,321 @@ where
         }
     }
     Ok(completed)
+}
+
+/// Concurrency of an automatic SQL wave: `min(runtime.max_parallel_nodes,
+/// runtime.max_worker_processes)` from the effective configuration (ADR 0008 §2).
+fn wave_concurrency(configuration: &Value) -> Result<usize> {
+    let runtime = &configuration["effective"]["runtime"];
+    let limit = |key: &str| {
+        runtime[key]
+            .as_u64()
+            .filter(|value| (1..=256).contains(value))
+            .ok_or_else(|| DowaiError::Config(format!("Effective runtime.{key} is invalid")))
+    };
+    let parallel = limit("max_parallel_nodes")?;
+    let workers = limit("max_worker_processes")?;
+    usize::try_from(parallel.min(workers))
+        .map_err(|_| DowaiError::Config("Effective runtime concurrency is invalid".to_owned()))
+}
+
+/// One wave of the automatic SQL path, rendered before any statement runs (ADR 0008 §3).
+struct RenderedWave {
+    /// Plan index and rendered SQL of each node, in plan order.
+    nodes: Vec<(usize, PreparedNode)>,
+    /// A variable written by two nodes of this wave (ADR 0008 §4). It fails the run at the wave end.
+    conflict: Option<DowaiError>,
+}
+
+/// Renders the waves of an automatic SQL run before any statement runs. Every node of a wave is
+/// rendered with the variables published before that wave (ADR 0008 §3), so a node does not see a
+/// sibling's variable. Returns the waves and the run's final variables. Rendering stops at the
+/// first conflicting wave: the run fails when that wave ends, after its nodes ran.
+fn render_sql_waves(
+    project_dir: &Path,
+    plan_nodes: &[PlanNode],
+    wave_plan: &[Vec<usize>],
+    variables: &BTreeMap<String, Value>,
+    template_options: &TemplateOptions,
+    relations: &BTreeMap<String, String>,
+    store: &SessionStore,
+) -> Result<(Vec<RenderedWave>, BTreeMap<String, Value>)> {
+    let mut state = variables.clone();
+    let mut rendered = Vec::with_capacity(wave_plan.len());
+    for wave in wave_plan {
+        let snapshot = state.clone();
+        let mut nodes = Vec::with_capacity(wave.len());
+        let mut writes: HashMap<usize, Vec<String>> = HashMap::with_capacity(wave.len());
+        let mut changes = Vec::with_capacity(wave.len());
+        for &index in wave {
+            let (prepared, next) = render_checked(
+                project_dir,
+                &plan_nodes[index],
+                &snapshot,
+                template_options,
+                relations,
+                store,
+            )?;
+            // A variable is written when the node changes or adds it (`def_var` only sets absent keys).
+            let changed: BTreeMap<String, Value> = next
+                .into_iter()
+                .filter(|(key, value)| snapshot.get(key) != Some(value))
+                .collect();
+            writes.insert(index, changed.keys().cloned().collect());
+            changes.push(changed);
+            nodes.push((index, prepared));
+        }
+        let conflict = waves::detect_variable_conflicts(wave, &writes, plan_nodes).err();
+        let conflicted = conflict.is_some();
+        rendered.push(RenderedWave { nodes, conflict });
+        if conflicted {
+            break;
+        }
+        for changed in changes {
+            state.extend(changed);
+        }
+    }
+    if rendered.iter().all(|wave| wave.conflict.is_none()) {
+        store.validate_variables(&state)?;
+    }
+    Ok((rendered, state))
+}
+
+/// Inputs shared by the SQL nodes of an automatic run.
+struct WaveContext<'a> {
+    root: &'a Path,
+    profile: &'a PgProfile,
+    mode: ExecutionMode,
+    retry_policy: RetryPolicy,
+    allow_replace: bool,
+    full_refresh: bool,
+    cancel: &'a CancellationToken,
+    /// `min(max_parallel_nodes, max_worker_processes)`; `1` runs every wave in order.
+    concurrency: usize,
+}
+
+/// Records and outcome of one node of a wave. They stay apart until the wave merges them in plan
+/// order, whatever the completion order (ADR 0008 §6).
+struct WaveNodeRun {
+    trace: Trace,
+    outcome: Result<()>,
+}
+
+/// Runs the rendered waves of an automatic SQL run (ADR 0008 §1 to §7). Each wave runs its nodes
+/// (concurrently when it has more than one node and the concurrency is above 1), merges their
+/// records in plan order, then checks its conflict and failures. Nothing is published here: the
+/// caller publishes the final variables once, after every wave succeeded. Returns the completed
+/// nodes in plan order.
+fn run_sql_waves(
+    trace: &mut Trace,
+    plan_nodes: &[PlanNode],
+    wave_plan: &[Vec<usize>],
+    rendered: Vec<RenderedWave>,
+    adapter: &mut PostgresAdapter,
+    context: &WaveContext<'_>,
+) -> Result<Vec<RunNodeResult>> {
+    let mut completed: Vec<(usize, RunNodeResult)> = Vec::with_capacity(plan_nodes.len());
+    for (position, wave) in rendered.into_iter().enumerate() {
+        if let Err(error) = context.cancel.check() {
+            skip_waves(trace, plan_nodes, &wave_plan[position..], context.mode);
+            return Err(error);
+        }
+        let RenderedWave { nodes, conflict } = wave;
+        let runs = if context.concurrency > 1 && nodes.len() > 1 {
+            run_wave_concurrently(trace, plan_nodes, &nodes, context)
+        } else {
+            run_wave_in_order(trace, plan_nodes, &nodes, adapter, context)
+        };
+        let mut failure = None;
+        let mut unstarted = false;
+        for ((index, prepared), run) in nodes.iter().zip(runs) {
+            match run {
+                Some(run) => {
+                    trace.absorb(run.trace);
+                    match run.outcome {
+                        Ok(()) => completed.push((*index, sql_node_result(prepared))),
+                        Err(error) => {
+                            failure.get_or_insert(error);
+                        }
+                    }
+                }
+                None => {
+                    unstarted = true;
+                    trace.skip(std::slice::from_ref(&plan_nodes[*index]), context.mode);
+                }
+            }
+        }
+        // ADR 0008 §4 is checked before the node failures of §7. A node that never started can
+        // only follow a halt (a failure, already recorded) or a cancellation.
+        let error = conflict.or(failure).or_else(|| {
+            unstarted.then(|| {
+                context.cancel.check().err().unwrap_or_else(|| {
+                    DowaiError::Execution("A SQL wave ended with unstarted nodes".to_owned())
+                })
+            })
+        });
+        if let Some(error) = error {
+            skip_waves(trace, plan_nodes, &wave_plan[position + 1..], context.mode);
+            return Err(error);
+        }
+    }
+    completed.sort_by_key(|(index, _)| *index);
+    Ok(completed.into_iter().map(|(_, result)| result).collect())
+}
+
+/// Sequential wave: nodes run in plan order on the run's connection. The first failure halts the
+/// wave; the nodes after it stay unstarted (`None`).
+fn run_wave_in_order(
+    trace: &Trace,
+    plan_nodes: &[PlanNode],
+    nodes: &[(usize, PreparedNode)],
+    adapter: &mut PostgresAdapter,
+    context: &WaveContext<'_>,
+) -> Vec<Option<WaveNodeRun>> {
+    let mut runs: Vec<Option<WaveNodeRun>> = nodes.iter().map(|_| None).collect();
+    for (slot, (index, prepared)) in nodes.iter().enumerate() {
+        if context.cancel.is_cancelled() {
+            break;
+        }
+        let mut node_trace = trace.fork();
+        let outcome = run_wave_node(
+            &mut node_trace,
+            adapter,
+            &plan_nodes[*index],
+            prepared,
+            context,
+        );
+        let failed = outcome.is_err();
+        runs[slot] = Some(WaveNodeRun {
+            trace: node_trace,
+            outcome,
+        });
+        if failed {
+            break;
+        }
+    }
+    runs
+}
+
+/// Concurrent wave: up to `context.concurrency` nodes at once, each on its own PostgreSQL
+/// connection (ADR 0008 §5). A failed node halts the claim of the nodes not yet started.
+fn run_wave_concurrently(
+    trace: &Trace,
+    plan_nodes: &[PlanNode],
+    nodes: &[(usize, PreparedNode)],
+    context: &WaveContext<'_>,
+) -> Vec<Option<WaveNodeRun>> {
+    waves::run_concurrently(
+        nodes.len(),
+        context.concurrency,
+        || context.cancel.is_cancelled(),
+        |slot| {
+            let (index, prepared) = &nodes[slot];
+            let plan_node = &plan_nodes[*index];
+            let mut node_trace = trace.fork();
+            let outcome = match PostgresAdapter::connect(context.profile) {
+                Ok(mut adapter) => {
+                    run_wave_node(&mut node_trace, &mut adapter, plan_node, prepared, context)
+                }
+                Err(error) => {
+                    let error = DowaiError::Connection(error.to_string());
+                    record_unstarted_failure(&mut node_trace, plan_node, context, &error);
+                    Err(error)
+                }
+            };
+            let halt = outcome.is_err();
+            (
+                WaveNodeRun {
+                    trace: node_trace,
+                    outcome,
+                },
+                halt,
+            )
+        },
+    )
+}
+
+/// Materializes one rendered node under the retry policy, recording into `node_trace`.
+fn run_wave_node(
+    node_trace: &mut Trace,
+    adapter: &mut PostgresAdapter,
+    plan_node: &PlanNode,
+    prepared: &PreparedNode,
+    context: &WaveContext<'_>,
+) -> Result<()> {
+    let materialization = match prepared.materialization {
+        Materialization::Table => PostgresMaterialization::Table,
+        Materialization::View => PostgresMaterialization::View,
+    };
+    materialize_with_retry(
+        adapter,
+        context.profile,
+        plan_node,
+        model_hash(context.root, plan_node),
+        context.mode,
+        Some(node_trace),
+        context.retry_policy,
+        context.cancel,
+        SqlWrite {
+            relation: &prepared.relation,
+            materialization,
+            sql: &prepared.sql,
+            allow_replace: context.allow_replace,
+            full_refresh: context.full_refresh,
+        },
+    )
+}
+
+/// Journals a node that failed before its first attempt, such as a failed connection.
+fn record_unstarted_failure(
+    trace: &mut Trace,
+    plan_node: &PlanNode,
+    context: &WaveContext<'_>,
+    error: &DowaiError,
+) {
+    let invocation_id = Uuid::new_v4().to_string();
+    let started = Instant::now();
+    trace.audit.node_started(
+        &invocation_id,
+        &plan_node.id,
+        model_hash(context.root, plan_node),
+    );
+    trace
+        .audit
+        .node_finished(&invocation_id, &plan_node.id, Some(error));
+    trace.node(
+        invocation_id,
+        plan_node,
+        context.mode,
+        node_failure_status(error),
+        started,
+        Some(error),
+    );
+}
+
+/// Records every node of `waves` as SKIPPED, wave by wave, in plan order inside each wave.
+fn skip_waves(
+    trace: &mut Trace,
+    plan_nodes: &[PlanNode],
+    waves: &[Vec<usize>],
+    mode: ExecutionMode,
+) {
+    for &index in waves.iter().flatten() {
+        trace.skip(std::slice::from_ref(&plan_nodes[index]), mode);
+    }
+}
+
+fn sql_node_result(prepared: &PreparedNode) -> RunNodeResult {
+    RunNodeResult {
+        id: prepared.id.clone(),
+        relation: prepared.relation.clone(),
+        materialization: match prepared.materialization {
+            Materialization::Table => "table",
+            Materialization::View => "view",
+        }
+        .to_owned(),
+        status: "SUCCEEDED".to_owned(),
+    }
 }
 
 /// Result record of a Python node: it materializes no relation.

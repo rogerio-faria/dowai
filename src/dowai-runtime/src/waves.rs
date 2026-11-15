@@ -1,12 +1,15 @@
 //! Ondas de execução e detecção de conflitos de variáveis (ENT-120a, ADR 0008 §1 e §4).
 //!
 //! Uma onda reúne nós cujas dependências (dentro do plano) já estão em ondas anteriores. Nós de
-//! uma mesma onda são independentes entre si e poderiam executar em paralelo. Este módulo define
-//! apenas a regra de agrupamento e a detecção de conflito; o agendador atual continua sequencial.
-//! A consumidora concorrente é ENT-120b (nós SQL) e ENT-120c (nós Python e misto).
+//! uma mesma onda são independentes entre si. Este módulo define a regra de agrupamento, a
+//! detecção de conflito e o limite de concorrência de uma onda (ENT-120b, ADR 0008 §2). O
+//! caminho concorrente cobre somente nós SQL no modo automático; nós Python e o modo manual
+//! continuam sequenciais (ENT-120c).
 
 use dowai_core::{DowaiError, PlanNode, Result};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::thread;
 
 /// Agrupa os índices de `nodes` em ondas. A onda de um nó é `1 + max(onda das dependências)`
 /// dentro do plano; dependências fora do plano são ignoradas. Dentro de cada onda, os índices
@@ -93,9 +96,144 @@ pub(crate) fn detect_variable_conflicts(
     Ok(())
 }
 
+/// Runs `count` items with at most `limit` of them in flight (ADR 0008 §2). Items are claimed in
+/// index order by `min(limit, count)` scoped threads. `work` returns the item's result and whether
+/// the wave must halt. After a halt, or once `cancelled()` holds, no unclaimed item starts. The
+/// result has one slot per item, in index order; `None` marks an item that never started.
+///
+/// A panic in `work` is propagated to the caller after every thread has finished.
+pub(crate) fn run_concurrently<T, W, C>(
+    count: usize,
+    limit: usize,
+    cancelled: C,
+    work: W,
+) -> Vec<Option<T>>
+where
+    T: Send,
+    W: Fn(usize) -> (T, bool) + Sync,
+    C: Fn() -> bool + Sync,
+{
+    let next = AtomicUsize::new(0);
+    let halted = AtomicBool::new(false);
+    let workers = limit.min(count).max(1);
+    let joined = thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        if halted.load(Ordering::SeqCst) || cancelled() {
+                            break;
+                        }
+                        let index = next.fetch_add(1, Ordering::SeqCst);
+                        if index >= count {
+                            break;
+                        }
+                        let (value, halt) = work(index);
+                        if halt {
+                            halted.store(true, Ordering::SeqCst);
+                        }
+                        done.push((index, value));
+                    }
+                    done
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(thread::ScopedJoinHandle::join)
+            .collect::<Vec<_>>()
+    });
+    let mut slots: Vec<Option<T>> = (0..count).map(|_| None).collect();
+    for outcome in joined {
+        match outcome {
+            Ok(done) => {
+                for (index, value) in done {
+                    slots[index] = Some(value);
+                }
+            }
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+    slots
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Waits until `in_flight` reaches `target` (or a generous deadline), so overlap is observed
+    /// without relying on sleeps of fixed length.
+    fn wait_for_overlap(in_flight: &AtomicUsize, target: usize) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while in_flight.load(Ordering::SeqCst) < target && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Runs `count` items and returns the maximum number seen in flight at once.
+    fn peak_in_flight(count: usize, limit: usize, target: usize) -> (usize, Vec<Option<usize>>) {
+        let in_flight = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let slots = run_concurrently(
+            count,
+            limit,
+            || false,
+            |index| {
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                wait_for_overlap(&in_flight, target);
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                (index, false)
+            },
+        );
+        (peak.load(Ordering::SeqCst), slots)
+    }
+
+    #[test]
+    fn items_overlap_up_to_the_limit() {
+        let (peak, slots) = peak_in_flight(4, 4, 4);
+        assert_eq!(peak, 4);
+        assert_eq!(slots, [Some(0), Some(1), Some(2), Some(3)]);
+    }
+
+    #[test]
+    fn concurrency_never_exceeds_the_limit() {
+        // The target is the limit: every worker waits for a full set of peers and none exceeds it.
+        let (peak, slots) = peak_in_flight(4, 2, 2);
+        assert_eq!(peak, 2);
+        assert!(slots.iter().all(Option::is_some));
+    }
+
+    #[test]
+    fn limit_one_runs_items_in_index_order() {
+        let order = std::sync::Mutex::new(Vec::new());
+        let slots = run_concurrently(
+            3,
+            1,
+            || false,
+            |index| {
+                order.lock().expect("order lock").push(index);
+                (index, false)
+            },
+        );
+        assert_eq!(*order.lock().expect("order lock"), [0, 1, 2]);
+        assert_eq!(slots, [Some(0), Some(1), Some(2)]);
+    }
+
+    #[test]
+    fn halt_prevents_unclaimed_items_from_starting() {
+        // With one worker, items are claimed strictly in order: item 1 halts, so 2 and 3 never run.
+        let slots = run_concurrently(4, 1, || false, |index| (index, index == 1));
+        assert_eq!(slots, [Some(0), Some(1), None, None]);
+    }
+
+    #[test]
+    fn cancellation_prevents_every_item_from_starting() {
+        let slots = run_concurrently(3, 2, || true, |index| (index, false));
+        assert_eq!(slots, [None, None, None]);
+    }
 
     fn node(id: &str, depends_on: &[&str]) -> PlanNode {
         PlanNode {

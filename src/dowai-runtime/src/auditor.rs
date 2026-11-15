@@ -35,6 +35,9 @@ pub(crate) struct Auditor {
     pub(crate) config_hash: Option<String>,
     pub(crate) plan_hash: Option<String>,
     pub(crate) profile: Option<String>,
+    /// Events of a forked child (ENT-120b), kept in memory until `absorb` writes them. `None`
+    /// for the run's own auditor, which writes each event as it is emitted.
+    pending: Option<Vec<AuditEvent>>,
 }
 
 impl Auditor {
@@ -65,6 +68,38 @@ impl Auditor {
             config_hash: None,
             plan_hash: None,
             profile: None,
+            pending: None,
+        }
+    }
+
+    /// Child auditor of one node that runs concurrently in a wave (ADR 0008 §6). It shares the
+    /// identifiers of this run, writes nothing itself, and keeps its events in order for `absorb`.
+    pub(crate) fn fork(&self) -> Self {
+        Self {
+            log: None,
+            operational: None,
+            run_id: self.run_id.clone(),
+            root_invocation_id: self.root_invocation_id.clone(),
+            started_ms: self.started_ms,
+            started: Instant::now(),
+            node_clocks: HashMap::new(),
+            started_emitted: true,
+            failed: false,
+            session_id: self.session_id.clone(),
+            project: self.project.clone(),
+            mode: self.mode.clone(),
+            config_hash: self.config_hash.clone(),
+            plan_hash: self.plan_hash.clone(),
+            profile: self.profile.clone(),
+            pending: Some(Vec::new()),
+        }
+    }
+
+    /// Writes the events of a forked child, in the order they were recorded. The caller decides
+    /// the order of children: plan order, whatever the completion order (ADR 0008 §6).
+    pub(crate) fn absorb(&mut self, child: Auditor) {
+        for event in child.pending.unwrap_or_default() {
+            self.emit(&event);
         }
     }
 
@@ -81,6 +116,10 @@ impl Auditor {
     }
 
     fn emit(&mut self, event: &AuditEvent) {
+        if let Some(pending) = self.pending.as_mut() {
+            pending.push(event.clone());
+            return;
+        }
         let written = match &self.log {
             Some(log) => log.append(event).is_ok(),
             None => false,
