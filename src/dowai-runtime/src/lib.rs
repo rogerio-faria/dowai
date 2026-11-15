@@ -765,16 +765,8 @@ fn execute_run(
         ));
     }
     // ENT-038: limites não aplicados ou parciais são reportados no resultado do run.
-    // ENT-120b/c: automatic runs without mixed nodes execute independent nodes in waves.
-    let has_python = execution_plan
-        .nodes
-        .iter()
-        .any(|node| is_python_path(&node.path));
-    let has_sql = execution_plan
-        .nodes
-        .iter()
-        .any(|node| !is_python_path(&node.path));
-    let concurrent_waves = matches!(mode, ExecutionMode::Automatic) && !(has_python && has_sql);
+    // ENT-120b/c2: automatic runs execute independent nodes in waves, whatever their node kinds.
+    let concurrent_waves = matches!(mode, ExecutionMode::Automatic);
     execution_plan.warnings.extend(resources::run_warnings(
         &configuration,
         &execution_plan.nodes,
@@ -932,18 +924,28 @@ fn execute_run(
                 executor::DatasetSource::new(profile, relations, BTreeSet::new(), sources)
                     .with_mysql(mysql)
             };
-            let wave_run = run_python_waves(
+            let root_invocation = run_invocation_id.clone();
+            let wave_run = run_variable_waves(
                 trace,
                 &execution_plan.nodes,
                 &wave_plan,
                 mode,
-                &root,
+                cancel,
                 std::mem::take(&mut variables),
                 concurrency,
-                &template,
-                cancel,
-                &new_sql,
-                &new_datasets,
+                &|index, snapshot, node_trace| {
+                    run_python_wave_node(
+                        &template,
+                        &new_sql,
+                        &new_datasets,
+                        &root,
+                        &execution_plan.nodes[index],
+                        mode,
+                        snapshot,
+                        &root_invocation,
+                        node_trace,
+                    )
+                },
             );
             executor.invocations = wave_run.invocations;
             execution_plan.warnings.extend(wave_run.warnings);
@@ -1056,6 +1058,16 @@ fn execute_run(
             .filter(|node| !is_python_path(&node.path))
             .filter_map(|node| relations.get(&node.id.replace('\\', "/")).cloned())
             .collect();
+        // Children of the waves (ENT-120c2) read datasets through their own connections.
+        let child_dataset_profile: std::result::Result<PgProfile, &'static str> =
+            Ok(postgres_profile(profile.clone(), &configuration)?);
+        let child_datasets = (
+            child_dataset_profile,
+            relations.clone(),
+            sql_relations.clone(),
+            declared_source_relations(&root)?,
+            declared_mysql_sources(&root, &configuration)?,
+        );
         executor.datasets = Some(
             executor::DatasetSource::new(
                 Ok(postgres_profile(profile.clone(), &configuration)?),
@@ -1066,6 +1078,7 @@ fn execute_run(
             .with_mysql(declared_mysql_sources(&root, &configuration)?),
         );
         let pg_profile = postgres_profile(profile, &configuration)?;
+        let child_pg_profile = pg_profile.clone();
         // Connected before the first node, as before ENT-114; nested SQL calls reuse it.
         let adapter = PostgresAdapter::connect(&pg_profile)
             .map_err(|error| DowaiError::Connection(error.to_string()))?;
@@ -1078,12 +1091,77 @@ fn execute_run(
             retry_policy,
             cancel.clone(),
         ));
-        let completed_nodes = match run_nodes_sequentially(
-            trace,
-            &execution_plan.nodes,
-            mode,
-            cancel,
-            |trace, node| {
+        let sequential = if matches!(mode, ExecutionMode::Automatic) {
+            // ENT-120c2 (ADR 0008): automatic mixed runs go wave by wave; SQL and Python nodes of
+            // a wave run concurrently, each with its own connection or child executor.
+            let wave_plan = waves::waves(&execution_plan.nodes)?;
+            let concurrency = wave_concurrency(&configuration)?;
+            let template = executor.child_template();
+            let new_sql = || {
+                SqlExecution::new(
+                    Ok(child_pg_profile.clone()),
+                    None,
+                    template_options.clone(),
+                    allow_replace,
+                    request.full_refresh,
+                    retry_policy,
+                    cancel.clone(),
+                )
+            };
+            let new_datasets = || {
+                let (profile, relations, sql_relations, sources, mysql) = child_datasets.clone();
+                executor::DatasetSource::new(profile, relations, sql_relations, sources)
+                    .with_mysql(mysql)
+            };
+            let root_invocation = run_invocation_id.clone();
+            let wave_run = run_variable_waves(
+                trace,
+                &execution_plan.nodes,
+                &wave_plan,
+                mode,
+                cancel,
+                std::mem::take(&mut variables),
+                concurrency,
+                &|index, snapshot, node_trace| {
+                    let node = &execution_plan.nodes[index];
+                    if is_python_path(&node.path) {
+                        run_python_wave_node(
+                            &template,
+                            &new_sql,
+                            &new_datasets,
+                            &root,
+                            node,
+                            mode,
+                            snapshot,
+                            &root_invocation,
+                            node_trace,
+                        )
+                    } else {
+                        run_sql_wave_node(
+                            &root,
+                            node,
+                            mode,
+                            snapshot,
+                            &template_options,
+                            &relations,
+                            &store,
+                            &new_sql,
+                            node_trace,
+                        )
+                    }
+                },
+            );
+            executor.invocations = wave_run.invocations;
+            execution_plan.warnings.extend(wave_run.warnings);
+            match wave_run.outcome {
+                Ok((completed, next)) => {
+                    variables = next;
+                    Ok(completed)
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            run_nodes_sequentially(trace, &execution_plan.nodes, mode, cancel, |trace, node| {
                 if is_python_path(&node.path) {
                     variables = run_python_node(
                         &mut executor,
@@ -1144,8 +1222,9 @@ fn execute_run(
                     .to_owned(),
                     status: "SUCCEEDED".to_owned(),
                 })
-            },
-        ) {
+            })
+        };
+        let completed_nodes = match sequential {
             Ok(completed) => completed,
             Err(error) => {
                 trace.python = std::mem::take(&mut executor.invocations);
@@ -1200,6 +1279,18 @@ fn execute_run(
             &relations,
             &store,
         )?;
+        // An empty rendered statement is refused before any connection (as the sequential path).
+        if let Some(node) = rendered
+            .iter()
+            .flat_map(|wave| wave.nodes.iter())
+            .map(|(_, prepared)| prepared)
+            .find(|prepared| prepared.sql.trim().is_empty())
+        {
+            return Err(DowaiError::Template(format!(
+                "{} renders to an empty SQL statement",
+                node.id
+            )));
+        }
         let pg_profile = postgres_profile(profile, &configuration)?;
         let mut adapter = PostgresAdapter::connect(&pg_profile)
             .map_err(|error| DowaiError::Connection(error.to_string()))?;
@@ -1508,42 +1599,154 @@ fn run_sql_waves(
     Ok(completed.into_iter().map(|(_, result)| result).collect())
 }
 
-/// Outcome of a Python-only run executed by waves (ENT-120c). The invocations and warnings are
-/// kept on failure too, so the journal records the nodes that ran.
-struct PythonWaveRun {
+/// Outcome of a run executed by variable waves (ENT-120c, ENT-120c2). The invocations and
+/// warnings are kept on failure too, so the journal records the nodes that ran.
+struct VariableWaveRun {
     outcome: Result<(Vec<RunNodeResult>, BTreeMap<String, Value>)>,
     invocations: Vec<InvocationRecord>,
     warnings: Vec<String>,
 }
 
-/// Records of one Python node of a wave, merged in plan order by `run_python_waves`.
-struct PythonNodeRun {
-    trace: Trace,
+/// What one node of a wave produced: its result and the variables it leaves, or its failure,
+/// together with the invocation records and dataset warnings of its own executor.
+struct NodeOutput {
+    outcome: Result<(BTreeMap<String, Value>, RunNodeResult)>,
     invocations: Vec<InvocationRecord>,
     warnings: Vec<String>,
-    outcome: Result<BTreeMap<String, Value>>,
 }
 
-/// Runs the waves of an automatic Python-only run (ADR 0008 §1 to §7). Each node of a wave runs
-/// in its own child executor, with its own worker process, call stack and connections, and gets
-/// the variables published before the wave (§3). When the wave ends, its records are merged in
-/// plan order (§6), its conflicts are checked (§4) and its failures are applied (§7). Nothing is
-/// published here: the caller publishes the final variables once.
+/// Records of one node of a wave, merged in plan order by `run_variable_waves`.
+struct VariableNodeRun {
+    trace: Trace,
+    output: NodeOutput,
+}
+
+/// Runs one Python node of a wave in a child executor of its own (ENT-120c).
 #[allow(clippy::too_many_arguments)]
-fn run_python_waves(
+fn run_python_wave_node(
+    template: &executor::ChildTemplate<'_>,
+    new_sql: &(dyn Fn() -> SqlExecution + Sync),
+    new_datasets: &(dyn Fn() -> executor::DatasetSource + Sync),
+    root: &Path,
+    node: &PlanNode,
+    mode: ExecutionMode,
+    snapshot: &BTreeMap<String, Value>,
+    root_invocation_id: &str,
+    node_trace: &mut Trace,
+) -> NodeOutput {
+    let mut child = template.child(Some(new_sql()), Some(new_datasets()));
+    let outcome = run_python_node(
+        &mut child,
+        &mut node_trace.audit,
+        root,
+        node,
+        mode,
+        snapshot.clone(),
+        root_invocation_id,
+    )
+    .map(|next| (next, python_node_result(node)));
+    let warnings = child
+        .datasets
+        .as_mut()
+        .map(|datasets| datasets.take_warnings())
+        .unwrap_or_default();
+    NodeOutput {
+        outcome,
+        invocations: child.invocations,
+        warnings,
+    }
+}
+
+/// Journals a node whose SQL could not be rendered: it has no attempt, but it is recorded once.
+fn journal_render_failure(
+    trace: &mut Trace,
+    node: &PlanNode,
+    mode: ExecutionMode,
+    hash: Option<String>,
+    error: &DowaiError,
+) {
+    let invocation_id = Uuid::new_v4().to_string();
+    let node_started = Instant::now();
+    trace.audit.node_started(&invocation_id, &node.id, hash);
+    trace
+        .audit
+        .node_finished(&invocation_id, &node.id, Some(error));
+    trace.node(
+        invocation_id,
+        node,
+        mode,
+        node_failure_status(error),
+        node_started,
+        Some(error),
+    );
+}
+
+/// Renders and materializes one SQL node of a mixed wave (ENT-120c2). The node sees the wave's
+/// snapshot (ADR 0008 §3) and has its own PostgreSQL connection.
+#[allow(clippy::too_many_arguments)]
+fn run_sql_wave_node(
+    root: &Path,
+    node: &PlanNode,
+    mode: ExecutionMode,
+    snapshot: &BTreeMap<String, Value>,
+    template_options: &TemplateOptions,
+    relations: &BTreeMap<String, String>,
+    store: &SessionStore,
+    new_sql: &(dyn Fn() -> SqlExecution + Sync),
+    node_trace: &mut Trace,
+) -> NodeOutput {
+    let hash = model_hash(root, node);
+    let outcome = match render_checked(root, node, snapshot, template_options, relations, store) {
+        Err(error) => {
+            journal_render_failure(node_trace, node, mode, hash, &error);
+            Err(error)
+        }
+        Ok((prepared, next_variables)) => {
+            let mut sql = new_sql();
+            sql.materialize(node, mode, hash, Some(&mut *node_trace), &prepared)
+                .map(|()| {
+                    (
+                        next_variables,
+                        RunNodeResult {
+                            id: prepared.id.clone(),
+                            relation: prepared.relation.clone(),
+                            materialization: match prepared.materialization {
+                                Materialization::Table => "table",
+                                Materialization::View => "view",
+                            }
+                            .to_owned(),
+                            status: "SUCCEEDED".to_owned(),
+                        },
+                    )
+                })
+        }
+    };
+    NodeOutput {
+        outcome,
+        invocations: Vec::new(),
+        warnings: Vec::new(),
+    }
+}
+
+/// Executes one node of a variable wave: the variables before the wave, and the node's own trace.
+type NodeRunner<'a> = dyn Fn(usize, &BTreeMap<String, Value>, &mut Trace) -> NodeOutput + Sync + 'a;
+
+/// Runs the waves of an automatic run whose nodes share the variables (ADR 0008 §1 to §7). Each
+/// node of a wave is executed by `run_node` with the variables published before the wave (§3),
+/// on its own trace. When the wave ends, the traces are merged in plan order (§6), its conflicts
+/// are checked (§4) and its failures are applied (§7). Nothing is published here: the caller
+/// publishes the final variables once, after every wave succeeded.
+#[allow(clippy::too_many_arguments)]
+fn run_variable_waves(
     trace: &mut Trace,
     plan_nodes: &[PlanNode],
     wave_plan: &[Vec<usize>],
     mode: ExecutionMode,
-    root: &Path,
+    cancel: &CancellationToken,
     variables: BTreeMap<String, Value>,
     concurrency: usize,
-    template: &executor::ChildTemplate<'_>,
-    cancel: &CancellationToken,
-    new_sql: &(dyn Fn() -> SqlExecution + Sync),
-    new_datasets: &(dyn Fn() -> executor::DatasetSource + Sync),
-) -> PythonWaveRun {
-    let root_invocation_id = trace.root_invocation_id.clone();
+    run_node: &NodeRunner<'_>,
+) -> VariableWaveRun {
     let mut state = variables;
     let mut completed: Vec<(usize, RunNodeResult)> = Vec::with_capacity(plan_nodes.len());
     let mut invocations = Vec::new();
@@ -1551,7 +1754,7 @@ fn run_python_waves(
     for (position, wave) in wave_plan.iter().enumerate() {
         if let Err(error) = cancel.check() {
             skip_waves(trace, plan_nodes, &wave_plan[position..], mode);
-            return PythonWaveRun {
+            return VariableWaveRun {
                 outcome: Err(error),
                 invocations,
                 warnings,
@@ -1565,30 +1768,14 @@ fn run_python_waves(
                 concurrency,
                 || cancel.is_cancelled(),
                 |slot| {
-                    let node = &plan_nodes[wave[slot]];
+                    let index = wave[slot];
                     let mut node_trace = shared.fork();
-                    let mut child = template.child(Some(new_sql()), Some(new_datasets()));
-                    let outcome = run_python_node(
-                        &mut child,
-                        &mut node_trace.audit,
-                        root,
-                        node,
-                        mode,
-                        snapshot.clone(),
-                        &root_invocation_id,
-                    );
-                    let node_warnings = child
-                        .datasets
-                        .as_mut()
-                        .map(|datasets| datasets.take_warnings())
-                        .unwrap_or_default();
-                    let halt = outcome.is_err();
+                    let output = run_node(index, &snapshot, &mut node_trace);
+                    let halt = output.outcome.is_err();
                     (
-                        PythonNodeRun {
+                        VariableNodeRun {
                             trace: node_trace,
-                            invocations: child.invocations,
-                            warnings: node_warnings,
-                            outcome,
+                            output,
                         },
                         halt,
                     )
@@ -1604,10 +1791,10 @@ fn run_python_waves(
             match run {
                 Some(run) => {
                     trace.absorb(run.trace);
-                    invocations.extend(run.invocations);
-                    warnings.extend(run.warnings);
-                    match run.outcome {
-                        Ok(next) => {
+                    invocations.extend(run.output.invocations);
+                    warnings.extend(run.output.warnings);
+                    match run.output.outcome {
+                        Ok((next, result)) => {
                             // A variable is written when the node changes or adds it.
                             let changed: BTreeMap<String, Value> = next
                                 .into_iter()
@@ -1615,7 +1802,7 @@ fn run_python_waves(
                                 .collect();
                             writes.insert(index, changed.keys().cloned().collect());
                             changes.push(changed);
-                            completed.push((index, python_node_result(&plan_nodes[index])));
+                            completed.push((index, result));
                         }
                         Err(error) => {
                             failure.get_or_insert(error);
@@ -1633,13 +1820,13 @@ fn run_python_waves(
         let error = conflict.or(failure).or_else(|| {
             unstarted.then(|| {
                 cancel.check().err().unwrap_or_else(|| {
-                    DowaiError::Execution("A Python wave ended with unstarted nodes".to_owned())
+                    DowaiError::Execution("A wave ended with unstarted nodes".to_owned())
                 })
             })
         });
         if let Some(error) = error {
             skip_waves(trace, plan_nodes, &wave_plan[position + 1..], mode);
-            return PythonWaveRun {
+            return VariableWaveRun {
                 outcome: Err(error),
                 invocations,
                 warnings,
@@ -1650,7 +1837,7 @@ fn run_python_waves(
         }
     }
     completed.sort_by_key(|(index, _)| *index);
-    PythonWaveRun {
+    VariableWaveRun {
         outcome: Ok((
             completed.into_iter().map(|(_, result)| result).collect(),
             state,

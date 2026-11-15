@@ -413,3 +413,28 @@ fn invocation_order_follows_the_plan_whatever_the_completion_order() {
         "journal must follow plan order: {stems_in_journal:?}"
     );
 }
+
+#[test]
+#[ignore = "requires the DOWAI_TEST_PG_* disposable PostgreSQL database (D-091)"]
+fn render_failure_in_a_later_wave_stops_before_any_statement() {
+    // Rendering happens before the first statement (as in the manual path): a node whose SQL does
+    // not render fails the run before any wave runs, so the earlier wave creates no relation.
+    let mut fixture = Fixture::new("renderfail");
+    fixture.write_model("a_first", "select 1 as v");
+    let first = fixture.relation("a_first");
+    fixture.write_model(
+        "b_later",
+        &format!("select * from {{{{ ref('{first}') }}}} {{% if var('never_defined') == 1 %}}where 1 = 1{{% endif %}}"),
+    );
+    fixture
+        .set_config(json!({ "runtime": { "max_parallel_nodes": 4, "max_worker_processes": 8 } }));
+
+    let error = fixture
+        .run(&[&fixture.target("a_first"), &fixture.target("b_later")])
+        .expect_err("a node whose SQL does not render must fail the run");
+    assert_eq!(error.code(), "DOWAI_TEMPLATE_INVALID");
+    assert!(
+        !fixture.table_exists("a_first"),
+        "no statement runs when a node of the run does not render"
+    );
+}
