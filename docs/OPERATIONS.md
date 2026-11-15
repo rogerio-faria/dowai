@@ -138,6 +138,17 @@ dowai config show --effective [--json]
 - Segredos de perfil nunca são gravados em JSON.
 - Escritas no banco são negadas sem `security.allow_external_writes`. Substituir tabela ou view exige `--yes`.
 
+## 9.1 Execução em ondas (modo automático)
+
+No modo automático, os nós de um run são agrupados em ondas: um nó entra numa onda quando suas dependências já foram concluídas. Os nós de uma mesma onda executam em paralelo, com no máximo `min(runtime.max_parallel_nodes, runtime.max_worker_processes)` simultâneos (ADR 0008).
+
+- Cada nó lê o snapshot de variáveis do início da onda. As variáveis escritas pela onda são publicadas ao fim, na ordem do plano, somente se a onda não tiver conflito e todos os nós tiverem sucesso.
+- Dois nós da mesma onda que escrevam a mesma variável geram `DOWAI_VARIABLE_CONFLICT` (exit 3): o run termina `FAILED` e nenhuma variável da sessão é publicada.
+- Falha de um nó interrompe os nós pendentes da mesma onda e aplica `execution.stop_on_error`. Efeitos já materializados (tabelas, views e envios à outbox) não são revertidos pelo scheduler; somente as variáveis de sessão são tudo-ou-nada.
+- Journal e eventos de AUDIT são gravados na ordem do plano, independentemente da ordem real de conclusão.
+- O modo manual (`dowai run --manual`, `env.manual()`) executa em sequência, sem paralelismo, por contrato.
+- Em runs somente SQL, todos os nós são renderizados antes da primeira instrução: uma falha de renderização interrompe o run sem executar nenhum nó. Em runs com Python ou misto, cada nó é renderizado ao iniciar a sua onda, com o snapshot dessa onda; a falha de um nó é registrada no journal e interrompe os pendentes da onda.
+
 ## 10. Erros e códigos de saída
 
 Erros usam códigos estáveis `DOWAI_*`, e a saída `--json` vai somente para stdout. Consulte `docs/CONFIGURATION.md` para o catálogo de parâmetros e o plano mestre para a tabela de códigos de saída.

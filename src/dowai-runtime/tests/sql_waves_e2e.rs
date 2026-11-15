@@ -438,3 +438,39 @@ fn render_failure_in_a_later_wave_stops_before_any_statement() {
         "no statement runs when a node of the run does not render"
     );
 }
+
+#[test]
+#[ignore = "requires the DOWAI_TEST_PG_* disposable PostgreSQL database (D-091)"]
+fn manual_mode_runs_sql_nodes_one_at_a_time() {
+    // Regression (ENT-120d): the manual mode stays sequential even with a parallel limit.
+    let mut fixture = Fixture::new("manual");
+    let stems = ["a", "b", "c", "d"];
+    for stem in stems {
+        fixture.write_model(stem, &timed_model(SLEEP_SECONDS));
+    }
+    fixture
+        .set_config(json!({ "runtime": { "max_parallel_nodes": 4, "max_worker_processes": 8 } }));
+    let targets: Vec<String> = stems.iter().map(|stem| fixture.target(stem)).collect();
+    let targets: Vec<&str> = targets.iter().map(String::as_str).collect();
+
+    let result = run_postgres(
+        &fixture.project,
+        RunRequest {
+            targets: targets.iter().map(|target| (*target).to_owned()).collect(),
+            mode: Some(dowai_core::ExecutionMode::Manual),
+            profile: None,
+            session_id: None,
+            variables: BTreeMap::new(),
+            confirm_destructive: false,
+            full_refresh: false,
+        },
+    )
+    .expect("manual SQL run must succeed");
+    assert_eq!(result.status, "SUCCEEDED");
+    let intervals: Vec<(f64, f64)> = stems.iter().map(|stem| fixture.interval(stem)).collect();
+    assert_eq!(
+        peak_overlap(&intervals),
+        1,
+        "manual mode must not overlap nodes"
+    );
+}

@@ -202,8 +202,8 @@ Unidades e limites aparecem na tabela. Limites mínimos e máximos são inclusiv
 
 | Parâmetro | Default | Tipo e validação | Unidade | Teto administrativo | Estado |
 |---|---|---|---|---|---|
-| `runtime.max_parallel_nodes` | `4` | inteiro 1–256 | nós | não pode exceder o teto administrativo | validado; aplicado pelo scheduler: nós em sequência, concorrência efetiva 1 (ENT-038, D-060); aviso em `warnings` quando há nós independentes e o limite é maior que 1 |
-| `runtime.max_worker_processes` | `4` | inteiro 1–64 | processos | não pode exceder o teto administrativo | um worker Python por vez (ENT-038, D-060); aviso junto de `max_parallel_nodes` |
+| `runtime.max_parallel_nodes` | `4` | inteiro 1–256 | nós | não pode exceder o teto administrativo | aplicado pelo scheduler: no modo automático, nós independentes de uma onda executam em paralelo, com no máximo `min(max_parallel_nodes, max_worker_processes)` simultâneos (ENT-120, ADR 0008 §2); no modo manual, sequencial (concorrência efetiva 1). Aviso em `warnings` somente quando o scheduler é sequencial, há nós independentes e o limite é maior que 1 |
+| `runtime.max_worker_processes` | `4` | inteiro 1–64 | processos | não pode exceder o teto administrativo | teto de processos simultâneos do scheduler: cada nó Python executa em seu próprio worker e cada nó SQL usa conexão própria (ADR 0008 §5); o limite efetivo de paralelismo é `min(max_parallel_nodes, max_worker_processes)` |
 | `runtime.max_threads` | `8` | inteiro 1–256 | threads | não pode exceder o teto administrativo | `not_enforced` (ENT-104): não há limitação de threads; aviso em `warnings` em todo run com nós |
 | `runtime.max_cpu_percent` | `100` | inteiro 1–100 | % de CPU | não pode exceder o teto administrativo | `not_enforced` em todas as plataformas nesta versão (D06); abaixo de 100 gera aviso e, com `require`, recusa o worker |
 | `runtime.max_memory_mb` | `2048` | inteiro 64–1048576 | MiB | não pode exceder o teto administrativo | Linux: `RLIMIT_AS` por worker Python (memória **virtual**, estado `partial`); fora do Linux `not_enforced` até ENT-093. Bibliotecas que reservam muita memória virtual podem precisar de valor maior |
