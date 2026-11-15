@@ -1,6 +1,6 @@
 //! ENT-038: limites de recursos e de paralelismo, em runs Python-only (sem PostgreSQL).
 
-use dowai_core::{create_project, DowaiError};
+use dowai_core::{create_project, DowaiError, ExecutionMode};
 use dowai_runtime::{run_postgres, RunRequest, RunResult};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -73,11 +73,19 @@ impl TestWorkspace {
     }
 
     fn run(&self, targets: &[&str]) -> Result<RunResult, DowaiError> {
+        self.run_in(targets, None)
+    }
+
+    fn run_in(
+        &self,
+        targets: &[&str],
+        mode: Option<ExecutionMode>,
+    ) -> Result<RunResult, DowaiError> {
         run_postgres(
             &self.project,
             RunRequest {
                 targets: targets.iter().map(|target| (*target).to_owned()).collect(),
-                mode: None,
+                mode,
                 profile: None,
                 session_id: None,
                 variables: BTreeMap::new(),
@@ -220,7 +228,7 @@ fn require_refuses_worker_before_user_code_when_cpu_limit_is_not_enforced() {
 }
 
 #[test]
-fn independent_nodes_never_overlap_and_the_unused_parallel_limit_is_reported() {
+fn manual_mode_runs_independent_nodes_one_at_a_time_and_reports_it() {
     let (state_root, _guards) = isolated_state();
     let workspace = TestWorkspace::new(&python_executable());
     let log = workspace.root.join("timeline.txt");
@@ -235,8 +243,9 @@ fn independent_nodes_never_overlap_and_the_unused_parallel_limit_is_reported() {
         );
     }
 
+    // Manual mode is sequential by contract (ADR 0008 §2): the sequential-scheduler warning applies.
     let result = workspace
-        .run(&["a.py", "b.py", "c.py"])
+        .run_in(&["a.py", "b.py", "c.py"], Some(ExecutionMode::Manual))
         .expect("three independent Python models must run");
     assert_eq!(result.status, "SUCCEEDED");
     assert!(

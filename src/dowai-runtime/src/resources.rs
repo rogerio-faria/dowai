@@ -98,7 +98,14 @@ pub(crate) fn worker_limits(configuration: &Value) -> Result<WorkerLimits> {
 }
 
 /// Avisos de execução (`RunResult.warnings`) sobre limites não aplicados ou parciais.
-pub(crate) fn run_warnings(configuration: &Value, nodes: &[PlanNode]) -> Result<Vec<String>> {
+/// `concurrent_waves` is true when the run's scheduler executes independent nodes in parallel
+/// (automatic SQL-only or Python-only runs, ADR 0008); the sequential-scheduler warning then
+/// does not apply.
+pub(crate) fn run_warnings(
+    configuration: &Value,
+    nodes: &[PlanNode],
+    concurrent_waves: bool,
+) -> Result<Vec<String>> {
     let memory_mb = effective_u64(configuration, "runtime", "max_memory_mb")?;
     let cpu_percent = effective_u64(configuration, "runtime", "max_cpu_percent")?;
     let max_parallel = effective_u64(configuration, "runtime", "max_parallel_nodes")?;
@@ -147,7 +154,7 @@ pub(crate) fn run_warnings(configuration: &Value, nodes: &[PlanNode]) -> Result<
             Enforcement::NotEnforced.as_str()
         ));
     }
-    if (max_parallel > 1 || max_workers > 1) && has_independent_nodes(nodes) {
+    if !concurrent_waves && (max_parallel > 1 || max_workers > 1) && has_independent_nodes(nodes) {
         warnings.push(format!(
             "runtime.max_parallel_nodes={max_parallel} e runtime.max_worker_processes={max_workers}: o scheduler executa nós em sequência com um worker por vez (concorrência efetiva 1); limite respeitado, paralelismo entre nós não ativo"
         ));
@@ -232,7 +239,7 @@ mod tests {
     #[test]
     fn unenforced_thread_and_byte_limits_are_reported_for_python_runs() {
         let nodes = [node("a.py", "models/a.py", &[])];
-        let warnings = run_warnings(&configuration(defaults(), "best_effort"), &nodes)
+        let warnings = run_warnings(&configuration(defaults(), "best_effort"), &nodes, false)
             .expect("warnings are computed from valid configuration");
         for needle in [
             "runtime.max_threads=8 não aplicado; estado not_enforced",
@@ -249,7 +256,7 @@ mod tests {
     #[test]
     fn python_only_limit_warnings_are_absent_for_sql_only_runs() {
         let nodes = [node("a.sql", "models/a.sql", &[])];
-        let warnings = run_warnings(&configuration(defaults(), "best_effort"), &nodes)
+        let warnings = run_warnings(&configuration(defaults(), "best_effort"), &nodes, false)
             .expect("warnings are computed from valid configuration");
         assert!(warnings.iter().any(|w| w.contains("runtime.max_threads=8")));
         assert!(!warnings.iter().any(|w| w.contains("python.max_threads")));
@@ -310,7 +317,7 @@ mod tests {
             node("a.py", "models/a.py", &[]),
             node("d.py", "models/d.py", &[]),
         ];
-        let warnings = run_warnings(&configuration(runtime, "best_effort"), &nodes)
+        let warnings = run_warnings(&configuration(runtime, "best_effort"), &nodes, false)
             .expect("warnings are computed from valid configuration");
         assert!(warnings.iter().any(|w| w.contains("max_cpu_percent=50")));
         assert!(warnings
@@ -324,7 +331,7 @@ mod tests {
             node("a.py", "models/a.py", &[]),
             node("b.py", "models/b.py", &["a.py"]),
         ];
-        let warnings = run_warnings(&configuration(defaults(), "best_effort"), &nodes)
+        let warnings = run_warnings(&configuration(defaults(), "best_effort"), &nodes, false)
             .expect("warnings are computed from valid configuration");
         assert!(!warnings.iter().any(|w| w.contains("concorrência efetiva")));
     }

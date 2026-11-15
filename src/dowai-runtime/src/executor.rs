@@ -27,6 +27,8 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -89,7 +91,7 @@ pub(crate) struct DatasetSource {
 }
 
 /// MySQL side of the declared sources of a run (ENT-116).
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct MysqlSources {
     pub profiles: BTreeMap<String, std::result::Result<MysqlProfile, &'static str>>,
     pub sources: BTreeMap<(String, String), (String, String)>,
@@ -440,8 +442,9 @@ pub(crate) struct Executor<'a> {
     /// Present only in mixed SQL + Python runs (AC002).
     pub(crate) datasets: Option<DatasetSource>,
     stack: Vec<String>,
-    /// Every invocation attempt received, including rejected ones.
-    attempts: usize,
+    /// Invocation attempts of the whole run, including rejected ones. Shared with the children of
+    /// a concurrent wave, so the per-run budget is not multiplied by the concurrency (ENT-120c).
+    attempts: Arc<AtomicUsize>,
     /// Run that owns this executor; nested `env.run` results report it (ENT-040).
     run_id: String,
     /// Session of the run when it is already known (explicit session); `None` otherwise.
@@ -451,6 +454,55 @@ pub(crate) struct Executor<'a> {
     /// PostgreSQL side of the run, for SQL models run by nested `env.run` (ENT-114). Set by the
     /// run that owns the executor.
     pub(crate) sql: Option<SqlExecution>,
+}
+
+/// Shareable part of an [`Executor`], from which the children of a concurrent wave are built
+/// (ENT-120c). Each child has its own call stack, invocation records, write session and SQL and
+/// dataset connections; the invocation budget is shared with the run.
+#[derive(Clone)]
+pub(crate) struct ChildTemplate<'a> {
+    root: &'a Path,
+    models_dir: &'a Path,
+    interpreter: &'a Path,
+    timeout: Duration,
+    max_call_depth: usize,
+    max_invocations: usize,
+    configuration: &'a Value,
+    store: &'a SessionStore,
+    cancel: CancellationToken,
+    run_id: String,
+    session_id: Option<String>,
+    attempts: Arc<AtomicUsize>,
+}
+
+impl<'a> ChildTemplate<'a> {
+    /// A child executor for one node of a wave. `sql` and `datasets` are the node's own
+    /// connections; they are never shared with siblings.
+    pub(crate) fn child(
+        &self,
+        sql: Option<SqlExecution>,
+        datasets: Option<DatasetSource>,
+    ) -> Executor<'a> {
+        Executor {
+            root: self.root,
+            models_dir: self.models_dir,
+            interpreter: self.interpreter,
+            timeout: self.timeout,
+            max_call_depth: self.max_call_depth,
+            max_invocations: self.max_invocations,
+            configuration: self.configuration,
+            store: self.store,
+            cancel: self.cancel.clone(),
+            invocations: Vec::new(),
+            datasets,
+            stack: Vec::new(),
+            attempts: Arc::clone(&self.attempts),
+            run_id: self.run_id.clone(),
+            session_id: self.session_id.clone(),
+            writer: None,
+            sql,
+        }
+    }
 }
 
 /// Interpreter and per-worker timeout used by every Python model of a run.
@@ -495,12 +547,31 @@ impl<'a> Executor<'a> {
             invocations: Vec::new(),
             datasets: None,
             stack: Vec::new(),
-            attempts: 0,
+            attempts: Arc::new(AtomicUsize::new(0)),
             run_id: identity.run_id,
             session_id: identity.session_id,
             writer: None,
             sql: None,
         })
+    }
+
+    /// What a child executor of a concurrent wave inherits from this one (ENT-120c). It holds
+    /// only shareable values, so a wave's threads can build their children from it.
+    pub(crate) fn child_template(&self) -> ChildTemplate<'a> {
+        ChildTemplate {
+            root: self.root,
+            models_dir: self.models_dir,
+            interpreter: self.interpreter,
+            timeout: self.timeout,
+            max_call_depth: self.max_call_depth,
+            max_invocations: self.max_invocations,
+            configuration: self.configuration,
+            store: self.store,
+            cancel: self.cancel.clone(),
+            run_id: self.run_id.clone(),
+            session_id: self.session_id.clone(),
+            attempts: Arc::clone(&self.attempts),
+        }
     }
 
     /// Execute a node of the static plan as a root-level invocation.
@@ -535,8 +606,8 @@ impl<'a> Executor<'a> {
     /// Count one invocation attempt; fail once the per-run budget is exceeded.
     /// Rejected attempts count too, so a model cannot probe for free.
     fn admit(&mut self) -> Result<()> {
-        self.attempts += 1;
-        if self.attempts > self.max_invocations {
+        let attempts = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+        if attempts > self.max_invocations {
             return Err(DowaiError::Execution(format!(
                 "Invocation limit reached: execution.max_invocations_per_run={}",
                 self.max_invocations
