@@ -30,12 +30,21 @@ impl Fixture {
         Self { root, project }
     }
 
+    /// Caminho de configuração do usuário conforme `user_config_path` (plataforma):
+    /// Windows usa `%APPDATA%\DOWAI\config.json`; Unix usa `$XDG_CONFIG_HOME/dowai/config.json`.
+    fn user_config_file(&self) -> PathBuf {
+        if cfg!(windows) {
+            self.root.join("config").join("DOWAI").join("config.json")
+        } else {
+            self.root.join("config").join("dowai").join("config.json")
+        }
+    }
+
     fn user_config(&self, value: &Value) {
-        fs::write(
-            self.root.join("config").join("dowai").join("config.json"),
-            serde_json::to_vec_pretty(value).expect("json"),
-        )
-        .expect("write user config");
+        let path = self.user_config_file();
+        fs::create_dir_all(path.parent().expect("config parent")).expect("config dir");
+        fs::write(path, serde_json::to_vec_pretty(value).expect("json"))
+            .expect("write user config");
     }
 
     fn show(&self) -> std::process::Output {
@@ -43,6 +52,7 @@ impl Fixture {
             .args(["config", "show", "--effective", "--json", "--project-dir"])
             .arg(&self.project)
             .env("XDG_CONFIG_HOME", self.root.join("config"))
+            .env("APPDATA", self.root.join("config"))
             .output()
             .expect("run dowai config show")
     }
