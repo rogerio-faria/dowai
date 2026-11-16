@@ -53,17 +53,24 @@ impl Sandbox {
         let payload: Value = serde_json::from_slice(&init.stdout).expect("init JSON");
         let project = PathBuf::from(payload["project_dir"].as_str().expect("project_dir"));
         let venv = project.join(".venv");
-        let created = Command::new("python3")
+        let system_python = if cfg!(windows) { "python" } else { "python3" };
+        let created = Command::new(system_python)
             .args(["-m", "venv", "--without-pip"])
             .arg(&venv)
             .output()
-            .expect("python3");
+            .expect("system python");
         assert!(created.status.success(), "create venv");
+        // Layout do venv: `Scripts\python.exe` no Windows; `bin/python` em Unix.
+        let venv_python = if cfg!(windows) {
+            venv.join("Scripts").join("python.exe")
+        } else {
+            venv.join("bin").join("python")
+        };
         let file = project.join("dowai_project.json");
         let mut manifest: Value =
             serde_json::from_slice(&fs::read(&file).expect("read")).expect("project manifest JSON");
         manifest["python"] = json!({
-            "interpreter": venv.join("bin").join("python"),
+            "interpreter": venv_python,
             "timeout_seconds": 30
         });
         fs::write(&file, manifest.to_string()).expect("write manifest");
