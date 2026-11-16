@@ -359,6 +359,9 @@ fn input_must_be_a_json_object() {
     assert_eq!(fixture.counter(), "");
 }
 
+// Usa `std::os::unix::fs::symlink`; o caso de symlink é coberto em Unix. Restrito a
+// Unix porque a criação de symlink no Windows exige privilégio adicional (ENT-122).
+#[cfg(unix)]
 #[test]
 fn entrypoint_module_escaping_the_plugin_directory_is_refused_without_running() {
     let fixture = Fixture::new();

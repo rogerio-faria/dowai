@@ -64,6 +64,9 @@ fn init_refuses_filesystem_root() {
     assert_eq!(error.code(), "DOWAI_POLICY_PATH");
 }
 
+// Cria symlink com `std::os::unix`; em Windows exige privilégio de criação de
+// symlink e o caso já é coberto em Linux, por isso o teste é restrito a Unix (ENT-122).
+#[cfg(unix)]
 #[test]
 fn init_refuses_symlink_that_resolves_to_protected_location() {
     let scratch = ScratchDir::new();

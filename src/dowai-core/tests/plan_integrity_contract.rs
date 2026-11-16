@@ -3,7 +3,9 @@
 
 use dowai_core::{plan, verify_planned_model, ExecutionMode};
 use std::fs;
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 struct Sandbox(PathBuf);
@@ -36,6 +38,8 @@ impl Sandbox {
     }
 
     /// Diretório irmão do projeto: fora da raiz e do diretório de modelos.
+    /// Usado só por testes de symlink, restritos a Unix (ENT-122).
+    #[cfg(unix)]
     fn outside(&self) -> PathBuf {
         let dir = self.0.join("outside");
         fs::create_dir_all(&dir).expect("create external directory");
