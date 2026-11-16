@@ -23,7 +23,8 @@ UNKNOWN_RUN = "00000000-0000-4000-8000-000000000000"
 
 
 def _engine_binary():
-    candidate = os.environ.get("DOWAI_BIN") or str(REPOSITORY_ROOT / "target" / "debug" / "dowai")
+    name = "dowai.exe" if os.name == "nt" else "dowai"
+    candidate = os.environ.get("DOWAI_BIN") or str(REPOSITORY_ROOT / "target" / "debug" / name)
     return candidate if Path(candidate).is_file() else None
 
 

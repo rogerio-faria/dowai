@@ -14,8 +14,7 @@ sys.path.insert(0, str(SDK_ROOT / "src"))
 from dowai import DowaiClient, DowaiExecutionError  # noqa: E402
 
 # Prints one JSON object: the chosen payload plus the arguments it received.
-FAKE_ENGINE = """#!{python}
-import json, sys
+FAKE_ENGINE = """import json, sys
 arguments = sys.argv[1:]
 if arguments == ["--version"]:
     print("dowai {version}")
@@ -37,9 +36,23 @@ else:
 """
 
 
-def _write_engine(directory, version="0.1.0"):
-    engine = Path(directory) / "dowai"
-    engine.write_text(FAKE_ENGINE.format(python=sys.executable, version=version))
+def _write_engine(directory, version="0.1.0", source=None):
+    """Writes a fake `dowai` executable that runs `source` (default: FAKE_ENGINE) under Python.
+
+    POSIX: a `dowai` file with a shebang. Windows: a `dowai.cmd` wrapper, because a bare file
+    without extension is not found by `shutil.which` and cannot be started directly.
+    """
+    directory = Path(directory)
+    if source is None:
+        source = FAKE_ENGINE.format(version=version)
+    script = directory / "dowai_engine.py"
+    script.write_text(source)
+    if os.name == "nt":
+        engine = directory / "dowai.cmd"
+        engine.write_text(f'@"{sys.executable}" "{script}" %*\r\n')
+        return engine
+    engine = directory / "dowai"
+    engine.write_text(f"#!{sys.executable}\n" + source)
     engine.chmod(engine.stat().st_mode | stat.S_IXUSR)
     return engine
 
@@ -163,9 +176,7 @@ class EngineCompatibilityTests(unittest.TestCase):
         self.assertIn("0.1", str(context.exception))
 
     def test_unparseable_version_output_is_refused(self):
-        engine = Path(self._directory.name) / "dowai"
-        engine.write_text("#!/bin/sh\necho 'not a version'\n")
-        engine.chmod(0o755)
+        engine = _write_engine(self._directory.name, source="print('not a version')\n")
         with self.assertRaises(DowaiExecutionError) as context:
             DowaiClient(self._directory.name, binary=engine)
         self.assertEqual(context.exception.code, "DOWAI_VERSION_INCOMPATIBLE")
