@@ -94,6 +94,8 @@ pub struct PreparedNode {
     pub relation: String,
     pub materialization: Materialization,
     pub sql: String,
+    /// `run()` targets of the model, executed after its materialization (ENT-126).
+    pub post_run_targets: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -538,6 +540,54 @@ fn model_hash(root: &Path, node: &PlanNode) -> Option<String> {
 }
 
 /// Runs one Python node, emitting `node.started` / `node.finished` around it.
+/// Audits and runs one `run()` target of a SQL model (ENT-126), as `run_python_node` does for a
+/// plan node: a started and a finished audit event, with the failure when it failed.
+fn run_post_target(
+    executor: &mut executor::Executor<'_>,
+    audit: &mut Auditor,
+    target: &str,
+    origin: &str,
+    mode: ExecutionMode,
+    variables: BTreeMap<String, Value>,
+    root_invocation_id: &str,
+) -> Result<BTreeMap<String, Value>> {
+    let mut started_id: Option<String> = None;
+    let outcome = executor.run_post(
+        target,
+        origin,
+        mode,
+        variables,
+        root_invocation_id,
+        &mut |id| {
+            audit.node_started(id, target, None);
+            started_id = Some(id.to_owned());
+        },
+    );
+    let invocation_id = match started_id {
+        Some(id) => id,
+        None => {
+            let id = Uuid::new_v4().to_string();
+            audit.node_started(&id, target, None);
+            id
+        }
+    };
+    audit.node_finished(&invocation_id, target, outcome.as_ref().err());
+    outcome
+}
+
+/// Paths without an executor cannot run `run()` targets. Routing sends such runs to the executor
+/// path first, so this refusal is a defensive guard that must not be reached.
+fn refuse_post_run_outside_executor(prepared: &PreparedNode) -> Result<()> {
+    if prepared.post_run_targets.is_empty() {
+        Ok(())
+    } else {
+        Err(DowaiError::NotImplemented(format!(
+            "{}: run() requires the executor path",
+            prepared.id
+        )))
+    }
+}
+
 fn run_python_node(
     executor: &mut executor::Executor<'_>,
     audit: &mut Auditor,
@@ -782,6 +832,20 @@ fn execute_run(
         .filter(|node| is_python_path(&node.path))
         .count();
     let mixed = python_nodes > 0 && python_nodes < execution_plan.nodes.len();
+    // ENT-126: a SQL model with `run()` needs the executor (Python child with `origem`), so the
+    // run takes the executor path, in plan order (no waves). Detection reads the planned source.
+    let mut post_run = false;
+    for node in execution_plan
+        .nodes
+        .iter()
+        .filter(|node| !is_python_path(&node.path))
+    {
+        if dowai_core::declares_post_run(&verify_planned_model(&root, node)?) {
+            post_run = true;
+            break;
+        }
+    }
+    let uses_executor = mixed || post_run;
 
     enforce_external_write_policy(&configuration)?;
     let python_only = python_nodes == execution_plan.nodes.len();
@@ -1021,8 +1085,8 @@ fn execute_run(
     trace.audit.profile = Some(profile_name.clone());
     let template_options = template_options(&configuration)?;
 
-    if mixed {
-        // Mixed SQL + Python run. Nodes execute strictly in plan order; each one sees
+    if uses_executor {
+        // Mixed SQL + Python run, or a SQL run with `run()` (ENT-126). Nodes execute strictly in plan order; each one sees
         // the variables accumulated by the nodes before it (SQL `def_var`, Python
         // `env.setVar`). SQL is rendered lazily, right before its node runs, so it
         // observes variables set by earlier Python nodes.
@@ -1092,7 +1156,7 @@ fn execute_run(
             retry_policy,
             cancel.clone(),
         ));
-        let sequential = if matches!(mode, ExecutionMode::Automatic) {
+        let sequential = if matches!(mode, ExecutionMode::Automatic) && !post_run {
             // ENT-120c2 (ADR 0008): automatic mixed runs go wave by wave; SQL and Python nodes of
             // a wave run concurrently, each with its own connection or child executor.
             let wave_plan = waves::waves(&execution_plan.nodes)?;
@@ -1213,6 +1277,18 @@ fn execute_run(
                     }
                 };
                 variables = next_variables;
+                // ENT-126: `run()` targets execute after the materialization, in declared order.
+                for target in &prepared.post_run_targets {
+                    variables = run_post_target(
+                        &mut executor,
+                        &mut trace.audit,
+                        target,
+                        &prepared.relation,
+                        mode,
+                        std::mem::take(&mut variables),
+                        &run_invocation_id,
+                    )?;
+                }
                 Ok(RunNodeResult {
                     id: prepared.id,
                     relation: prepared.relation,
@@ -1493,6 +1569,7 @@ fn render_sql_waves(
                 relations,
                 store,
             )?;
+            refuse_post_run_outside_executor(&prepared)?;
             // A variable is written when the node changes or adds it (`def_var` only sets absent keys).
             let changed: BTreeMap<String, Value> = next
                 .into_iter()
@@ -2371,20 +2448,13 @@ fn render_sql_node(
                 DowaiError::Template(format!("{}: {}", node.path, error.message()))
             }
         })?;
-    // ENT-124 only parses `run()`; the deferred execution is ENT-126. Refuse before any SQL
-    // runs, so the call is never silently ignored.
-    if !rendered.post_run_targets.is_empty() {
-        return Err(DowaiError::NotImplemented(format!(
-            "{}: run() is parsed but its execution is not implemented yet (ENT-126)",
-            node.path
-        )));
-    }
     Ok((
         PreparedNode {
             id: node.id.clone(),
             relation: model_stem(&node.id)?,
             materialization: rendered.materialization,
             sql: rendered.sql,
+            post_run_targets: rendered.post_run_targets,
         },
         rendered.variables,
     ))

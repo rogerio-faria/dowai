@@ -406,6 +406,27 @@ pub fn render_sql_model(
     })
 }
 
+/// Whether a SQL model source contains a `{{ run(...) }}` macro anywhere, including inside
+/// conditional branches. Used to route a run to the executor path (ENT-126) before rendering.
+pub fn declares_post_run(source: &str) -> bool {
+    let mut position = 0;
+    while let Some(opening_offset) = source[position..].find("{{") {
+        let content_start = position + opening_offset + 2;
+        let Some(close_offset) = source[content_start..].find("}}") else {
+            return false;
+        };
+        let close = content_start + close_offset;
+        if matches!(
+            parse_static_macro(source[content_start..close].trim()),
+            Ok(StaticMacro::Run(_))
+        ) {
+            return true;
+        }
+        position = close + 2;
+    }
+    false
+}
+
 /// `run("x.py")` names a Python file inside the project: relative, without `..`, absolute
 /// prefixes, backslashes or empty segments, and with a `.py` extension. Symbolic links and
 /// existence are checked when the file is executed (ENT-126).

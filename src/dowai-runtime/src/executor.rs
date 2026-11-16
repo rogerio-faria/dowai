@@ -597,6 +597,41 @@ impl<'a> Executor<'a> {
                     variables,
                     invocation_id,
                     None,
+                    None,
+                )
+            },
+        )
+        .1
+    }
+
+    /// `{{ run("x.py") }}` (ENT-126): runs the Python file after its SQL model was materialized.
+    /// The file receives the model as `origem`; its call is journaled as an imperative call of
+    /// the SQL node, which is the parent. A failure fails the call, never the materialization.
+    pub(crate) fn run_post(
+        &mut self,
+        target: &str,
+        origin: &str,
+        mode: ExecutionMode,
+        variables: Variables,
+        parent_invocation_id: &str,
+        on_start: &mut dyn FnMut(&str),
+    ) -> Result<Variables> {
+        let depends_on = [origin.to_owned()];
+        self.record(
+            "imperative",
+            parent_invocation_id,
+            target,
+            mode,
+            |this, invocation_id| {
+                on_start(invocation_id);
+                this.execute_node(
+                    target,
+                    &depends_on,
+                    mode,
+                    variables,
+                    invocation_id,
+                    None,
+                    Some(origin),
                 )
             },
         )
@@ -676,6 +711,8 @@ impl<'a> Executor<'a> {
     }
 
     /// Run one Python model in a worker process, serving its nested calls.
+    // `origin` (ENT-126) makes eight arguments; the call sites read clearly by position.
+    #[allow(clippy::too_many_arguments)]
     fn execute_node(
         &mut self,
         model_id: &str,
@@ -684,6 +721,7 @@ impl<'a> Executor<'a> {
         variables: Variables,
         invocation_id: &str,
         parent_deadline: Option<Instant>,
+        origin: Option<&str>,
     ) -> Result<Variables> {
         self.cancel.check()?;
         if self.stack.iter().any(|entry| entry == model_id) {
@@ -721,8 +759,7 @@ impl<'a> Executor<'a> {
                 mode: mode.as_str(),
                 cancel: &cancel,
                 memory_bytes: limits.memory_bytes,
-                // ENT-126 passa o modelo SQL pai quando `run()` é executado.
-                origin: None,
+                origin,
             },
             &variables,
             &mut |request| self.handle_request(request, invocation_id, deadline, depends_on),
@@ -1188,9 +1225,10 @@ impl<'a> Executor<'a> {
                 variables,
                 invocation_id,
                 parent_deadline,
+                None,
             );
         }
-        self.execute_sql(node, relations, mode, &variables)
+        self.execute_sql(node, relations, mode, &variables, invocation_id)
     }
 
     /// Renders and materializes one SQL model with the run's PostgreSQL side. The variables it
@@ -1201,6 +1239,7 @@ impl<'a> Executor<'a> {
         relations: &BTreeMap<String, String>,
         mode: ExecutionMode,
         variables: &Variables,
+        invocation_id: &str,
     ) -> Result<Variables> {
         self.cancel.check()?;
         let sql = self.sql.as_mut().ok_or_else(|| {
@@ -1215,7 +1254,19 @@ impl<'a> Executor<'a> {
             self.store,
         )?;
         sql.materialize(node, mode, None, None, &prepared)?;
-        Ok(next_variables)
+        // ENT-126: `run()` targets execute only after the materialization succeeded.
+        let mut variables = next_variables;
+        for target in &prepared.post_run_targets {
+            variables = self.run_post(
+                target,
+                &prepared.relation,
+                mode,
+                variables,
+                invocation_id,
+                &mut |_| {},
+            )?;
+        }
+        Ok(variables)
     }
 }
 
