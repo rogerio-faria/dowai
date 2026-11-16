@@ -3,8 +3,10 @@
 
 use dowai_core::{
     create_project, current_time_ms, default_audit_log_path, default_run_store_path, AuditEvent,
-    AuditLog, LogPolicy, OperationalLog, RunStore,
+    AuditLog, RunStore,
 };
+#[cfg(unix)]
+use dowai_core::{LogPolicy, OperationalLog};
 use dowai_runtime::{run_postgres, RunRequest};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
