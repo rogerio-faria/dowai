@@ -1361,12 +1361,14 @@ pub(crate) fn execute_model(
         replies: write_sender,
         final_message: None,
         failed_calls: HashMap::new(),
+        failed_write: None,
     };
     let driven = supervision.drive(&mut child, on_request);
     let Supervision {
         replies,
         final_message,
         failed_calls,
+        failed_write,
         messages,
         ..
     } = supervision;
@@ -1427,10 +1429,17 @@ pub(crate) fn execute_model(
             // Only trust a code that matches the error the host produced for
             // the very call the model re-raised.
             let mut failed_calls = failed_calls;
+            let mut failed_write = failed_write;
             let trusted = match (response.code.as_deref(), response.invocation_id.as_deref()) {
                 (Some(code), Some(id)) => failed_calls
                     .remove(id)
                     .filter(|error| error.code() == code),
+                // ENT-127: a write the host refused, re-raised by the model with the same code.
+                // The host's own error is returned, so the cause (for example an undeclared
+                // profile) is reported instead of an opaque failure.
+                (Some(code), None) if failed_write.as_ref().is_some_and(|error| error.code() == code) => {
+                    failed_write.take()
+                }
                 // ENT-125: the worker's own contract check, raised before `model()` runs. It has
                 // no invocation id, so a model cannot forge it through a re-raised call.
                 (Some("DOWAI_MODEL_SIGNATURE_INVALID"), None) => Some(DowaiError::ModelContract(
@@ -1454,6 +1463,8 @@ struct Supervision {
     replies: SyncSender<Vec<u8>>,
     final_message: Option<WorkerMessage>,
     failed_calls: HashMap<String, DowaiError>,
+    /// The last write the host refused (ENT-127). Only a failure re-raised with its code is trusted.
+    failed_write: Option<DowaiError>,
 }
 
 impl Supervision {
@@ -1695,6 +1706,9 @@ impl Supervision {
                 }
                 bytes.push(b'\n');
                 self.replies.send(bytes).map_err(|_| protocol_error())?;
+                if let Err(error) = result {
+                    self.failed_write = Some(error);
+                }
                 Ok(())
             }
             "export" => {

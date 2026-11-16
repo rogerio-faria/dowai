@@ -1,0 +1,10 @@
+{
+  "schema_version": 2,
+  "name": "sql-run-post",
+  "models_dir": "models",
+  "config": {
+    "security": {
+      "allow_external_writes": true
+    }
+  }
+}

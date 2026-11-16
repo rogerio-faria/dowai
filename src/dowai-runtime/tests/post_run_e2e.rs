@@ -308,3 +308,51 @@ fn legacy_post_run_signature_is_refused_when_an_origin_is_passed() {
     assert_eq!(error.code(), "DOWAI_MODEL_SIGNATURE_INVALID");
     fixture.drop_table(&table);
 }
+
+/// ENT-127: the `examples/sql-run-post` model, as shipped, executed with its origin.
+#[test]
+#[ignore = "opt-in E2E; requires a dedicated disposable PostgreSQL database"]
+fn example_sql_run_post_hands_the_materialized_model_to_the_python_file() {
+    let fixture = Fixture::new("example");
+    let table = fixture.name("carga");
+    fixture.write_model(
+        &format!("{table}.sql"),
+        include_str!("../../../examples/sql-run-post/models/carga.sql"),
+    );
+    fixture.write_model(
+        "transforma.py",
+        include_str!("../../../examples/sql-run-post/models/transforma.py"),
+    );
+
+    let result = fixture
+        .run(&[&format!("{table}.sql")], Some(ExecutionMode::Automatic))
+        .expect("the shipped example should execute");
+
+    assert_eq!(result.status, "SUCCEEDED");
+    assert_eq!(fixture.table_rows(&table), vec![1, 2, 3]);
+    let variables = fixture.variables(&result.session_id);
+    assert_eq!(variables["origem_recebida"], json!(true));
+    assert_eq!(variables["linhas_origem"], json!(3));
+    fixture.drop_table(&table);
+}
+
+/// ENT-127: the same Python file run directly (`dowai run transforma.py`) receives `origem=None`
+/// and handles it without error.
+#[test]
+#[ignore = "opt-in E2E; requires a dedicated disposable PostgreSQL database"]
+fn example_python_treats_origem_none_when_run_directly() {
+    let fixture = Fixture::new("example_none");
+    fixture.write_model(
+        "transforma.py",
+        include_str!("../../../examples/sql-run-post/models/transforma.py"),
+    );
+
+    let result = fixture
+        .run(&["transforma.py"], Some(ExecutionMode::Automatic))
+        .expect("origem=None must be handled by the shipped example");
+
+    assert_eq!(result.status, "SUCCEEDED");
+    let variables = fixture.variables(&result.session_id);
+    assert_eq!(variables["origem_recebida"], json!(false));
+    assert_eq!(variables["linhas_origem"], json!(0));
+}

@@ -323,6 +323,13 @@ Unidades e limites aparecem na tabela. Limites mínimos e máximos são inclusiv
 | `database.max_transfer_bytes` | `1073741824` | inteiro 1–1099511627776 | bytes | não pode exceder o teto administrativo | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
 | `database.tls_required` | `true` | booleano | — | administrador `true` impõe `true` | validado; consumido por `render_template`, `render_sql_model` e preparação do run (ENT-021) |
 
+#### Destinos de `env.write` (ENT-127)
+
+- `env.write(..., target="NOME")` aceita somente perfis declarados em `workspace.json` (`profiles`) e permitidos pela política (`security.allowed_profiles`). O nome não declarado é recusado com `DOWAI_CONFIG_INVALID` (mensagem: `Unknown connection profile 'NOME'`) **antes de qualquer conexão**.
+- Tipos suportados hoje: `postgres` e `mysql`. Outros tipos dependem do mecanismo de adaptador (ENT-128), ainda sem driver instalado.
+- Os modos são fixos: `append`, `replace` (com `confirm_replace=True`) e `upsert` (com `keys`). A escolha do método correto, a ausência de duplicidade e as cláusulas de filtro são responsabilidade do usuário; o DOWAI garante perfil, schema, política e transação no destino.
+- `origem` pode ser `None` quando o modelo Python é executado diretamente; o arquivo deve tratar esse caso (ver `examples/sql-run-post`).
+
 ### `python`
 
 | Parâmetro | Default | Tipo e validação | Unidade | Teto administrativo | Estado |
