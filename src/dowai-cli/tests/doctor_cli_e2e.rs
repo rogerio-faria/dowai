@@ -125,7 +125,10 @@ fn check_connections_without_declared_profile_reports_not_declared() {
 fn interpreter_outside_project_is_a_coded_diagnostic() {
     let sandbox = Sandbox::new();
     let project = sandbox.project();
-    sandbox.declare_interpreter(&project, Path::new("/usr/bin/python3"));
+    // Caminho absoluto existente e fora do projeto em qualquer plataforma
+    // (`/usr/bin/python3` não é absoluto no Windows e invalidaria o projeto antes da checagem).
+    let outside = std::env::current_exe().expect("current exe");
+    sandbox.declare_interpreter(&project, &outside);
 
     let output = sandbox.cli_in(&project, &["doctor", "--json"]);
     assert_eq!(output.status.code(), Some(2));
