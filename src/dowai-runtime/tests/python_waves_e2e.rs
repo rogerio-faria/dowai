@@ -12,11 +12,17 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const SLEEP_SECONDS: f64 = 1.0;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Environment variables are process-wide, and the state directory of each fixture is chosen
+/// through them. Without this lock, parallel tests redirected each other's journal and
+/// corrupted it (ENT-121). Each fixture holds the lock for its whole lifetime.
+static ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
 
 struct EnvironmentRestore {
     name: &'static str,
@@ -43,11 +49,16 @@ impl Drop for EnvironmentRestore {
 struct Fixture {
     root: PathBuf,
     project: PathBuf,
+    // Fields drop in declaration order: the environment is restored before the lock is released.
     _env: Vec<EnvironmentRestore>,
+    _environment_lock: MutexGuard<'static, ()>,
 }
 
 impl Fixture {
     fn new() -> Self {
+        let environment_lock = ENVIRONMENT_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock is after Unix epoch")
@@ -94,6 +105,7 @@ impl Fixture {
             root,
             project,
             _env: env,
+            _environment_lock: environment_lock,
         }
     }
 

@@ -618,10 +618,20 @@ impl RunStore {
         let mut connection = Connection::open(&self.path).map_err(state_error)?;
         connection.busy_timeout(BUSY_TIMEOUT).map_err(state_error)?;
         connection
-            .execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")
+            .execute_batch("PRAGMA foreign_keys = ON;")
             .map_err(state_error)?;
-        if user_version(&connection)? == 0 {
-            connection.execute_batch(SCHEMA_V1).map_err(state_error)?;
+        enable_wal(&connection)?;
+        // The emptiness check and the initial schema share one IMMEDIATE transaction. Checking
+        // outside it let a second connection that read version 0 earlier rewind `user_version`
+        // to 1 after others had migrated it, and then replay the migrations (ENT-121).
+        {
+            let transaction = connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(state_error)?;
+            if user_version(&transaction)? == 0 {
+                transaction.execute_batch(SCHEMA_V1).map_err(state_error)?;
+            }
+            transaction.commit().map_err(state_error)?;
         }
         match user_version(&connection)? {
             1 => {
@@ -656,6 +666,28 @@ impl RunStore {
         }
         set_private_file_permissions(&self.path)?;
         Ok(connection)
+    }
+}
+
+/// Switching a new database to WAL needs a brief exclusive lock. SQLite returns BUSY for that
+/// step without calling the busy handler, so concurrent first opens retry it here until the
+/// same `BUSY_TIMEOUT` used elsewhere expires (ENT-121). Once the mode is set, it is persistent
+/// and later calls are no-ops.
+fn enable_wal(connection: &Connection) -> Result<()> {
+    let deadline = std::time::Instant::now() + BUSY_TIMEOUT;
+    loop {
+        match connection.query_row("PRAGMA journal_mode = WAL", [], |row| {
+            row.get::<_, String>(0)
+        }) {
+            Ok(_) => return Ok(()),
+            Err(rusqlite::Error::SqliteFailure(failure, _))
+                if failure.code == rusqlite::ErrorCode::DatabaseBusy
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(error) => return Err(state_error(error)),
+        }
     }
 }
 
@@ -879,7 +911,6 @@ const RUN_COLUMNS: &str = "run_id, session_id, project, status, execution_mode, 
                            finished_at, duration_ms, error_code";
 
 pub(crate) const SCHEMA_V1: &str = "
-BEGIN IMMEDIATE;
 CREATE TABLE IF NOT EXISTS runs (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id TEXT NOT NULL UNIQUE,
@@ -910,8 +941,7 @@ CREATE TABLE IF NOT EXISTS invocations (
   UNIQUE (run_id, invocation_id)
 );
 CREATE INDEX IF NOT EXISTS invocations_run ON invocations(run_id, seq);
-PRAGMA user_version = 1;
-COMMIT;";
+PRAGMA user_version = 1;";
 
 fn read_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunSummary> {
     Ok(RunSummary {
@@ -1808,5 +1838,33 @@ mod recovery_tests {
             .begin_run(&start(&Uuid::new_v4().to_string(), 1, None))
             .expect("begin after migration");
         drop(lease);
+    }
+
+    #[test]
+    fn concurrent_first_open_creates_the_journal_once_and_never_replays_a_migration() {
+        // ENT-121: connections that all read an empty journal at the same time must not
+        // rewind `user_version` and replay a migration (`duplicate column name`).
+        for round in 0..25 {
+            let fixture = Fixture::new();
+            let path = fixture.dir.join("state/runs.sqlite3");
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let path = path.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        RunStore::new(path).schema_version()
+                    })
+                })
+                .collect();
+            for handle in handles {
+                let version = handle
+                    .join()
+                    .expect("thread finished")
+                    .unwrap_or_else(|error| panic!("round {round}: {error:?}"));
+                assert_eq!(version, RUN_SCHEMA_VERSION, "round {round}");
+            }
+        }
     }
 }
