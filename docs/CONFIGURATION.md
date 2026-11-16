@@ -326,9 +326,39 @@ Unidades e limites aparecem na tabela. Limites mínimos e máximos são inclusiv
 #### Destinos de `env.write` (ENT-127)
 
 - `env.write(..., target="NOME")` aceita somente perfis declarados em `workspace.json` (`profiles`) e permitidos pela política (`security.allowed_profiles`). O nome não declarado é recusado com `DOWAI_CONFIG_INVALID` (mensagem: `Unknown connection profile 'NOME'`) **antes de qualquer conexão**.
-- Tipos suportados hoje: `postgres` e `mysql`. Outros tipos dependem do mecanismo de adaptador (ENT-128), ainda sem driver instalado.
+- Tipos suportados: `postgres`, `mysql` e `external` (driver Python, ENT-128).
 - Os modos são fixos: `append`, `replace` (com `confirm_replace=True`) e `upsert` (com `keys`). A escolha do método correto, a ausência de duplicidade e as cláusulas de filtro são responsabilidade do usuário; o DOWAI garante perfil, schema, política e transação no destino.
 - `origem` pode ser `None` quando o modelo Python é executado diretamente; o arquivo deve tratar esse caso (ver `examples/sql-run-post`).
+
+#### Perfil `external`: destino com driver Python (ENT-128)
+
+Destinos sem adaptador embutido usam um driver Python escolhido por configuração, sem recompilar o DOWAI. Exemplo em `workspace.json`:
+
+```json
+"profiles": {
+  "sqlserver_dw": {
+    "type": "external",
+    "driver": "sqlserver/driver.py",
+    "params": { "schema": "dw", "batch_size": 500 },
+    "env": ["SQLSERVER_TOKEN"]
+  }
+}
+```
+
+- `driver`: arquivo `.py` relativo a `<projeto>/drivers/`. Sem `..`, barra invertida, caminho absoluto ou link simbólico. Erro: `DOWAI_WRITE_DRIVER_INVALID`.
+- `params`: objeto de parâmetros não secretos. Segredo literal é recusado com `DOWAI_CONFIG_INVALID`; use variável de ambiente.
+- `env`: nomes de variáveis de ambiente que o driver recebe. Só os nomes ficam na configuração; a ausência de uma variável declarada é recusada antes de qualquer linha.
+
+Interface do módulo (funções de nível de módulo; todas obrigatórias, ausência gera `DOWAI_WRITE_DRIVER_INVALID`):
+
+| Função | Contrato |
+|---|---|
+| `open(params, table, columns, mode, keys, confirm_replace)` | Prepara uma sessão de escrita. |
+| `write_batch(rows) -> int` | Grava um lote de mapeamentos com exatamente as colunas declaradas. Retorna a quantidade. |
+| `commit() -> dict` | Torna a sessão durável e devolve os contadores em um dicionário compatível com JSON. |
+| `abort()` | Descarta a sessão. |
+
+O driver roda em processo supervisionado, com o interpretador do projeto em modo isolado. Ele deve desfazer a escrita se o processo encerrar sem `commit`, porque o runtime encerra o processo após qualquer falha. Erros do driver com código `DOWAI_*` são reportados com esse código; demais erros viram `DOWAI_WRITE_DRIVER_FAILED` com mensagem sanitizada. Saída do driver em `stdout` é desviada para `stderr`. Não há isolamento de rede nem de arquivos do driver (mesma limitação de §2 de `docs/SECURITY.md`).
 
 ### `python`
 

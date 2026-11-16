@@ -19,13 +19,28 @@ pub enum ProfileTlsMode {
 pub struct WorkspaceProfile {
     #[serde(rename = "type")]
     pub profile_type: String,
+    // SQL profiles (`postgres`, `mysql`) require these; an `external` profile leaves them empty.
+    #[serde(default)]
     pub host: String,
+    #[serde(default)]
     pub port: u16,
+    #[serde(default)]
     pub user: String,
+    #[serde(default)]
     pub database: String,
+    #[serde(default)]
     pub password_env: String,
     #[serde(default)]
     pub tls: ProfileTlsMode,
+    /// `external` profiles (ENT-128): driver file under `drivers/` (relative, `.py`).
+    #[serde(default)]
+    pub driver: Option<String>,
+    /// Non-secret parameters passed to the driver. Literal secrets are refused.
+    #[serde(default)]
+    pub params: Option<Value>,
+    /// Environment variables the driver receives. Only their names are configured.
+    #[serde(default)]
+    pub env: Vec<String>,
 }
 
 pub fn load_workspace_profile(project_dir: &Path, profile_name: &str) -> Result<WorkspaceProfile> {
@@ -63,14 +78,21 @@ fn parse_workspace_profile(
     let profile: WorkspaceProfile = serde_json::from_value(value.clone()).map_err(|error| {
         config_error(path, &format!("Invalid profile '{profile_name}': {error}"))
     })?;
-    if !matches!(profile.profile_type.as_str(), "postgres" | "mysql") {
-        return Err(config_error(
-            path,
-            &format!(
-                "Unsupported connection profile type '{}' for '{profile_name}'",
-                profile.profile_type
-            ),
-        ));
+    match profile.profile_type.as_str() {
+        "postgres" | "mysql" => {}
+        "external" => {
+            validate_external_profile(path, profile_name, &profile)?;
+            return Ok(profile);
+        }
+        _ => {
+            return Err(config_error(
+                path,
+                &format!(
+                    "Unsupported connection profile type '{}' for '{profile_name}'",
+                    profile.profile_type
+                ),
+            ));
+        }
     }
     if profile.host.trim().is_empty()
         || profile
@@ -90,6 +112,55 @@ fn parse_workspace_profile(
         ));
     }
     Ok(profile)
+}
+
+/// Validates an `external` profile (ENT-128). The driver is a Python file under `drivers/` of the
+/// project, given as a relative path without `..`, backslashes, drive prefixes or control
+/// characters. `params` must be an object without literal secrets, and `env` lists variable names.
+fn validate_external_profile(
+    path: &Path,
+    profile_name: &str,
+    profile: &WorkspaceProfile,
+) -> Result<()> {
+    let invalid = |detail: &str| {
+        config_error(
+            path,
+            &format!("External profile '{profile_name}' is invalid: {detail}"),
+        )
+    };
+    let driver = profile
+        .driver
+        .as_deref()
+        .ok_or_else(|| invalid("driver is required"))?;
+    let segments_are_valid = driver
+        .split('/')
+        .all(|segment| !segment.is_empty() && segment != "..");
+    if driver.is_empty()
+        || driver.starts_with('/')
+        || driver.contains(['\\', ':'])
+        || driver.chars().any(char::is_control)
+        || !segments_are_valid
+        || !driver.ends_with(".py")
+    {
+        return Err(invalid(
+            "driver must be a relative .py path inside drivers/ without '..'",
+        ));
+    }
+    if let Some(params) = &profile.params {
+        if !params.is_object() {
+            return Err(invalid("params must be an object"));
+        }
+        reject_secret_literals(params, "")
+            .map_err(|_| invalid("params contain a literal secret; use a *_env reference"))?;
+    }
+    if profile
+        .env
+        .iter()
+        .any(|name| !valid_environment_variable_name(name))
+    {
+        return Err(invalid("env must list valid environment variable names"));
+    }
+    Ok(())
 }
 
 fn read_workspace_document(path: &Path) -> Result<Value> {

@@ -4,7 +4,7 @@
 //! invocation history linked by `parent_invocation_id`.
 
 use crate::dataset_query::{self, FilterRequest};
-use crate::external_write::{ExternalWrite, WriteRequest};
+use crate::external_write::WriteRequest;
 use crate::python_runtime::{
     self, CallDetails, ChildCall, ChildOutcome, DatasetAnswer, DatasetColumn, HostReply,
     HostRequest, ModelInvocation,
@@ -450,7 +450,7 @@ pub(crate) struct Executor<'a> {
     /// Session of the run when it is already known (explicit session); `None` otherwise.
     session_id: Option<String>,
     /// Open `env.write` session (ENT-048). At most one; it belongs to the model that opened it.
-    writer: Option<ExternalWrite>,
+    writer: Option<crate::external_write::WriteSession>,
     /// PostgreSQL side of the run, for SQL models run by nested `env.run` (ENT-114). Set by the
     /// run that owns the executor.
     pub(crate) sql: Option<SqlExecution>,
@@ -840,11 +840,15 @@ impl<'a> Executor<'a> {
                     });
                 }
                 let depth = self.stack.len();
-                self.writer = Some(ExternalWrite::open(
+                self.writer = Some(crate::external_write::WriteSession::open(
                     self.root,
                     self.configuration,
                     request,
                     depth,
+                    WorkerSettings {
+                        interpreter: self.interpreter,
+                        timeout: self.timeout,
+                    },
                 )?);
                 Ok(json!({ "state": "open" }))
             }

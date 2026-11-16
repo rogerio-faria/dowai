@@ -26,6 +26,7 @@ mod auditor;
 pub mod benchmark;
 mod dataset_query;
 mod executor;
+mod external_driver;
 mod external_write;
 mod plugin_exec;
 mod python_runtime;
@@ -2581,6 +2582,10 @@ fn enforce_profile_policy(
         profile_name,
         "connection profile",
     )?;
+    // An external profile has no host of its own; its driver decides the destination.
+    if profile.profile_type == "external" {
+        return Ok(());
+    }
     enforce_allowlist(
         configuration,
         "allowed_hosts",
@@ -3401,6 +3406,9 @@ mod tests {
             database: "analytics".to_owned(),
             password_env: "DOWAI_PG_PASSWORD".to_owned(),
             tls: ProfileTlsMode::Required,
+            driver: None,
+            params: None,
+            env: Vec::new(),
         };
         assert!(super::enforce_profile_policy(&configuration, "approved", &approved).is_ok());
         assert_eq!(
@@ -3441,6 +3449,9 @@ mod tests {
             database: "analytics".to_owned(),
             password_env: "DOWAI_PG_PASSWORD".to_owned(),
             tls: ProfileTlsMode::Required,
+            driver: None,
+            params: None,
+            env: Vec::new(),
         };
 
         assert_eq!(
@@ -3485,6 +3496,9 @@ mod tests {
             database: "analytics".to_owned(),
             password_env: "DOWAI_ENT030_UNIT_PASSWORD".to_owned(),
             tls: dowai_core::ProfileTlsMode::Required,
+            driver: None,
+            params: None,
+            env: Vec::new(),
         };
         let configuration = serde_json::json!({
             "effective": {

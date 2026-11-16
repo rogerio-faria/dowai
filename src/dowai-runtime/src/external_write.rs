@@ -55,7 +55,7 @@ pub(crate) struct WriteRequest {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WriteMode {
+pub(crate) enum WriteMode {
     Append,
     Replace,
     Upsert,
@@ -71,7 +71,7 @@ impl WriteMode {
         }
     }
 
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Append => "append",
             Self::Replace => "replace",
@@ -136,6 +136,60 @@ fn validate_names(names: &[String], label: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validated parts of a `write` request (ENT-128): shared by the SQL and the driver sessions.
+pub(crate) struct Validated {
+    pub table: String,
+    pub mode: WriteMode,
+    pub columns: Vec<String>,
+    pub keys: Vec<String>,
+}
+
+/// Generic checks of a `write` request, independent of the destination kind.
+pub(crate) fn validate_write_request(request: &WriteRequest) -> Result<Validated> {
+    let table = request
+        .table
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| invalid("table must be a non-empty name"))?;
+    let mode = WriteMode::parse(request.mode.as_deref().unwrap_or("append"))?;
+    let columns = request
+        .columns
+        .clone()
+        .ok_or_else(|| invalid("columns are required"))?;
+    validate_names(&columns, "columns")?;
+    let keys = request.keys.clone().unwrap_or_default();
+    match mode {
+        WriteMode::Upsert => {
+            if keys.is_empty() {
+                return Err(precondition("upsert requires keys"));
+            }
+            validate_names(&keys, "keys")?;
+            if keys.iter().any(|key| !columns.contains(key)) {
+                return Err(invalid("keys must be written columns"));
+            }
+        }
+        WriteMode::Append | WriteMode::Replace => {
+            if !keys.is_empty() {
+                return Err(invalid("keys are only accepted by upsert"));
+            }
+        }
+    }
+    if mode == WriteMode::Replace && !request.confirm_replace {
+        return Err(precondition(
+            "replace requires explicit confirmation (confirm_replace=True)",
+        ));
+    }
+    if mode != WriteMode::Replace && request.confirm_replace {
+        return Err(invalid("confirm_replace only applies to replace"));
+    }
+    Ok(Validated {
+        table,
+        mode,
+        columns,
+        keys,
+    })
+}
+
 impl ExternalWrite {
     /// Opens a session after authorization and destination checks. Any failure rolls back the
     /// transaction (dropping the connection also does).
@@ -151,42 +205,12 @@ impl ExternalWrite {
             .as_deref()
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| invalid("target must be a non-empty profile name"))?;
-        let table = request
-            .table
-            .clone()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| invalid("table must be a non-empty name"))?;
-        let mode = WriteMode::parse(request.mode.as_deref().unwrap_or("append"))?;
-        let columns = request
-            .columns
-            .clone()
-            .ok_or_else(|| invalid("columns are required"))?;
-        validate_names(&columns, "columns")?;
-        let keys = request.keys.clone().unwrap_or_default();
-        match mode {
-            WriteMode::Upsert => {
-                if keys.is_empty() {
-                    return Err(precondition("upsert requires keys"));
-                }
-                validate_names(&keys, "keys")?;
-                if keys.iter().any(|key| !columns.contains(key)) {
-                    return Err(invalid("keys must be written columns"));
-                }
-            }
-            WriteMode::Append | WriteMode::Replace => {
-                if !keys.is_empty() {
-                    return Err(invalid("keys are only accepted by upsert"));
-                }
-            }
-        }
-        if mode == WriteMode::Replace && !request.confirm_replace {
-            return Err(precondition(
-                "replace requires explicit confirmation (confirm_replace=True)",
-            ));
-        }
-        if mode != WriteMode::Replace && request.confirm_replace {
-            return Err(invalid("confirm_replace only applies to replace"));
-        }
+        let Validated {
+            table,
+            mode,
+            columns,
+            keys,
+        } = validate_write_request(&request)?;
         let quoted_table = quote_identifier(&table).map_err(map_adapter)?;
 
         // Authorization of the destination profile: the same policy as every profile.
@@ -533,5 +557,73 @@ fn json_to_mysql(value: &Value) -> dowai_mysql::Value {
             .unwrap_or(dowai_mysql::Value::NULL),
         Value::String(text) => dowai_mysql::Value::Bytes(text.clone().into_bytes()),
         other => dowai_mysql::Value::Bytes(other.to_string().into_bytes()),
+    }
+}
+
+/// One `env.write` session, whatever its destination kind (ENT-128). A SQL profile keeps the
+/// built-in adapter path; an `external` profile runs through its Python driver.
+pub(crate) enum WriteSession {
+    Sql(ExternalWrite),
+    Driver(crate::external_driver::ExternalDriverSession),
+}
+
+impl WriteSession {
+    /// Authorizes the destination, then opens the session of its kind.
+    pub(crate) fn open(
+        root: &Path,
+        configuration: &Value,
+        request: WriteRequest,
+        depth: usize,
+        worker: crate::executor::WorkerSettings<'_>,
+    ) -> Result<Self> {
+        enforce_external_write_policy(configuration)?;
+        let target = request
+            .target
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| invalid("target must be a non-empty profile name"))?
+            .to_owned();
+        let (_, profile) = resolve_profile(root, configuration, Some(&target))?;
+        if profile.profile_type == "external" {
+            return Ok(Self::Driver(
+                crate::external_driver::ExternalDriverSession::open(
+                    root, &profile, &request, depth, worker,
+                )?,
+            ));
+        }
+        Ok(Self::Sql(ExternalWrite::open(
+            root,
+            configuration,
+            request,
+            depth,
+        )?))
+    }
+
+    pub(crate) fn depth(&self) -> usize {
+        match self {
+            Self::Sql(session) => session.depth(),
+            Self::Driver(session) => session.depth(),
+        }
+    }
+
+    pub(crate) fn stage_rows(&mut self, rows: &[Value]) -> Result<u64> {
+        match self {
+            Self::Sql(session) => session.stage_rows(rows),
+            Self::Driver(session) => session.stage_rows(rows),
+        }
+    }
+
+    pub(crate) fn commit(self) -> Result<Value> {
+        match self {
+            Self::Sql(session) => session.commit(),
+            Self::Driver(session) => session.commit(),
+        }
+    }
+
+    pub(crate) fn abort(self) {
+        match self {
+            Self::Sql(session) => session.abort(),
+            Self::Driver(session) => session.abort(),
+        }
     }
 }
