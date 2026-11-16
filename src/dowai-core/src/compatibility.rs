@@ -317,6 +317,7 @@ fn classify_expression(content: &str) -> Classification {
     if has_call {
         return match name {
             "ref" | "source" => supported(name),
+            "run" => supported("run (extensão DOWAI, ENT-124)"),
             "config" => classify_config(trimmed),
             "var" => unsupported(
                 "DOWAI_COMPAT_EXPRESSION_UNSUPPORTED",

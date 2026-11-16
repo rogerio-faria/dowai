@@ -44,6 +44,9 @@ pub struct RenderedSqlModel {
     pub sql: String,
     pub variables: BTreeMap<String, Value>,
     pub materialization: Materialization,
+    /// Python files named by `{{ run("arq.py") }}` at the end of the model (ENT-124), in order.
+    /// They are executed only after the SQL is materialized (ENT-126); rendering runs nothing.
+    pub post_run_targets: Vec<String>,
 }
 
 /// Render the supported conditional SQL template subset without evaluating SQL values.
@@ -200,7 +203,7 @@ fn push_text(tokens: &mut Vec<Token>, text: &str) {
 }
 
 fn is_reference_call(expression: &str) -> bool {
-    ["ref(", "source(", "config("]
+    ["ref(", "source(", "config(", "run("]
         .iter()
         .any(|prefix| expression.starts_with(prefix))
 }
@@ -213,12 +216,13 @@ enum StaticMacro {
     Ref(String),
     Source(String, String),
     Config(BTreeMap<String, Value>),
+    Run(String),
 }
 
 fn parse_static_macro(expression: &str) -> Result<StaticMacro> {
     let mut cursor = Cursor::new(expression);
     let name = cursor.parse_name()?;
-    if !matches!(name.as_str(), "ref" | "source" | "config") {
+    if !matches!(name.as_str(), "ref" | "source" | "config" | "run") {
         return Err(template_error("unsupported static SQL macro"));
     }
     cursor.expect_char('(')?;
@@ -281,6 +285,11 @@ fn parse_static_macro(expression: &str) -> Result<StaticMacro> {
             Ok(StaticMacro::Source(source.to_owned(), table.to_owned()))
         }
         "config" if positional.is_empty() && !named.is_empty() => Ok(StaticMacro::Config(named)),
+        "run" if positional.len() == 1 && named.is_empty() => positional[0]
+            .as_str()
+            .map(|path| StaticMacro::Run(path.to_owned()))
+            .ok_or_else(|| template_error("run() requires one string literal")),
+        "run" => Err(template_error("run() requires exactly one string literal")),
         "ref" => Err(template_error("ref() requires exactly one string literal")),
         "source" => Err(template_error(
             "source() requires exactly two string literals",
@@ -310,15 +319,32 @@ pub fn render_sql_model(
     let mut position = 0;
     let mut materialization = Materialization::Table;
     let mut configured_materialization = false;
+    let mut post_run_targets: Vec<String> = Vec::new();
     while let Some(opening_offset) = rendered.sql[position..].find("{{") {
         let opening = position + opening_offset;
-        sql.push_str(&rendered.sql[position..opening]);
+        let segment = &rendered.sql[position..opening];
+        if !post_run_targets.is_empty() && !segment.trim().is_empty() {
+            return Err(template_error(
+                "run() must be placed at the end of the SQL model, after all SQL",
+            ));
+        }
+        sql.push_str(segment);
         let content_start = opening + 2;
         let close_offset = rendered.sql[content_start..]
             .find("}}")
             .ok_or_else(|| template_error("static SQL macro is missing '}}'"))?;
         let close = content_start + close_offset;
-        match parse_static_macro(rendered.sql[content_start..close].trim())? {
+        let macro_call = parse_static_macro(rendered.sql[content_start..close].trim())?;
+        if !post_run_targets.is_empty() && !matches!(macro_call, StaticMacro::Run(_)) {
+            return Err(template_error(
+                "run() must be placed at the end of the SQL model, after all SQL",
+            ));
+        }
+        match macro_call {
+            StaticMacro::Run(path) => {
+                validate_run_target(&path)?;
+                post_run_targets.push(path);
+            }
             StaticMacro::Ref(reference) => {
                 let relation = relations.get(&reference).ok_or_else(|| {
                     template_error(format!("ref('{reference}') is not in the plan"))
@@ -365,12 +391,40 @@ pub fn render_sql_model(
         }
         position = close + 2;
     }
-    sql.push_str(&rendered.sql[position..]);
+    let tail = &rendered.sql[position..];
+    if !post_run_targets.is_empty() && !tail.trim().is_empty() {
+        return Err(template_error(
+            "run() must be placed at the end of the SQL model, after all SQL",
+        ));
+    }
+    sql.push_str(tail);
     Ok(RenderedSqlModel {
         sql,
         variables: rendered.variables,
         materialization,
+        post_run_targets,
     })
+}
+
+/// `run("x.py")` names a Python file inside the project: relative, without `..`, absolute
+/// prefixes, backslashes or empty segments, and with a `.py` extension. Symbolic links and
+/// existence are checked when the file is executed (ENT-126).
+fn validate_run_target(path: &str) -> Result<()> {
+    let invalid = path.is_empty()
+        || path.starts_with('/')
+        || path.chars().any(|character| character.is_control())
+        || path.contains('\\')
+        || path.contains(':')
+        || path
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "..")
+        || !path.ends_with(".py");
+    if invalid {
+        return Err(template_error(format!(
+            "run('{path}') must be a relative project path to a .py file without '..'"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_static_sources(
@@ -482,7 +536,7 @@ fn collect_static_references(
                         StaticMacro::Source(source, table) => {
                             references.push(StaticSqlReference::Source { source, table })
                         }
-                        StaticMacro::Config(_) => {}
+                        StaticMacro::Config(_) | StaticMacro::Run(_) => {}
                     }
                     position = close + 2;
                 }

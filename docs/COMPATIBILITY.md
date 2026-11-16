@@ -23,6 +23,7 @@ dowai compatibility check <project_path> [--json]
 | `source('fonte', 'tabela')` | SUPPORTED | — |
 | `config(materialized='table')` / `config(materialized='view')` | SUPPORTED | — |
 | `def_var` (extensão DOWAI) | SUPPORTED | — |
+| `run("arq.py")` (extensão DOWAI, ENT-124) | PARTIAL | Aceita somente no fim do arquivo SQL, após todo o SQL, com literal de caminho relativo `.py` (sem `..`, sem barra invertida, sem caractere de controle). Múltiplas chamadas executam em ordem. Renderização não executa nada. A execução pós-materialização ainda não existe (ENT-126): o runtime recusa o modelo com `DOWAI_NOT_IMPLEMENTED` antes de executar qualquer SQL. |
 | `{% if %}` / `{% elif %}` / `{% else %}` (subconjunto de `var()`) | PARTIAL | `DOWAI_COMPAT_CONDITIONAL_SUBSET` |
 | `config(materialized='incremental')` e demais materializações | UNSUPPORTED | `DOWAI_COMPAT_MATERIALIZATION_UNSUPPORTED` |
 | `config(...)` com chaves diferentes de `materialized` | UNSUPPORTED | `DOWAI_COMPAT_CONFIG_UNSUPPORTED` |

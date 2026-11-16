@@ -2371,6 +2371,14 @@ fn render_sql_node(
                 DowaiError::Template(format!("{}: {}", node.path, error.message()))
             }
         })?;
+    // ENT-124 only parses `run()`; the deferred execution is ENT-126. Refuse before any SQL
+    // runs, so the call is never silently ignored.
+    if !rendered.post_run_targets.is_empty() {
+        return Err(DowaiError::NotImplemented(format!(
+            "{}: run() is parsed but its execution is not implemented yet (ENT-126)",
+            node.path
+        )));
+    }
     Ok((
         PreparedNode {
             id: node.id.clone(),
