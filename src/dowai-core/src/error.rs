@@ -40,6 +40,8 @@ pub enum DowaiError {
     /// Model file changed between planning and execution (ENT-024).
     ModelChanged(String),
     Template(String),
+    /// `model()` does not match the `(env)` or `(env, origem)` contract (ENT-125).
+    ModelContract(String),
     Cycle(String),
     Session(String),
     /// Concurrent writes to the same session variable (AC040, `conflict_policy = "error"`).
@@ -101,6 +103,7 @@ impl DowaiError {
             Self::Model(_) => "DOWAI_PLAN_INVALID",
             Self::ModelChanged(_) => "DOWAI_PLAN_MODEL_CHANGED",
             Self::Template(_) => "DOWAI_TEMPLATE_INVALID",
+            Self::ModelContract(_) => "DOWAI_MODEL_SIGNATURE_INVALID",
             Self::Cycle(_) => "DOWAI_PLAN_CYCLE",
             Self::Session(_) => "DOWAI_SESSION_INVALID",
             Self::SessionConflict(_) => "DOWAI_SESSION_CONFLICT",
@@ -133,6 +136,7 @@ impl DowaiError {
             | Self::LegacyConfigFormat(_)
             | Self::Model(_)
             | Self::Template(_)
+            | Self::ModelContract(_)
             | Self::Cycle(_)
             | Self::Session(_)
             | Self::State(_)
@@ -170,6 +174,7 @@ impl DowaiError {
             | Self::Model(message)
             | Self::ModelChanged(message)
             | Self::Template(message)
+            | Self::ModelContract(message)
             | Self::Cycle(message)
             | Self::Session(message)
             | Self::SessionConflict(message)
@@ -251,6 +256,10 @@ mod tests {
             (DowaiError::Model(String::new()), exit_codes::INVALID_INPUT),
             (
                 DowaiError::Template(String::new()),
+                exit_codes::INVALID_INPUT,
+            ),
+            (
+                DowaiError::ModelContract(String::new()),
                 exit_codes::INVALID_INPUT,
             ),
             (DowaiError::Cycle(String::new()), exit_codes::INVALID_INPUT),

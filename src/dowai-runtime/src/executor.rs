@@ -721,6 +721,8 @@ impl<'a> Executor<'a> {
                 mode: mode.as_str(),
                 cancel: &cancel,
                 memory_bytes: limits.memory_bytes,
+                // ENT-126 passa o modelo SQL pai quando `run()` é executado.
+                origin: None,
             },
             &variables,
             &mut |request| self.handle_request(request, invocation_id, deadline, depends_on),

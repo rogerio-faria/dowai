@@ -65,6 +65,7 @@ import csv
 import datetime
 import decimal
 import importlib
+import inspect
 import itertools
 import json
 import math
@@ -129,6 +130,23 @@ class EngineResult:
     @property
     def failed(self):
         return self.status != "SUCCEEDED"
+
+def model_arity(function, error_class):
+    """ENT-125: 2 when `model` takes (env, origem), 1 when it takes (env) only."""
+    parameters = list(inspect.signature(function).parameters.values())
+    if any(parameter.kind is parameter.VAR_POSITIONAL for parameter in parameters):
+        return 2
+    positional = [
+        parameter
+        for parameter in parameters
+        if parameter.kind in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    required = [parameter for parameter in positional if parameter.default is parameter.empty]
+    if not positional or len(required) > 2:
+        raise error_class(
+            "DOWAI_MODEL_SIGNATURE_INVALID", "model() must accept (env) or (env, origem=None)"
+        )
+    return 2 if len(positional) >= 2 else 1
 
 def main():
     try:
@@ -974,6 +992,11 @@ def main():
     dependencies = set(request.get("dependencies", []))
     for dependency in list(dependencies):
         dependencies.add(pathlib.PurePath(dependency).stem)
+    origin_name = request.get("origin")
+    if origin_name is not None and (not isinstance(origin_name, str) or not origin_name.strip()):
+        raise RuntimeError("invalid origin")
+    if origin_name:
+        dependencies.add(origin_name)
     environment = Env(request["variables"], dependencies, mode)
     try:
         with contextlib.redirect_stdout(sys.stderr):
@@ -981,7 +1004,16 @@ def main():
             model = namespace.get("model")
             if not callable(model):
                 raise RuntimeError()
-            result = model(environment)
+            if model_arity(model, ExecutionError) == 2:
+                origin = environment.ref(origin_name) if origin_name else None
+                result = model(environment, origin)
+            elif origin_name:
+                raise ExecutionError(
+                    "DOWAI_MODEL_SIGNATURE_INVALID",
+                    "run() passes an origin, so model() must accept (env, origem)",
+                )
+            else:
+                result = model(environment)
     except NotImplementedError:
         respond({"protocol_version": 1, "kind": "unsupported"})
         return
@@ -1014,6 +1046,9 @@ struct WorkerRequest<'a> {
     variables: &'a BTreeMap<String, Value>,
     dependencies: &'a [String],
     mode: &'a str,
+    /// Parent SQL model whose materialized relation is passed as `origem` (ENT-125).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origin: Option<&'a str>,
 }
 
 #[derive(Deserialize)]
@@ -1223,6 +1258,8 @@ pub(crate) struct ModelInvocation<'a> {
     pub cancel: &'a CancellationToken,
     /// `RLIMIT_AS` do worker (ENT-038, D06); `None` quando o limite não se aplica.
     pub memory_bytes: Option<u64>,
+    /// Modelo SQL pai cujo resultado é a `origem` (ENT-125); `None` quando não há pai.
+    pub origin: Option<&'a str>,
 }
 
 type RequestHandler<'a> = dyn FnMut(HostRequest) -> HostReply + 'a;
@@ -1237,6 +1274,7 @@ pub(crate) fn execute_model(
         variables,
         dependencies: invocation.dependencies,
         mode: invocation.mode,
+        origin: invocation.origin,
     })
     .map_err(|_| protocol_error())?;
     if request.len() > MAX_IPC_BYTES {
@@ -1393,6 +1431,12 @@ pub(crate) fn execute_model(
                 (Some(code), Some(id)) => failed_calls
                     .remove(id)
                     .filter(|error| error.code() == code),
+                // ENT-125: the worker's own contract check, raised before `model()` runs. It has
+                // no invocation id, so a model cannot forge it through a re-raised call.
+                (Some("DOWAI_MODEL_SIGNATURE_INVALID"), None) => Some(DowaiError::ModelContract(
+                    "model() must accept (env) or (env, origem=None), matching run() arguments"
+                        .to_owned(),
+                )),
                 _ => None,
             };
             Err(trusted.unwrap_or_else(|| {
@@ -1966,6 +2010,94 @@ fn terminate_child(child: &mut Child) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Runs `source` as the model of a worker with `origin` (ENT-125) and returns its variables.
+    fn run_model_source(source: &str, origin: Option<&str>) -> Result<BTreeMap<String, Value>> {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock is after Unix epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "dowai-model-contract-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).expect("create model directory");
+        // The worker only runs inside a virtual environment (sys.prefix != sys.base_prefix).
+        let venv = directory.join("venv");
+        let created = Command::new("python3")
+            .args(["-m", "venv", "--without-pip"])
+            .arg(&venv)
+            .status()
+            .expect("python3 must be available to create the test venv");
+        assert!(created.success(), "test venv creation failed");
+        let interpreter = if cfg!(windows) {
+            venv.join("Scripts").join("python.exe")
+        } else {
+            venv.join("bin").join("python")
+        };
+        let model_path = directory.join("model.py");
+        std::fs::write(&model_path, source).expect("write model");
+        let cancel = CancellationToken::new();
+        let dependencies: Vec<String> = Vec::new();
+        let result = execute_model(
+            &ModelInvocation {
+                project_root: &directory,
+                interpreter: &interpreter,
+                deadline: Instant::now() + Duration::from_secs(60),
+                model_path: &model_path,
+                dependencies: &dependencies,
+                mode: "automatic",
+                cancel: &cancel,
+                memory_bytes: None,
+                origin,
+            },
+            &BTreeMap::new(),
+            &mut |_request| unreachable!("the contract tests do not request host data"),
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+        result
+    }
+
+    #[test]
+    fn model_with_one_parameter_runs_without_origin() {
+        let variables = run_model_source("def model(env):\n    env.setVar('ok', True)\n", None)
+            .expect("legacy signature should run");
+        assert_eq!(variables.get("ok"), Some(&Value::Bool(true)));
+    }
+
+    #[test]
+    fn model_with_origem_receives_none_when_not_called_from_a_sql_parent() {
+        let variables = run_model_source(
+            "def model(env, origem=None):\n    env.setVar('is_none', origem is None)\n",
+            None,
+        )
+        .expect("origem=None should be passed");
+        assert_eq!(variables.get("is_none"), Some(&Value::Bool(true)));
+    }
+
+    #[test]
+    fn model_with_origem_receives_a_lazy_dataset_when_origin_is_given() {
+        let variables = run_model_source(
+            "def model(env, origem=None):\n    env.setVar('is_none', origem is None)\n",
+            Some("arq"),
+        )
+        .expect("origem should be a dataset");
+        assert_eq!(variables.get("is_none"), Some(&Value::Bool(false)));
+    }
+
+    #[test]
+    fn legacy_model_refuses_an_origin_instead_of_ignoring_it() {
+        let error = run_model_source("def model(env):\n    pass\n", Some("arq"))
+            .expect_err("a model without origem must not silently drop the parent");
+        assert_eq!(error.code(), "DOWAI_MODEL_SIGNATURE_INVALID");
+    }
+
+    #[test]
+    fn model_with_too_many_required_parameters_is_refused() {
+        let error = run_model_source("def model(env, a, b):\n    pass\n", None)
+            .expect_err("three required parameters are not part of the contract");
+        assert_eq!(error.code(), "DOWAI_MODEL_SIGNATURE_INVALID");
+    }
 
     #[test]
     fn unsupported_python_package_features_fail_explicitly() {

@@ -132,6 +132,22 @@ resolved = client.plugin_resolve("namespace.method")
 
 ### 2.2 `Env` (SDK dentro de modelos Python)
 
+**Contrato da função `model` (ENT-125).** A função de entrada aceita uma das assinaturas:
+
+```python
+def model(env):                      # modelo sem origem (compatível com versões anteriores)
+    ...
+
+def model(env, origem=None):         # recebe o modelo SQL que chamou via run() (ENT-126)
+    if origem is None:               # obrigatório tratar None quando executado diretamente
+        ...
+    df = origem.to_pandas(max_rows=1000000)
+```
+
+- `origem` é um dataset lazy com o mesmo contrato de `env.ref(...)`. Quando não há modelo pai (`dowai run x.py`, ou `env.run("x.py")` sem origem), `origem` é `None`.
+- Passar uma origem a um modelo com assinatura `model(env)` falha com `DOWAI_MODEL_SIGNATURE_INVALID`, em vez de ignorar o pai silenciosamente. Assinaturas com mais de dois parâmetros obrigatórios também são recusadas com esse código, antes de qualquer efeito.
+- Nesta versão, o runtime ainda não passa origem a partir de `{{ run(...) }}` (ENT-126 pendente); o contrato do worker já está pronto.
+
 Disponível no modelo Python executado pelo runtime:
 
 | Método | Status |
