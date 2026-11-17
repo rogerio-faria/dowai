@@ -1,148 +1,252 @@
 # DOWAI
 
-O DOWAI executa pipelines de dados com modelos SQL e Python no mesmo grafo de dependências, contra PostgreSQL. Você escreve os modelos, a ferramenta descobre a ordem de execução, grava com segurança e registra tudo o que aconteceu.
+**Build data pipelines with SQL and Python in one dependency graph, running against PostgreSQL.**
+You write the models. DOWAI works out the execution order, writes safely, and records every run.
 
-## Modelos SQL
+- **One graph for SQL and Python.** `ref()`, `source()` and `env.depends_on()` define the order.
+  A Python model can read a SQL model's output, and a SQL model can hand its result to Python with `run()`.
+- **Safe by default.** External writes are off until you enable them. Replacing an existing table requires an explicit `--yes`.
+- **Shared session variables.** `setVar` and `getVar` pass values between models. They are published only when the whole run succeeds.
+- **Incremental loads.** A model declares its own watermark, which advances only after the write is committed.
+- **Recoverable runs.** Transient PostgreSQL errors are retried with backoff. `dowai retry` reruns only what failed.
+- **Auditable.** A local journal records each run and invocation with stable `DOWAI_*` error codes. Logs keep metadata and hashes, never variable values or SQL text.
 
-Um arquivo `.sql` por tabela ou view, dentro de `models/`. O nome do arquivo é o nome do modelo.
+## Quick start
 
-**1. `stg_pedidos.sql`: leitura da origem (tabela)**
+Requirements: a Rust toolchain to build, a PostgreSQL database, and Python 3 with `venv` for Python models.
 
-```sql
-{{ config(materialized='table') }}
-select id, cliente_id, valor, status
-from {{ source('landing', 'pedidos') }}
-where status <> 'cancelado'
+```bash
+cargo build --workspace
+export PATH="$PWD/target/debug:$PATH"
 ```
 
-**2. `faturamento_mensal.sql`: agregação sobre outro modelo (tabela)**
+A project looks like this:
 
-```sql
-{{ config(materialized='table') }}
-select cliente_id, sum(valor) as total, count(*) as pedidos
-from {{ ref('stg_pedidos') }}
-group by cliente_id
+```text
+sales/
+├── dowai_project.json        # project, sources, Python interpreter, policies
+├── workspace.json            # PostgreSQL profiles (passwords come from environment variables)
+├── models/
+│   ├── stg_orders.sql
+│   ├── customer_totals.sql
+│   ├── sales_by_region.sql
+│   ├── flag_regional_drops.py
+│   └── fetch_users.py
+└── .venv/                    # Python environment used by the models
 ```
 
-**3. `clientes_top.sql`: view sobre o resultado (view)**
-
-```sql
-{{ config(materialized='view') }}
-select cliente_id, total
-from {{ ref('faturamento_mensal') }}
-where total >= 1000
-```
-
-As origens (`source`) são declaradas uma vez, em `dowai_project.json`:
+`workspace.json` declares the connection. The password is read from the variable named in `password_env`, never from the file:
 
 ```json
-"sources": {
-  "landing": {
-    "schema": "landing",
-    "tables": { "pedidos": "pedidos" }
+{
+  "schema_version": 2,
+  "profiles": {
+    "warehouse": {
+      "type": "postgres",
+      "host": "localhost",
+      "port": 5432,
+      "user": "dowai",
+      "database": "analytics",
+      "password_env": "DOWAI_PG_PASSWORD",
+      "tls": "required"
+    }
+  },
+  "defaults": { "execution": { "default_profile": "warehouse" } }
+}
+```
+
+`dowai_project.json` declares the source tables, the Python interpreter and the write policy:
+
+```json
+{
+  "schema_version": 2,
+  "name": "sales",
+  "models_dir": "models",
+  "python": { "interpreter": "/absolute/path/to/sales/.venv/bin/python", "timeout_seconds": 60 },
+  "config": {
+    "security": { "allow_external_writes": true }
+  },
+  "sources": {
+    "landing": { "schema": "landing", "tables": { "orders": "orders" } }
   }
 }
 ```
 
-## Modelos Python
-
-Um arquivo `.py` com uma função `model(env)`. Ele pode ler modelos SQL do mesmo run, ler origens declaradas, gravar dados e guardar variáveis de sessão.
-
-**1. Gravar o resultado de um modelo SQL em outro destino**
-
-```python
-def model(env):
-    env.depends_on("faturamento_mensal")
-    linhas = [dict(r) for r in env.ref("faturamento_mensal").iter_rows(batch_size=500)]
-    env.write(linhas, target="warehouse", table="faturamento_exportado", mode="replace")
-    env.setVar("exportados", len(linhas))
-    return None
-```
-
-`mode="replace"` troca a tabela de destino e, por isso, exige `--yes` na execução.
-
-**2. Carga incremental com watermark declarado pelo próprio modelo**
-
-```python
-PEDIDOS = [
-    {"id": 1, "atualizado_em": 10, "status": "ok"},
-    {"id": 2, "atualizado_em": 20, "status": "ok"},
-]
-
-def model(env):
-    marca = env.getVar("pedidos_marca", 0)
-    novos = [p for p in PEDIDOS if p["atualizado_em"] > marca]
-    if novos:
-        env.write(novos, target="warehouse", table="pedidos_historico", mode="append")
-        env.setVar("pedidos_marca", max(p["atualizado_em"] for p in novos))
-    env.setVar("carregados_agora", len(novos))
-    return None
-```
-
-A marca só avança depois que a gravação é confirmada. Uma segunda execução na mesma sessão não carrega nada repetido.
-
-**3. Validação de qualidade antes de publicar**
-
-```python
-def model(env):
-    linhas = list(env.source("landing", "pedidos").iter_rows(batch_size=500))
-    invalidas = [r for r in linhas if r["valor"] is None or r["valor"] < 0]
-    env.setVar("linhas_invalidas", len(invalidas))
-    if invalidas:
-        raise ValueError(f"{len(invalidas)} pedidos com valor inválido; nada foi publicado")
-    env.write(linhas, target="warehouse", table="pedidos_validados", mode="append")
-    return None
-```
-
-Se a validação falhar, a execução termina com erro e a tabela de destino não recebe nenhuma linha.
-
-## Como executar
+Prepare the environment once. The interpreter path must be absolute and inside the project.
+DOWAI writes into tables that already exist; it does not create them.
 
 ```bash
-dowai validate . --json            # confere schema, referências, ciclos e origens
-dowai plan all --json              # mostra a ordem calculada
-dowai run all --yes --json         # executa; --yes confirma substituições
-dowai runs list                    # histórico local de execuções
-dowai retry <run_id> --failed-only --yes   # reexecuta só o que falhou
+python3 -m venv .venv
+export DOWAI_PG_PASSWORD='your-password'
 ```
 
-Configuração do projeto e do perfil do PostgreSQL: veja [docs/CONFIGURATION.md](docs/CONFIGURATION.md). A senha é lida de variável de ambiente e nunca fica em arquivo.
+```sql
+create table regional_drop_alerts (
+  region text not null, month date not null,
+  amount numeric(12,2) not null, trailing_average numeric(12,2) not null
+);
+create table api_users (
+  id int primary key, name text not null, email text not null,
+  city text not null, company text not null
+);
+```
 
-## Lacunas preenchidas em relação ao dbt
+## Examples
 
-| Necessidade | No dbt | No DOWAI |
-|---|---|---|
-| SQL e Python no mesmo pipeline | Modelos Python dependem da plataforma do warehouse | SQL e Python no mesmo grafo e na mesma sessão |
-| Variáveis entre modelos | Não há estado compartilhado nativo entre modelos | `setVar`/`getVar`, persistidas na sessão |
-| Proteção contra sobrescrita | Substituição é o padrão do `dbt run` | Escrita externa desligada por padrão; substituição exige `--yes` |
-| Carga incremental | Lógica `is_incremental()` no SQL | Watermark declarado pelo modelo, avançado só após commit |
-| Reconstrução completa | Recriação direta | `--full-refresh --yes` com staging e troca em uma transação; recusa se o schema divergir |
-| Falhas transitórias | `dbt retry` reexecuta nós que falharam | Retry com backoff e jitter em falhas transitórias do PostgreSQL, dentro da execução, e `dowai retry` por execução |
-| Auditoria | Logs de execução | Diário local com códigos `DOWAI_*` estáveis; guarda hashes, nunca valores |
-| Escrita direta em Python | Não controlada pelo framework | Política opcional que recusa drivers ou ORMs usados para gravar dados |
-| Credenciais em modelos | Variáveis de ambiente ou perfil | Modelo recebe um handle com nome e tipo, sem URL, usuário ou senha |
+### 1. SQL: a staging table from a source
 
-**Onde o dbt ainda está à frente:** ecossistema de pacotes, maturidade de testes e documentação, e suporte a vários warehouses. O DOWAI hoje executa modelos SQL somente em PostgreSQL.
+`models/stg_orders.sql`
 
-## Estado atual
+```sql
+{{ config(materialized='table') }}
+select id, customer_id, region, amount, sold_on
+from {{ source('landing', 'orders') }}
+where status = 'paid'
+```
 
-O DOWAI está em desenvolvimento. Implementado e verificado localmente: planejamento e validação offline, modelos SQL em PostgreSQL (tabelas e views), modelos Python em venv do projeto, variáveis de sessão, cargas incrementais, `--full-refresh`, retries, e o plugin `files` (CSV, JSON Lines e Parquet).
+`source()` points to a table declared once in `dowai_project.json`.
 
-Ainda não disponível: funções de IA, lineage OpenLineage, instaladores e pacotes de release. O plugin `sftp` não foi testado contra servidor real. O CI hospedado em Linux e Windows ainda não foi executado. Detalhes, limites e evidências: [docs/STATUS.md](docs/STATUS.md). Roteiro: [docs/ROADMAP.md](docs/ROADMAP.md).
+### 2. SQL: aggregate another model
 
-## Build
+`models/customer_totals.sql`
 
-Requisitos: toolchain Rust com Cargo.
+```sql
+{{ config(materialized='table') }}
+select customer_id, count(*) as orders, sum(amount) as total_amount
+from {{ ref('stg_orders') }}
+group by customer_id
+```
+
+`ref()` sets the order: DOWAI runs `stg_orders` first, without you listing it.
+
+### 3. SQL that calls Python: flag sudden regional drops
+
+`models/sales_by_region.sql`
+
+```sql
+{{ config(materialized='table') }}
+select region,
+       date_trunc('month', sold_on)::date as month,
+       sum(amount) as amount
+from {{ ref('stg_orders') }}
+group by region, date_trunc('month', sold_on)::date
+{{ run("flag_regional_drops.py") }}
+```
+
+`run()` goes at the end of the SQL file. After `sales_by_region` is materialized, DOWAI executes the Python model and passes the table to it as `origem`, a lazy dataset that is read in batches.
+
+`models/flag_regional_drops.py`
+
+```python
+from collections import defaultdict
+
+WINDOW = 3               # previous months used as the trailing average
+DROP_THRESHOLD = 0.70    # flag a month that falls below 70% of that average
+
+
+def model(env, origem=None):
+    if origem is None:  # run directly (dowai run flag_regional_drops.py): nothing to read
+        return None
+
+    series = defaultdict(list)
+    for batch in origem.iter_batches(500):
+        for row in batch:
+            series[row["region"]].append((row["month"], float(row["amount"])))
+
+    alerts = []
+    for region, points in series.items():
+        points.sort()
+        for i in range(WINDOW, len(points)):
+            month, amount = points[i]
+            history = [value for _, value in points[i - WINDOW:i]]
+            average = sum(history) / len(history)
+            if amount < DROP_THRESHOLD * average:
+                alerts.append({
+                    "region": region,
+                    "month": month,
+                    "amount": round(amount, 2),
+                    "trailing_average": round(average, 2),
+                })
+
+    # The write is skipped when nothing was flagged: env.write rejects an empty batch.
+    if alerts:
+        env.write(alerts, target="warehouse", table="regional_drop_alerts",
+                  mode="replace", confirm_replace=True)
+    env.setVar("drop_alerts", len(alerts))
+    return None
+```
+
+With sample orders where North's June sales fall to 40.00 against a trailing average of 106.67, the model writes one row to `regional_drop_alerts`: `north | 2026-06-01 | 40.00 | 106.67`.
+
+### 4. Python first: load a REST API into a table
+
+`models/fetch_users.py`
+
+```python
+import json
+import urllib.request
+
+USERS_URL = "https://jsonplaceholder.typicode.com/users"
+
+
+def model(env):
+    request = urllib.request.Request(USERS_URL, headers={"Accept": "application/json"})
+    with urllib.request.urlopen(request, timeout=15) as response:
+        users = json.loads(response.read().decode("utf-8"))
+
+    rows = [
+        {
+            "id": user["id"],
+            "name": user["name"],
+            "email": user["email"],
+            "city": user["address"]["city"],
+            "company": user["company"]["name"],
+        }
+        for user in users
+    ]
+    env.write(rows, target="warehouse", table="api_users",
+              mode="replace", confirm_replace=True)
+    env.setVar("users_loaded", len(rows))
+    return None
+```
+
+This model uses only the standard library, so the project venv needs no packages. Run it on its own, without any SQL model:
+
+```bash
+dowai run fetch_users.py --json
+```
+
+## Running the project
+
+Run these commands from the project directory:
+
+```bash
+dowai validate . --json                    # schema, references, cycles and sources
+dowai plan all --json                      # execution order computed from the graph
+dowai run all --yes --json                 # --yes allows replacing existing SQL tables
+dowai runs list                            # local history of runs
+dowai retry <run_id> --failed-only --yes   # rerun only what failed
+```
+
+Connection and policy details: [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
+
+## Status and limitations
+
+- SQL models run on PostgreSQL (tables and views). MySQL works as a write destination and as a Python source, not as the SQL execution profile.
+- DOWAI writes into existing tables and does not create them.
+- Re-running a table model fails while a view depends on that table, because the table is dropped and recreated. Drop the dependent view first.
+- The test suite passes on Linux against PostgreSQL 16.15 and MySQL 8.0.46. Windows and hosted CI are not verified yet. See [docs/STATUS.md](docs/STATUS.md) for what is implemented, partial, or pending, and [docs/ROADMAP.md](docs/ROADMAP.md) for the plan.
+
+## Build and test
 
 ```bash
 cargo build --workspace
 cargo test --workspace
 ```
 
-No Linux sem `pkg-config`, defina antes: `OPENSSL_DIR=/usr OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu OPENSSL_INCLUDE_DIR=/usr/include`.
+On Linux without `pkg-config`, set first: `OPENSSL_DIR=/usr OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu OPENSSL_INCLUDE_DIR=/usr/include`.
 
-## Documentação
+## Documentation
 
-- [Configuração](docs/CONFIGURATION.md), [API](docs/API.md), [compatibilidade](docs/COMPATIBILITY.md), [operação](docs/OPERATIONS.md), [segurança](docs/SECURITY.md)
-- [Contribuição](CONTRIBUTING.md) e [política de segurança](SECURITY.md)
-- Requisitos normativos: [plano_mestre.md](plano_mestre.md)
+- [Configuration](docs/CONFIGURATION.md), [CLI and API](docs/API.md), [compatibility](docs/COMPATIBILITY.md), [operations](docs/OPERATIONS.md), [security](docs/SECURITY.md)
+- [Contributing](CONTRIBUTING.md) and [security policy](SECURITY.md)
