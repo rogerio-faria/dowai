@@ -73,23 +73,12 @@ sales/
 ```
 
 Prepare the environment once. The interpreter path must be absolute and inside the project.
-DOWAI writes into tables that already exist; it does not create them.
 
 ```bash
 python3 -m venv .venv
 export DOWAI_PG_PASSWORD='your-password'
 ```
 
-```sql
-create table regional_drop_alerts (
-  region text not null, month date not null,
-  amount numeric(12,2) not null, trailing_average numeric(12,2) not null
-);
-create table api_users (
-  id int primary key, name text not null, email text not null,
-  city text not null, company text not null
-);
-```
 
 ## Examples
 
@@ -99,9 +88,17 @@ create table api_users (
 
 ```sql
 {{ config(materialized='table') }}
-select id, customer_id, region, amount, sold_on
-from {{ source('landing', 'orders') }}
-where status = 'paid'
+
+select 
+    id, 
+    customer_id, 
+    region, 
+    amount, 
+    sold_on
+from 
+    {{ source('landing', 'orders') }}
+where 
+    status = 'paid'
 ```
 
 `source()` points to a table declared once in `dowai_project.json`.
@@ -112,9 +109,15 @@ where status = 'paid'
 
 ```sql
 {{ config(materialized='table') }}
-select customer_id, count(*) as orders, sum(amount) as total_amount
-from {{ ref('stg_orders') }}
-group by customer_id
+
+select 
+    customer_id, 
+    count(*) as orders, 
+    sum(amount) as total_amount
+from
+    {{ ref('stg_orders') }}
+group by 
+    customer_id
 ```
 
 `ref()` sets the order: DOWAI runs `stg_orders` first, without you listing it.
@@ -125,12 +128,18 @@ group by customer_id
 
 ```sql
 {{ config(materialized='table') }}
-select region,
-       date_trunc('month', sold_on)::date as month,
-       sum(amount) as amount
-from {{ ref('stg_orders') }}
-group by region, date_trunc('month', sold_on)::date
-{{ run("flag_regional_drops.py") }}
+
+select 
+    region,
+    date_trunc('month', sold_on)::date as month,
+    sum(amount) as amount
+from 
+    {{ ref('stg_orders') }}
+group by 
+    region, 
+    date_trunc('month', sold_on)::date
+
+{{ run("flag_regional_drops.py") }}   -- calls a python file
 ```
 
 `run()` goes at the end of the SQL file. After `sales_by_region` is materialized, DOWAI executes the Python model and passes the table to it as `origem`, a lazy dataset that is read in batches.
