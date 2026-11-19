@@ -15,7 +15,7 @@ pub enum ProfileTlsMode {
     OracleNative,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceProfile {
     #[serde(rename = "type")]
@@ -30,7 +30,7 @@ pub struct WorkspaceProfile {
     #[serde(default)]
     pub database: String,
     #[serde(default)]
-    pub password_env: String,
+    pub password: String,
     #[serde(default)]
     pub tls: ProfileTlsMode,
     /// External Python driver path or a system driver/provider name, depending on `type`.
@@ -44,6 +44,67 @@ pub struct WorkspaceProfile {
     pub env: Vec<String>,
 }
 
+impl std::fmt::Debug for WorkspaceProfile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorkspaceProfile")
+            .field("profile_type", &self.profile_type)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("database", &self.database)
+            .field("password", &"<redacted>")
+            .field("tls", &self.tls)
+            .field("driver", &self.driver)
+            .field("params", &self.params)
+            .field("env", &self.env)
+            .finish()
+    }
+}
+
+impl WorkspaceProfile {
+    /// Returns an environment variable name for an env_var expression, or None for a literal.
+    pub fn password_env_name(&self) -> Result<Option<&str>> {
+        password_env_name(&self.password)
+    }
+}
+
+fn password_env_name(password: &str) -> Result<Option<&str>> {
+    let value = password.trim();
+    if !value.starts_with("{{") {
+        if password.is_empty() {
+            return Err(DowaiError::Config(
+                "Profile password must not be empty".to_owned(),
+            ));
+        }
+        return Ok(None);
+    }
+    let invalid = || DowaiError::Config("Invalid password env_var expression".to_owned());
+    let expression = value
+        .strip_prefix("{{")
+        .and_then(|v| v.strip_suffix("}}"))
+        .ok_or_else(invalid)?
+        .trim();
+    let argument = expression
+        .strip_prefix("env_var")
+        .ok_or_else(invalid)?
+        .trim();
+    let argument = argument
+        .strip_prefix('(')
+        .and_then(|v| v.strip_suffix(')'))
+        .ok_or_else(invalid)?
+        .trim();
+    let quote = argument.chars().next().ok_or_else(invalid)?;
+    if !matches!(quote, '\'' | '"') || argument.len() < 2 || !argument.ends_with(quote) {
+        return Err(invalid());
+    }
+    let name = &argument[1..argument.len() - 1];
+    if !valid_environment_variable_name(name) {
+        return Err(invalid());
+    }
+    Ok(Some(name))
+}
+
 pub fn load_workspace_profile(project_dir: &Path, profile_name: &str) -> Result<WorkspaceProfile> {
     if profile_name.trim().is_empty()
         || profile_name
@@ -54,8 +115,8 @@ pub fn load_workspace_profile(project_dir: &Path, profile_name: &str) -> Result<
             "Connection profile name is invalid".to_owned(),
         ));
     }
-    let path = find_ancestor_file(project_dir, "workspace.json")
-        .ok_or_else(|| DowaiError::Config("No workspace.json found for this project".to_owned()))?;
+    let path = find_ancestor_file(project_dir, "profiles.json")
+        .ok_or_else(|| DowaiError::Config("No profiles.json found for this project".to_owned()))?;
     let document = read_workspace_document(&path)?;
     validate_workspace_profiles(&path, &document)?;
     let profiles = document
@@ -111,7 +172,7 @@ fn parse_workspace_profile(
         || profile.database.trim().is_empty()
         || profile.database.chars().any(char::is_control)
         || profile.port == 0
-        || !valid_environment_variable_name(&profile.password_env)
+        || profile.password_env_name().is_err()
     {
         return Err(config_error(
             path,
@@ -240,10 +301,10 @@ pub fn resolve_effective_configuration(
         }
     }
 
-    if let Some(legacy_workspace) = find_ancestor_file(project_dir, "workspace.yaml") {
+    if let Some(legacy_workspace) = find_ancestor_file(project_dir, "profiles.yaml") {
         check_configuration_formats(&legacy_workspace.with_extension("json"))?;
     }
-    if let Some(workspace_path) = find_ancestor_file(project_dir, "workspace.json") {
+    if let Some(workspace_path) = find_ancestor_file(project_dir, "profiles.json") {
         if let Some(layer) = read_config_layer(&workspace_path, "workspace")? {
             validate_layer(&layer, &workspace_path)?;
             sources.insert("workspace", "loaded");

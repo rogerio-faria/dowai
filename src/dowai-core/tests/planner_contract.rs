@@ -44,6 +44,69 @@ impl Drop for TestProject {
 }
 
 #[test]
+fn nested_models_resolve_by_name_and_path() {
+    let project = TestProject::new();
+    project.write_model("staging/deep/source.sql", "select 1 as id");
+    project.write_model("reports/daily.sql", "select * from {{ ref('source') }}");
+    project.write_model("tasks/refresh.py", "def model(env): pass");
+    let result = plan(
+        project.path(),
+        &["daily.sql".into(), "refresh.py".into()],
+        ExecutionMode::Automatic,
+    )
+    .expect("nested model names should resolve");
+    assert_eq!(
+        result
+            .nodes
+            .iter()
+            .map(|node| node.id.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "staging/deep/source.sql",
+            "reports/daily.sql",
+            "tasks/refresh.py"
+        ]
+    );
+    assert!(plan(
+        project.path(),
+        &["refresh.sql".into()],
+        ExecutionMode::Automatic
+    )
+    .is_err());
+    let path_plan = plan(
+        project.path(),
+        &["tasks/refresh".into()],
+        ExecutionMode::Automatic,
+    )
+    .expect("nested path without extension should resolve");
+    assert_eq!(path_plan.nodes[0].id, "tasks/refresh.py");
+}
+
+#[test]
+fn duplicate_model_names_report_every_path_even_for_an_unrelated_target() {
+    let project = TestProject::new();
+    project.write_model("ok.sql", "select 1");
+    project.write_model("a/orders.sql", "select 1");
+    project.write_model("b/orders.py", "def model(env): pass");
+    project.write_model("c/orders.sql", "select 1");
+    let error = plan(project.path(), &["ok.sql".into()], ExecutionMode::Automatic)
+        .expect_err("duplicate names must invalidate the entire project");
+    for path in ["a/orders.sql", "b/orders.py", "c/orders.sql"] {
+        assert!(
+            error.message().contains(path),
+            "missing {path} in {}",
+            error.message()
+        );
+    }
+    let report = validate_project(project.path());
+    assert!(!report.valid);
+    assert!(report
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.message.contains("c/orders.sql")));
+}
+
+#[test]
 fn automatic_plan_runs_static_sql_dependencies_before_the_target() {
     let project = TestProject::new();
     project.write_model("source.sql", "select 1 as id");
@@ -357,8 +420,28 @@ fn project_initialization_creates_a_valid_empty_project() {
 
     assert!(root.join("dowai_project.json").is_file());
     assert!(root.join("models").is_dir());
-    assert!(workspace.path().join("workspace.json").is_file());
+    assert!(workspace.path().join("profiles.json").is_file());
+    assert!(fs::read_to_string(workspace.path().join(".gitignore"))
+        .unwrap()
+        .lines()
+        .any(|line| line == "/profiles.json"));
     assert!(report.valid);
+}
+
+#[test]
+fn project_initialization_preserves_existing_gitignore_and_ignores_profiles() {
+    let workspace = TestProject::new();
+    fs::write(
+        workspace.path().join(".gitignore"),
+        "target/\n!profiles.json",
+    )
+    .unwrap();
+    create_project(workspace.path(), "sample").unwrap();
+    create_project(workspace.path(), "second").unwrap();
+    assert_eq!(
+        fs::read_to_string(workspace.path().join(".gitignore")).unwrap(),
+        "target/\n!profiles.json\n/profiles.json\n"
+    );
 }
 
 #[test]
@@ -431,7 +514,7 @@ fn project_initialization_rejects_windows_reserved_names() {
 #[test]
 fn project_initialization_preserves_existing_workspace_configuration() {
     let workspace = TestProject::new();
-    let config = workspace.path().join("workspace.json");
+    let config = workspace.path().join("profiles.json");
     fs::write(
         &config,
         r#"{"schema_version":2,"workspace_name":"custom","profiles":{"source":{}}}"#,

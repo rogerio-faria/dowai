@@ -151,7 +151,7 @@ fn origin_is_reported_for_each_precedence_layer() {
     let project = create_project(&workspace, "origens").expect("project");
 
     scratch.write(
-        "ws/workspace.json",
+        "ws/profiles.json",
         &json!({ "schema_version": 2, "runtime": { "queue_capacity": 50 } }),
     );
     let admin = scratch.write(

@@ -1,4 +1,4 @@
-//! ENT-127: `env.write` accepts only profiles declared in `workspace.json`. An undeclared target is
+//! ENT-127: `env.write` accepts only profiles declared in `profiles.json`. An undeclared target is
 //! refused before any connection is attempted, so this test needs no database.
 
 use dowai_core::{create_project, ExecutionMode};
@@ -91,13 +91,13 @@ impl Fixture {
                 "port": 1,
                 "user": "nobody",
                 "database": "nowhere",
-                "password_env": "DOWAI_TEST_UNUSED_PASSWORD",
+                "password": "{{ env_var('DOWAI_TEST_UNUSED_PASSWORD') }}",
                 "tls": "disabled"
             }},
             "defaults": { "execution": { "default_profile": "warehouse" } }
         });
         fs::write(
-            root.join("workspace.json"),
+            root.join("profiles.json"),
             serde_json::to_vec(&workspace).expect("serialize"),
         )
         .expect("write workspace");

@@ -317,12 +317,12 @@ fn sentinels_never_reach_the_audit_file() {
     .expect("write");
     harness.model("q.sql", &format!("select 1 as {SENTINEL_SQL}"));
     fs::write(
-        harness.root.join("workspace.json"),
+        harness.root.join("profiles.json"),
         serde_json::to_vec(&json!({
             "schema_version": 2,
             "profiles": {"wh": {
                 "type": "postgres", "host": "127.0.0.1", "port": 5432, "user": "u",
-                "database": "d", "password_env": "DOWAI_AUDIT_TEST_PASSWORD", "tls": "disabled"
+                "database": "d", "password": "{{ env_var('DOWAI_AUDIT_TEST_PASSWORD') }}", "tls": "disabled"
             }}
         }))
         .expect("encode"),

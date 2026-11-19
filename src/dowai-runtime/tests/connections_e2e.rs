@@ -52,10 +52,10 @@ impl TestWorkspace {
         };
 
         // Two profiles: "approved" and "other". Only the first one is allowed by policy.
-        let workspace_file = root.join("workspace.json");
+        let workspace_file = root.join("profiles.json");
         let mut workspace: Value =
-            serde_json::from_slice(&fs::read(&workspace_file).expect("read workspace.json"))
-                .expect("workspace.json is valid JSON");
+            serde_json::from_slice(&fs::read(&workspace_file).expect("read profiles.json"))
+                .expect("profiles.json is valid JSON");
         let profile = |database: &str| {
             json!({
                 "type": "postgres",
@@ -63,7 +63,7 @@ impl TestWorkspace {
                 "port": 5432,
                 "user": "ent043_user",
                 "database": database,
-                "password_env": SECRET_ENV,
+                "password": format!("{{{{ env_var('{SECRET_ENV}') }}}}"),
                 "tls": "required"
             })
         };
@@ -75,7 +75,7 @@ impl TestWorkspace {
             &workspace_file,
             serde_json::to_vec(&workspace).expect("serialize workspace"),
         )
-        .expect("write workspace.json");
+        .expect("write profiles.json");
 
         let manifest = project.join("dowai_project.json");
         let mut project_config: Value =

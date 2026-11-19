@@ -114,7 +114,9 @@ impl Harness {
     }
 
     fn model(&self, name: &str, body: &str) {
-        fs::write(self.project.join("models").join(name), body).expect("write model");
+        let path = self.project.join("models").join(name);
+        fs::create_dir_all(path.parent().expect("model parent")).expect("create model directory");
+        fs::write(path, body).expect("write model");
     }
 
     fn run(&self, target: &str) -> dowai_core::Result<RunResult> {
@@ -165,6 +167,24 @@ fn find<'a>(result: &'a RunResult, target: &str) -> Vec<&'a dowai_runtime::Invoc
 
 const CHILD_OK: &str = "def model(env):\n    env.setVar('from_child', 2)\n    env.setVar('saw_pending', env.getVar('pending'))\n";
 const SENTINEL: &str = "sentinel-7f3a91c4-private-value";
+
+#[test]
+fn nested_models_run_by_unique_filename() {
+    let harness = Harness::new();
+    harness.model(
+        "jobs/main.py",
+        "def model(env):\n    env.run('worker.py')\n",
+    );
+    harness.model(
+        "jobs/deep/worker.py",
+        "def model(env):\n    env.setVar('nested_ok', True)\n",
+    );
+    let result = harness.run("main.py").expect("nested models should run");
+    assert_eq!(
+        harness.snapshot(&result.session_id)["nested_ok"],
+        json!(true)
+    );
+}
 
 #[test]
 fn ac043_child_runs_inherits_pending_variables_merges_back_and_is_recorded_without_dag_edge() {

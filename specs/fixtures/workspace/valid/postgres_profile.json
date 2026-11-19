@@ -8,7 +8,7 @@
       "port": 5432,
       "user": "dowai",
       "database": "analytics",
-      "password_env": "DOWAI_PG_PASSWORD",
+      "password": "{{ env_var('DOWAI_PG_PASSWORD') }}",
       "tls": "disabled"
     }
   },

@@ -70,12 +70,12 @@ fn write_plugin(root: &Path, dir: &str, id: &str, sentinel: &Path) -> PathBuf {
     plugin_dir
 }
 
-/// Workspace com `workspace.json`, projeto `fat` e plugins nos dois escopos.
+/// Workspace com `profiles.json`, projeto `fat` e plugins nos dois escopos.
 fn workspace_layout(scratch: &Scratch) -> (PathBuf, PathBuf, PluginRoots) {
     let workspace = scratch.path().join("ws");
     let project = workspace.join("projects").join("fat");
     fs::create_dir_all(&project).expect("project dir");
-    fs::write(workspace.join("workspace.json"), "{}").expect("workspace");
+    fs::write(workspace.join("profiles.json"), "{}").expect("workspace");
     fs::write(project.join("dowai_project.json"), "{}").expect("project");
     let roots = PluginRoots {
         project: Some(project.join("plugins")),

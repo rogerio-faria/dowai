@@ -126,7 +126,7 @@ fn run_executes_sources_and_refs_and_requires_approval_to_replace_relations() {
                     .expect("valid test port"),
                 "user": std::env::var("DOWAI_TEST_PG_USER").expect("test user"),
                 "database": std::env::var("DOWAI_TEST_PG_DATABASE").expect("test database"),
-                "password_env": "DOWAI_TEST_PG_PASSWORD",
+                "password": "{{ env_var('DOWAI_TEST_PG_PASSWORD') }}",
                 "tls": if std::env::var("DOWAI_TEST_PG_TLS").as_deref() == Ok("disabled") {
                     "disabled"
                 } else {
@@ -139,7 +139,7 @@ fn run_executes_sources_and_refs_and_requires_approval_to_replace_relations() {
         }
     });
     fs::write(
-        workspace.root.join("workspace.json"),
+        workspace.root.join("profiles.json"),
         serde_json::to_vec(&workspace_config).expect("serialize workspace config"),
     )
     .expect("write workspace config");

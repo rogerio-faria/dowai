@@ -45,7 +45,7 @@ Comentários `{# … #}` são ignorados. Modelos Python (`.py`) não são avalia
 
 ## Matriz de versões testadas (ENT-080)
 
-Esta matriz lista somente versões com evidência de teste executado e registrado em `_gestao/EVIDENCIAS.md`. Versões sem evidência não aparecem como suportadas. A matriz de CI hospedada (`.github/workflows/ci.yml`) ainda não foi executada remotamente (ENT-010 bloqueada, sem remoto Git); por isso a coluna "Evidência" indica apenas validação local.
+Esta matriz lista somente versões com evidência de teste executado e registrado em `_gestao/EVIDENCIAS.md`. Versões sem evidência não aparecem como suportadas. Não há workflows de CI hospedada configurados; a coluna "Evidência" indica apenas validação local.
 
 | Componente | Versão testada | Evidência local | Limitações |
 |---|---|---|---|

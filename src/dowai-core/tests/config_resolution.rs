@@ -57,7 +57,7 @@ fn effective_configuration_applies_project_over_workspace_user_admin_and_default
     let project = tree.path().join("workspace").join("projects").join("sales");
     fs::create_dir_all(&project).expect("create project");
     tree.write_json(
-        "workspace/workspace.json",
+        "workspace/profiles.json",
         &json!({
             "schema_version": 2,
             "execution": { "default_mode": "manual" },
@@ -210,7 +210,7 @@ fn workspace_defaults_are_loaded_and_direct_workspace_values_override_them() {
     let project = tree.path().join("workspace").join("projects").join("sales");
     fs::create_dir_all(&project).expect("create project");
     tree.write_json(
-        "workspace/workspace.json",
+        "workspace/profiles.json",
         &json!({
             "schema_version": 2,
             "workspace_name": "analytics",
@@ -295,7 +295,7 @@ fn workspace_profiles_use_environment_references_and_default_to_tls() {
     let project = tree.path().join("workspace").join("projects").join("sales");
     fs::create_dir_all(&project).expect("create project");
     tree.write_json(
-        "workspace/workspace.json",
+        "workspace/profiles.json",
         &json!({
             "schema_version": 2,
             "profiles": {
@@ -305,7 +305,7 @@ fn workspace_profiles_use_environment_references_and_default_to_tls() {
                     "port": 5432,
                     "user": "dowai",
                     "database": "analytics",
-                    "password_env": "DOWAI_PG_PASSWORD"
+                    "password": "{{ env_var('DOWAI_PG_PASSWORD') }}"
                 }
             }
         }),
@@ -315,8 +315,62 @@ fn workspace_profiles_use_environment_references_and_default_to_tls() {
         load_workspace_profile(&project, "warehouse").expect("load the named workspace profile");
 
     assert_eq!(profile.profile_type, "postgres");
-    assert_eq!(profile.password_env, "DOWAI_PG_PASSWORD");
+    assert_eq!(
+        profile.password_env_name().unwrap(),
+        Some("DOWAI_PG_PASSWORD")
+    );
     assert_eq!(profile.tls, ProfileTlsMode::Required);
+}
+
+#[test]
+fn profile_passwords_accept_literals_and_env_expressions_without_disclosure() {
+    let tree = TestConfigTree::new();
+    let project = tree.path().join("workspace").join("projects").join("sales");
+    fs::create_dir_all(&project).unwrap();
+    let profile = |password: &str| {
+        json!({
+            "type": "postgres", "host": "localhost", "port": 5432,
+            "user": "dowai", "database": "analytics", "password": password
+        })
+    };
+    tree.write_json(
+        "workspace/profiles.json",
+        &json!({
+            "schema_version": 2,
+            "profiles": {
+                "literal": profile("private-test-value"),
+                "environment": profile("{{ env_var( \"DOWAI_TEST_MISSING\" ) }}")
+            }
+        }),
+    );
+    let literal = load_workspace_profile(&project, "literal").unwrap();
+    assert_eq!(literal.password_env_name().unwrap(), None);
+    assert!(!format!("{literal:?}").contains("private-test-value"));
+    let environment = load_workspace_profile(&project, "environment").unwrap();
+    assert_eq!(
+        environment.password_env_name().unwrap(),
+        Some("DOWAI_TEST_MISSING")
+    );
+    let effective = resolve(&project, None, None).unwrap().to_string();
+    assert!(!effective.contains("private-test-value"));
+    assert!(!effective.contains("DOWAI_TEST_MISSING"));
+    for invalid in [
+        "",
+        "{{ env_var('BAD-NAME') }}",
+        "{{ env_var('X', 'default') }}",
+        "{{ env_var('X')",
+        "{{ other('X') }}",
+    ] {
+        tree.write_json(
+            "workspace/profiles.json",
+            &json!({"schema_version": 2, "profiles": {"bad": profile(invalid)}}),
+        );
+        let error =
+            load_workspace_profile(&project, "bad").expect_err("invalid password expression");
+        if !invalid.is_empty() {
+            assert!(!error.message().contains(invalid));
+        }
+    }
 }
 
 #[test]
@@ -325,7 +379,7 @@ fn native_database_profiles_validate_environment_secrets() {
     let project = tree.path().join("workspace").join("projects").join("sales");
     fs::create_dir_all(&project).expect("create project");
     tree.write_json(
-        "workspace/workspace.json",
+        "workspace/profiles.json",
         &json!({
             "schema_version": 2,
             "profiles": {
@@ -335,7 +389,7 @@ fn native_database_profiles_validate_environment_secrets() {
                     "port": 1521,
                     "user": "dowai",
                     "database": "analytics",
-                    "password_env": "DOWAI_ORACLE_PASSWORD",
+                    "password": "{{ env_var('DOWAI_ORACLE_PASSWORD') }}",
                     "tls": "oracle_native"
                 },
                 "sqlserver": {
@@ -344,7 +398,7 @@ fn native_database_profiles_validate_environment_secrets() {
                     "port": 1433,
                     "user": "dowai",
                     "database": "analytics",
-                    "password_env": "DOWAI_SQLSERVER_PASSWORD"
+                    "password": "{{ env_var('DOWAI_SQLSERVER_PASSWORD') }}"
                 }
             }
         }),
@@ -365,7 +419,7 @@ fn oracle_native_encryption_is_rejected_for_other_profiles() {
     let project = tree.path().join("workspace").join("projects").join("sales");
     fs::create_dir_all(&project).expect("create project");
     tree.write_json(
-        "workspace/workspace.json",
+        "workspace/profiles.json",
         &json!({
             "schema_version": 2,
             "profiles": {
@@ -375,7 +429,7 @@ fn oracle_native_encryption_is_rejected_for_other_profiles() {
                     "port": 3306,
                     "user": "dowai",
                     "database": "analytics",
-                    "password_env": "DOWAI_MYSQL_PASSWORD",
+                    "password": "{{ env_var('DOWAI_MYSQL_PASSWORD') }}",
                     "tls": "oracle_native"
                 }
             }
@@ -385,12 +439,12 @@ fn oracle_native_encryption_is_rejected_for_other_profiles() {
 }
 
 #[test]
-fn workspace_profiles_reject_literal_passwords_and_unknown_fields() {
+fn workspace_profiles_reject_unknown_fields() {
     let tree = TestConfigTree::new();
     let project = tree.path().join("workspace").join("projects").join("sales");
     fs::create_dir_all(&project).expect("create project");
     tree.write_json(
-        "workspace/workspace.json",
+        "workspace/profiles.json",
         &json!({
             "schema_version": 2,
             "profiles": {
@@ -400,18 +454,43 @@ fn workspace_profiles_reject_literal_passwords_and_unknown_fields() {
                     "port": 5432,
                     "user": "dowai",
                     "database": "analytics",
-                    "password_env": "DOWAI_PG_PASSWORD",
-                    "password": "do-not-accept"
+                    "password": "do-not-display",
+                    "unexpected": true
                 }
             }
         }),
     );
 
     let error = load_workspace_profile(&project, "warehouse")
-        .expect_err("literal secrets and unknown properties must be rejected");
+        .expect_err("unknown properties must be rejected");
 
     assert_eq!(error.code(), "DOWAI_CONFIG_INVALID");
-    assert!(!error.message().contains("do-not-accept"));
+    assert!(!error.message().contains("do-not-display"));
+}
+
+#[test]
+fn legacy_workspace_and_password_env_are_not_loaded() {
+    let tree = TestConfigTree::new();
+    let project = tree.path().join("workspace").join("project");
+    fs::create_dir_all(&project).unwrap();
+    tree.write_json(
+        "workspace/workspace.json",
+        &json!({
+            "schema_version": 2, "profiles": {}
+        }),
+    );
+    assert!(load_workspace_profile(&project, "old").is_err());
+    tree.write_json(
+        "workspace/profiles.json",
+        &json!({
+            "schema_version": 2,
+            "profiles": {"old": {
+                "type": "postgres", "host": "localhost", "port": 5432,
+                "user": "dowai", "database": "analytics", "password_env": "OLD_PASSWORD"
+            }}
+        }),
+    );
+    assert!(load_workspace_profile(&project, "old").is_err());
 }
 
 #[test]

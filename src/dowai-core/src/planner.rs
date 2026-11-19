@@ -91,6 +91,21 @@ pub fn plan(project_root: &Path, targets: &[String], mode: ExecutionMode) -> Res
             .or_default()
             .push(model.id.clone());
     }
+    let mut duplicates: Vec<_> = models_by_name
+        .iter()
+        .filter(|(_, paths)| paths.len() > 1)
+        .collect();
+    duplicates.sort_by_key(|(name, _)| *name);
+    if !duplicates.is_empty() {
+        let details = duplicates
+            .into_iter()
+            .map(|(name, paths)| format!("'{name}': {}", paths.join(", ")))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(DowaiError::Model(format!(
+            "Duplicate model names: {details}"
+        )));
+    }
 
     let mut resolved = BTreeMap::new();
     for model in models_by_id.values() {
@@ -337,9 +352,27 @@ fn resolve_targets(
             } else {
                 models_dir.join(path)
             };
-            let canonical = candidate
-                .canonicalize()
-                .map_err(|_| DowaiError::Model(format!("Model not found: {target}")))?;
+            let candidates = if candidate.extension().is_none() {
+                vec![
+                    candidate.with_extension("sql"),
+                    candidate.with_extension("py"),
+                ]
+            } else {
+                vec![candidate]
+            };
+            let mut canonical = None;
+            for candidate in candidates {
+                match candidate.canonicalize() {
+                    Ok(path) => {
+                        canonical = Some(path);
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            let canonical =
+                canonical.ok_or_else(|| DowaiError::Model(format!("Model not found: {target}")))?;
             ensure_within(models_dir, &canonical)?;
             let id =
                 path_string(canonical.strip_prefix(models_dir).map_err(|_| {
@@ -383,7 +416,13 @@ fn resolve_targets(
             .and_then(|value| value.to_str())
             .unwrap_or(target);
         match models_by_name.get(name).map(Vec::as_slice) {
-            Some([id]) => ids.push(id.clone()),
+            Some([id])
+                if target_path.extension().is_none()
+                    || Path::new(id).extension() == target_path.extension() =>
+            {
+                ids.push(id.clone())
+            }
+            Some([_]) => return Err(DowaiError::Model(format!("Model not found: {target}"))),
             Some(_) => {
                 return Err(DowaiError::Model(format!(
                     "Ambiguous model ID '{target}'; use its relative path"
@@ -444,7 +483,15 @@ fn resolve_reference(
         .and_then(|value| value.to_str())
         .unwrap_or(&normalized);
     match models_by_name.get(name).map(Vec::as_slice) {
-        Some([id]) => Ok(id.clone()),
+        Some([id])
+            if Path::new(&normalized).extension().is_none()
+                || Path::new(id).extension() == Path::new(&normalized).extension() =>
+        {
+            Ok(id.clone())
+        }
+        Some([_]) => Err(DowaiError::Model(format!(
+            "Model reference not found: ref('{reference}')"
+        ))),
         Some(_) => Err(DowaiError::Model(format!(
             "Ambiguous ref('{reference}'); use a unique model name"
         ))),

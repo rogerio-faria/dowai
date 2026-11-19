@@ -4,7 +4,7 @@ Demonstra a substituição de plugin global por plugin local (plano §9.2, §17.
 
 ## Estrutura
 
-- `workspace.json`: marca o workspace; o escopo global é `plugins/` ao lado dele.
+- `profiles.json`: marca o workspace; o escopo global é `plugins/` ao lado dele.
 - `plugins/api/`: plugin global `api.call`, sem rede, devolve `origin = "global"`.
 - `project/dowai_project.json`: `plugins.allow_local_override = true` e `plugins.allow_network = true`.
 - `project/plugins/api/`: plugin local `api.call`, que consulta uma URL HTTP e devolve `origin = "local"`.

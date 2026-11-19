@@ -124,7 +124,7 @@ impl std::fmt::Display for MysqlError {
 
 impl std::error::Error for MysqlError {}
 
-/// Perfil de conexão. A senha nunca é guardada: só o nome da variável de ambiente.
+/// Perfil de conexão; senhas literais são omitidas da saída de depuração.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MysqlProfile {
     host: String,
@@ -132,9 +132,19 @@ pub struct MysqlProfile {
     user: String,
     database: String,
     password_env_var: String,
+    password: Option<SecretPassword>,
     tls_mode: TlsMode,
     connect_timeout: Duration,
     query_timeout: Option<Duration>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct SecretPassword(String);
+
+impl std::fmt::Debug for SecretPassword {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("<redacted>")
+    }
 }
 
 impl MysqlProfile {
@@ -151,9 +161,22 @@ impl MysqlProfile {
             user: user.into(),
             database: database.into(),
             password_env_var: password_env_var.into(),
+            password: None,
             tls_mode: TlsMode::Required,
             connect_timeout: Duration::from_secs(10),
             query_timeout: None,
+        }
+    }
+
+    pub fn with_password(mut self, password: String) -> Self {
+        self.password = Some(SecretPassword(password));
+        self
+    }
+
+    fn resolve_password(&self) -> Result<String, MysqlError> {
+        match &self.password {
+            Some(password) => Ok(password.0.clone()),
+            None => std::env::var(&self.password_env_var).map_err(|_| MysqlError::MissingPassword),
         }
     }
 
@@ -190,7 +213,7 @@ impl MysqlProfile {
         if self.port == 0 {
             return Err(MysqlError::InvalidProfile("port"));
         }
-        if !valid_env_var_name(&self.password_env_var) {
+        if self.password.is_none() && !valid_env_var_name(&self.password_env_var) {
             return Err(MysqlError::InvalidProfile("password environment variable"));
         }
         if self.tls_mode == TlsMode::Disabled && !is_local_host(&self.host) {
@@ -293,8 +316,7 @@ enum RelationKind {
 impl MysqlAdapter {
     pub fn connect(profile: &MysqlProfile) -> Result<Self, MysqlError> {
         profile.validate()?;
-        let password =
-            std::env::var(&profile.password_env_var).map_err(|_| MysqlError::MissingPassword)?;
+        let password = profile.resolve_password()?;
         let mut init = vec![
             // Escrita estrita: valor que não cabe é erro, nunca truncamento silencioso.
             "SET SESSION sql_mode = CONCAT_WS(',', @@SESSION.sql_mode, 'STRICT_ALL_TABLES')"
@@ -1027,6 +1049,15 @@ impl MysqlBatchStream<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn literal_password_is_used_and_redacted() {
+        let profile = MysqlProfile::new("localhost", 3306, "user", "db", "")
+            .with_password("test-only-value".to_owned());
+        profile.validate().unwrap();
+        assert_eq!(profile.resolve_password().unwrap(), "test-only-value");
+        assert!(!format!("{profile:?}").contains("test-only-value"));
+    }
 
     #[test]
     fn capabilities_reflect_mysql_not_postgres() {

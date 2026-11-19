@@ -1352,7 +1352,7 @@ fn find_config_root(start: &Path) -> PathBuf {
         .ancestors()
         .find(|candidate| {
             candidate.join("dowai_project.json").is_file()
-                || candidate.join("workspace.json").is_file()
+                || candidate.join("profiles.json").is_file()
         })
         .map(Path::to_path_buf)
         .unwrap_or_else(|| start.to_path_buf())

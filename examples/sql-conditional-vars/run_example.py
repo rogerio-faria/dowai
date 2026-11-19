@@ -13,7 +13,7 @@ Três execuções do mesmo modelo `faturamento.sql`:
   2. com `--vars '{"carga_total": true}'`: o valor da CLI prevalece sobre `def_var` e o ramo completo é executado;
   3. sem variáveis de novo: sem `--session` nada é herdado, então volta ao ramo filtrado.
 
-O exemplo é copiado para um diretório temporário com um `workspace.json` gerado a partir das
+O exemplo é copiado para um diretório temporário com um `profiles.json` gerado a partir das
 variáveis acima; nenhuma credencial é gravada no repositório. Tudo que o exemplo cria é removido ao fim.
 Requer `psql` e o binário `dowai` em `target/debug/dowai` ou em `DOWAI_BIN`.
 Sai com 0 somente se as três execuções terminarem com SUCCEEDED e os resultados forem os esperados.
@@ -71,13 +71,13 @@ def write_workspace(work, settings):
                 "port": settings["port"],
                 "user": settings["user"],
                 "database": settings["database"],
-                "password_env": "DOWAI_EXAMPLE_PG_PASSWORD",
+                "password": "{{ env_var('DOWAI_EXAMPLE_PG_PASSWORD') }}",
                 "tls": settings["tls"],
             }
         },
         "defaults": {"execution": {"default_profile": "warehouse"}},
     }
-    with open(os.path.join(work, "workspace.json"), "w", encoding="utf-8") as handle:
+    with open(os.path.join(work, "profiles.json"), "w", encoding="utf-8") as handle:
         json.dump(workspace, handle)
 
 
@@ -149,7 +149,7 @@ def main():
     settings = connection_settings()
     if settings is None:
         return 2
-    # O dowai exige que a variável indicada por password_env exista (vazia em autenticação confiável).
+    # O dowai exige que a variável indicada em password exista (vazia em autenticação confiável).
     os.environ.setdefault("DOWAI_EXAMPLE_PG_PASSWORD", "")
     work = tempfile.mkdtemp(prefix="dowai-example-sql-vars-")
     try:

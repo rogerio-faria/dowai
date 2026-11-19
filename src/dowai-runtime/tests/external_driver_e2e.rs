@@ -134,7 +134,7 @@ impl Fixture {
             "profiles": { "fake": profile },
         });
         fs::write(
-            root.join("workspace.json"),
+            root.join("profiles.json"),
             serde_json::to_vec(&workspace).expect("serialize"),
         )
         .expect("write workspace");

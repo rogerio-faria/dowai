@@ -119,14 +119,14 @@ impl Fixture {
             "schema_version":2,
             "profiles":{
                 "oracle":{"type":"oracle","host":oracle.host,"port":oracle.port,"user":oracle.user,
-                    "database":oracle.service,"password_env":"DOWAI_ORACLE_PASSWORD","tls":"oracle_native"},
+                    "database":oracle.service,"password":"{{ env_var('DOWAI_ORACLE_PASSWORD') }}","tls":"oracle_native"},
                 "sqlserver":{"type":"sqlserver","host":sqlserver.host,"port":sqlserver.port,"user":sqlserver.user,
-                    "database":sqlserver.database,"password_env":"DOWAI_SQLSERVER_PASSWORD","tls":"required"}
+                    "database":sqlserver.database,"password":"{{ env_var('DOWAI_SQLSERVER_PASSWORD') }}","tls":"required"}
             },
-            "defaults":{"execution":{"default_profile":"sqlserver"}}
+            "defaults":{"execution":{"default_profile":"sqlserver"}, "database":{"connect_timeout_seconds":30}}
         });
         fs::write(
-            root.join("workspace.json"),
+            root.join("profiles.json"),
             serde_json::to_vec(&workspace).unwrap(),
         )
         .unwrap();
@@ -138,7 +138,9 @@ impl Fixture {
     }
 
     fn model(&self, name: &str, body: &str) {
-        fs::write(self.project.join("models").join(name), body).unwrap();
+        let path = self.project.join("models").join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
     }
 
     fn run(&self, name: &str, profile: Option<&str>) -> BTreeMap<String, Value> {
@@ -183,23 +185,26 @@ struct Tables {
 
 impl Drop for Tables {
     fn drop(&mut self) {
-        if let Ok(oracle) = OracleAdapter::connect(&oracle_profile()) {
-            for name in &self.oracle {
-                let relation = dowai_databases_oracle::quote_identifier(name).unwrap();
-                if let Err(error) = oracle.execute(&format!("DROP TABLE {relation} PURGE"), &[]) {
-                    if !matches!(
-                        error,
-                        dowai_databases_oracle::AdapterError::Oracle {
-                            kind: dowai_databases_oracle::OracleErrorKind::ObjectNotFound,
-                            ..
+        if !self.oracle.is_empty() {
+            if let Ok(oracle) = OracleAdapter::connect(&oracle_profile()) {
+                for name in &self.oracle {
+                    let relation = dowai_databases_oracle::quote_identifier(name).unwrap();
+                    if let Err(error) = oracle.execute(&format!("DROP TABLE {relation} PURGE"), &[])
+                    {
+                        if !matches!(
+                            error,
+                            dowai_databases_oracle::AdapterError::Oracle {
+                                kind: dowai_databases_oracle::OracleErrorKind::ObjectNotFound,
+                                ..
+                            }
+                        ) {
+                            eprintln!("Oracle test cleanup failed: {error}");
                         }
-                    ) {
-                        eprintln!("Oracle test cleanup failed: {error}");
                     }
                 }
+            } else {
+                eprintln!("Oracle test cleanup connection failed");
             }
-        } else {
-            eprintln!("Oracle test cleanup connection failed");
         }
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -219,6 +224,44 @@ impl Drop for Tables {
             Err(error) => eprintln!("SQL Server test cleanup connection failed: {error}"),
         }
     }
+}
+
+#[test]
+#[ignore = "requires an encrypted SQL Server test connection and an installed Python"]
+fn nested_models_use_environment_and_literal_profiles() {
+    let suffix = &uuid::Uuid::new_v4().simple().to_string()[..12];
+    let env_model = format!("env_{suffix}");
+    let literal_model = format!("lit_{suffix}");
+    let _tables = Tables {
+        oracle: Vec::new(),
+        sqlserver: vec![env_model.clone(), literal_model.clone()],
+    };
+    let fixture = Fixture::new("unused", "unused", "unused");
+    fixture.model(
+        "tasks/deep/read.py",
+        "def model(env, origem=None):\n    env.setVar('read_value', int(next(origem.iter_rows())['id']))\n",
+    );
+    fixture.model(
+        &format!("staging/{env_model}.sql"),
+        "SELECT 12 AS [id]\n{{ run('read.py') }}",
+    );
+    assert_eq!(
+        fixture.run(&format!("{env_model}.sql"), Some("sqlserver"))["read_value"],
+        json!(12)
+    );
+    let profiles_path = fixture.root.join("profiles.json");
+    let mut profiles: Value = serde_json::from_slice(&fs::read(&profiles_path).unwrap()).unwrap();
+    profiles["profiles"]["sqlserver"]["password"] =
+        json!(std::env::var("DOWAI_SQLSERVER_PASSWORD").unwrap());
+    fs::write(&profiles_path, serde_json::to_vec(&profiles).unwrap()).unwrap();
+    fixture.model(
+        &format!("staging/{literal_model}.sql"),
+        "SELECT 34 AS [id]\n{{ run('tasks/deep/read.py') }}",
+    );
+    assert_eq!(
+        fixture.run(&format!("{literal_model}.sql"), Some("sqlserver"))["read_value"],
+        json!(34)
+    );
 }
 
 #[test]

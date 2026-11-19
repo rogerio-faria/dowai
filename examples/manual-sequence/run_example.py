@@ -9,7 +9,7 @@ Uso (a partir da raiz do repositório), com as variáveis de conexão exportadas
     python3 -I examples/manual-sequence/run_example.py
 
 O exemplo é copiado para um diretório temporário, com um venv Python sem pacotes e um
-`workspace.json` gerado a partir das variáveis acima; nenhuma credencial é gravada no repositório.
+`profiles.json` gerado a partir das variáveis acima; nenhuma credencial é gravada no repositório.
 Executa duas sequências:
 
 - `sequencia.py`: com `try` em torno de `arq10.sql`. Deve terminar SUCCEEDED, com `arq7.py`
@@ -77,13 +77,13 @@ def write_workspace(work, settings):
                 "port": settings["port"],
                 "user": settings["user"],
                 "database": settings["database"],
-                "password_env": "DOWAI_EXAMPLE_PG_PASSWORD",
+                "password": "{{ env_var('DOWAI_EXAMPLE_PG_PASSWORD') }}",
                 "tls": settings["tls"],
             }
         },
         "defaults": {"execution": {"default_profile": "warehouse"}},
     }
-    with open(os.path.join(work, "workspace.json"), "w", encoding="utf-8") as handle:
+    with open(os.path.join(work, "profiles.json"), "w", encoding="utf-8") as handle:
         json.dump(workspace, handle)
 
 

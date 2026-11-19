@@ -153,7 +153,7 @@ impl Fixture {
                     "port": std::env::var("DOWAI_TEST_PG_PORT").ok().and_then(|p| p.parse::<u16>().ok()).unwrap_or(5432),
                     "user": std::env::var("DOWAI_TEST_PG_USER").unwrap_or_else(|_| "unused".into()),
                     "database": std::env::var("DOWAI_TEST_PG_DATABASE").unwrap_or_else(|_| "unused".into()),
-                    "password_env": "DOWAI_TEST_PG_PASSWORD",
+                    "password": "{{ env_var('DOWAI_TEST_PG_PASSWORD') }}",
                     "tls": "disabled"
                 },
                 "mart": {
@@ -162,14 +162,14 @@ impl Fixture {
                     "port": env_var("DOWAI_TEST_MYSQL_PORT").parse::<u16>().expect("port"),
                     "user": env_var("DOWAI_TEST_MYSQL_USER"),
                     "database": env_var("DOWAI_TEST_MYSQL_DATABASE"),
-                    "password_env": "DOWAI_TEST_MYSQL_PASSWORD",
+                    "password": "{{ env_var('DOWAI_TEST_MYSQL_PASSWORD') }}",
                     "tls": if std::env::var("DOWAI_TEST_MYSQL_TLS").as_deref() == Ok("required") { "required" } else { "disabled" }
                 }
             },
             "defaults": { "execution": { "default_profile": "warehouse" } }
         });
         fs::write(
-            root.join("workspace.json"),
+            root.join("profiles.json"),
             serde_json::to_vec(&workspace).expect("json"),
         )
         .expect("write workspace");

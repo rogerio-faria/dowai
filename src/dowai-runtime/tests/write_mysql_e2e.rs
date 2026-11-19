@@ -182,7 +182,7 @@ impl Fixture {
                     "port": env_var("DOWAI_TEST_PG_PORT").parse::<u16>().expect("port"),
                     "user": env_var("DOWAI_TEST_PG_USER"),
                     "database": env_var("DOWAI_TEST_PG_DATABASE"),
-                    "password_env": "DOWAI_TEST_PG_PASSWORD",
+                    "password": "{{ env_var('DOWAI_TEST_PG_PASSWORD') }}",
                     "tls": pg_tls
                 },
                 "mart": {
@@ -191,14 +191,14 @@ impl Fixture {
                     "port": env_var("DOWAI_TEST_MYSQL_PORT").parse::<u16>().expect("port"),
                     "user": env_var("DOWAI_TEST_MYSQL_USER"),
                     "database": env_var("DOWAI_TEST_MYSQL_DATABASE"),
-                    "password_env": "DOWAI_TEST_MYSQL_PASSWORD",
+                    "password": "{{ env_var('DOWAI_TEST_MYSQL_PASSWORD') }}",
                     "tls": my_tls
                 }
             },
             "defaults": { "execution": { "default_profile": "warehouse" } }
         });
         fs::write(
-            root.join("workspace.json"),
+            root.join("profiles.json"),
             serde_json::to_vec(&workspace).expect("json"),
         )
         .expect("write workspace");

@@ -134,7 +134,7 @@ dowai doctor --check-connections [--json]
 dowai config show --effective [--json]
 ```
 
-- `doctor --check-connections` usa o perfil padrão e os perfis do `workspace.json`. Perfis PostgreSQL exigem `password_env`; TLS é obrigatório por padrão e `tls: "disabled"` só é aceito em hosts loopback.
+- `doctor --check-connections` usa o perfil padrão e os perfis do `profiles.json`. Perfis exigem `password` literal ou `{{ env_var('NOME') }}`; TLS é obrigatório por padrão e `tls: "disabled"` só é aceito em hosts loopback.
 - Segredos de perfil nunca são gravados em JSON.
 - Escritas no banco são negadas sem `security.allow_external_writes`. Substituir tabela ou view exige `--yes`.
 

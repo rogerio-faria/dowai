@@ -24,12 +24,12 @@ export DOWAI_EXAMPLE_PG_DATABASE=<banco>
 python3 -I examples/sql-basic/run_example.py
 ```
 
-O runner copia o exemplo para um diretório temporário, gera o `workspace.json` a partir das
+O runner copia o exemplo para um diretório temporário, gera o `profiles.json` a partir das
 variáveis acima (nenhuma credencial vai para o repositório), cria as tabelas de origem no schema
 `dowai_example_sql_basic_landing`, executa `dowai run faturamento.sql` duas vezes (a segunda com
 `--yes`, pois substituir relações existentes exige confirmação) e remove tudo ao final.
 
-Comando manual equivalente, depois de montar um `workspace.json` com o perfil `warehouse`
+Comando manual equivalente, depois de montar um `profiles.json` com o perfil `warehouse`
 (ver `docs/CONFIGURATION.md`):
 
 ```bash

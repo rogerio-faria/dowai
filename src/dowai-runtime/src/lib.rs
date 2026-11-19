@@ -2334,17 +2334,21 @@ fn declared_dataset_sources(project_dir: &Path) -> Result<executor::SourceDefini
     Ok(sources)
 }
 
-/// Builds the MySQL adapter profile with the effective `database` timeouts (ENT-116). The
-/// password is never copied: only the name of its environment variable.
+/// Builds the MySQL adapter profile with the effective `database` timeouts.
 fn mysql_profile(profile: WorkspaceProfile, configuration: &Value) -> Result<MysqlProfile> {
     let database = &configuration["effective"]["database"];
+    let env_name = profile.password_env_name()?.map(str::to_owned);
+    let literal = env_name.is_none().then(|| profile.password.clone());
     let mut adapter_profile = MysqlProfile::new(
         profile.host,
         profile.port,
         profile.user,
         profile.database,
-        profile.password_env,
+        env_name.unwrap_or_default(),
     );
+    if let Some(password) = literal {
+        adapter_profile = adapter_profile.with_password(password);
+    }
     if profile.tls == dowai_core::ProfileTlsMode::Disabled {
         adapter_profile.set_tls_mode(TlsMode::Disabled);
     }
@@ -2773,9 +2777,7 @@ fn enforce_allowlist(
     Ok(())
 }
 
-/// Builds the adapter profile from the workspace profile and the effective `database` policy
-/// (`connect_timeout_seconds`, `query_timeout_seconds`). The password is never copied: only the
-/// name of the environment variable that holds it.
+/// Builds the adapter profile from the profile and effective database policy.
 fn postgres_profile(profile: WorkspaceProfile, configuration: &Value) -> Result<PgProfile> {
     if profile.profile_type != "postgres" {
         return Err(DowaiError::Config(format!(
@@ -2784,13 +2786,18 @@ fn postgres_profile(profile: WorkspaceProfile, configuration: &Value) -> Result<
         )));
     }
     let database = &configuration["effective"]["database"];
+    let env_name = profile.password_env_name()?.map(str::to_owned);
+    let literal = env_name.is_none().then(|| profile.password.clone());
     let mut adapter_profile = PgProfile::new(
         profile.host,
         profile.port,
         profile.user,
         profile.database,
-        profile.password_env,
+        env_name.unwrap_or_default(),
     );
+    if let Some(password) = literal {
+        adapter_profile = adapter_profile.with_password(password);
+    }
     if profile.tls == dowai_core::ProfileTlsMode::Disabled {
         adapter_profile.set_tls_mode(TlsMode::Disabled);
     }
@@ -3312,22 +3319,16 @@ mod tests {
         let fixture = Fixture::new();
         fixture.write_model("a/orders.sql", "select 1");
         fixture.write_model("b/orders.sql", "select 2");
-        let execution_plan = plan(
+        let error = plan(
             fixture.path(),
             &["all".to_owned()],
             ExecutionMode::Automatic,
         )
-        .expect("plan models");
-
-        let error = prepare_postgres_plan(
-            fixture.path(),
-            &execution_plan,
-            &BTreeMap::new(),
-            &TemplateOptions::default(),
-        )
         .expect_err("ambiguous materialization targets must fail");
 
         assert_eq!(error.code(), "DOWAI_PLAN_INVALID");
+        assert!(error.message().contains("a/orders.sql"));
+        assert!(error.message().contains("b/orders.sql"));
     }
 
     #[test]
@@ -3366,7 +3367,7 @@ mod tests {
                 .path()
                 .parent()
                 .expect("project has workspace")
-                .join("workspace.json"),
+                .join("profiles.json"),
             serde_json::to_vec(&json!({
                 "schema_version": 2,
                 "profiles": {
@@ -3376,7 +3377,7 @@ mod tests {
                         "port": 5432,
                         "user": "dowai",
                         "database": "analytics",
-                        "password_env": "DOWAI_POLICY_TEST_NO_PASSWORD",
+                        "password": "{{ env_var('DOWAI_POLICY_TEST_NO_PASSWORD') }}",
                         "tls": "disabled"
                     }
                 }
@@ -3459,7 +3460,7 @@ mod tests {
             .path()
             .parent()
             .expect("project has workspace")
-            .join("workspace.json");
+            .join("profiles.json");
         fs::write(
             workspace_config,
             serde_json::to_vec(&json!({
@@ -3471,7 +3472,7 @@ mod tests {
                         "port": 5432,
                         "user": "dowai",
                         "database": "analytics",
-                        "password_env": password_env,
+                        "password": format!("{{{{ env_var('{password_env}') }}}}"),
                         "tls": "disabled"
                     }
                 }
@@ -3519,7 +3520,7 @@ mod tests {
             .path()
             .parent()
             .expect("project has workspace")
-            .join("workspace.json");
+            .join("profiles.json");
         fs::write(
             workspace_config,
             serde_json::to_vec(&json!({
@@ -3531,7 +3532,7 @@ mod tests {
                         "port": 5432,
                         "user": "dowai",
                         "database": "analytics",
-                        "password_env": "DOWAI_RUNTIME_EMPTY_SQL_PASSWORD",
+                        "password": "{{ env_var('DOWAI_RUNTIME_EMPTY_SQL_PASSWORD') }}",
                         "tls": "disabled"
                     }
                 }
@@ -3580,7 +3581,7 @@ mod tests {
             port: 5432,
             user: "dowai".to_owned(),
             database: "analytics".to_owned(),
-            password_env: "DOWAI_PG_PASSWORD".to_owned(),
+            password: "{{ env_var('DOWAI_PG_PASSWORD') }}".to_owned(),
             tls: ProfileTlsMode::Required,
             driver: None,
             params: None,
@@ -3623,7 +3624,7 @@ mod tests {
             port: 5432,
             user: "dowai".to_owned(),
             database: "analytics".to_owned(),
-            password_env: "DOWAI_PG_PASSWORD".to_owned(),
+            password: "{{ env_var('DOWAI_PG_PASSWORD') }}".to_owned(),
             tls: ProfileTlsMode::Required,
             driver: None,
             params: None,
@@ -3670,7 +3671,7 @@ mod tests {
             port: 5432,
             user: "dowai".to_owned(),
             database: "analytics".to_owned(),
-            password_env: "DOWAI_ENT030_UNIT_PASSWORD".to_owned(),
+            password: "{{ env_var('DOWAI_ENT030_UNIT_PASSWORD') }}".to_owned(),
             tls: dowai_core::ProfileTlsMode::Required,
             driver: None,
             params: None,

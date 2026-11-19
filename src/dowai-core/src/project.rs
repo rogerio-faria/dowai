@@ -321,6 +321,7 @@ pub fn create_project(workspace: &Path, name: &str) -> Result<PathBuf> {
         .map_err(|error| DowaiError::Config(error.to_string()))?;
     fs::write(root.join(PROJECT_FILE), project_json)?;
     create_workspace_config(workspace)?;
+    protect_workspace_profiles(workspace)?;
     Ok(root)
 }
 
@@ -493,7 +494,7 @@ fn is_reserved_windows_name(name: &str) -> bool {
 }
 
 fn create_workspace_config(workspace: &Path) -> Result<()> {
-    let path = workspace.join("workspace.json");
+    let path = workspace.join("profiles.json");
     let workspace_name = workspace
         .file_name()
         .and_then(|name| name.to_str())
@@ -513,6 +514,7 @@ fn create_workspace_config(workspace: &Path) -> Result<()> {
                 DowaiError::Config(format!("Cannot initialize {}: {error}", path.display()))
             })?;
         }
+
         Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
         Err(error) => {
             return Err(DowaiError::Config(format!(
@@ -520,6 +522,43 @@ fn create_workspace_config(workspace: &Path) -> Result<()> {
                 path.display()
             )))
         }
+    }
+    Ok(())
+}
+
+fn protect_workspace_profiles(workspace: &Path) -> Result<()> {
+    let path = workspace.join(".gitignore");
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err(DowaiError::Path(
+                "Workspace .gitignore must be a regular file".to_owned(),
+            ));
+        }
+        Ok(_) => {
+            let contents = fs::read_to_string(&path)?;
+            if contents
+                .lines()
+                .rfind(|line| !line.trim().is_empty())
+                .is_some_and(|line| matches!(line.trim(), "profiles.json" | "/profiles.json"))
+            {
+                return Ok(());
+            }
+            let mut file = OpenOptions::new().append(true).open(&path)?;
+            use std::io::Write;
+            if !contents.is_empty() && !contents.ends_with('\n') {
+                file.write_all(b"\n")?;
+            }
+            file.write_all(b"/profiles.json\n")?;
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)?;
+            use std::io::Write;
+            file.write_all(b"/profiles.json\n")?;
+        }
+        Err(error) => return Err(error.into()),
     }
     Ok(())
 }

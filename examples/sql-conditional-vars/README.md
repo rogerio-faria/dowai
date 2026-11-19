@@ -27,7 +27,7 @@ export DOWAI_EXAMPLE_PG_DATABASE=<banco>
 python3 -I examples/sql-conditional-vars/run_example.py
 ```
 
-O runner copia o exemplo para um diretório temporário, gera o `workspace.json` a partir das
+O runner copia o exemplo para um diretório temporário, gera o `profiles.json` a partir das
 variáveis acima, cria a tabela de origem `dowai_example_sql_conditional_landing.vendas` e executa
 três vezes:
 
@@ -37,7 +37,7 @@ três vezes:
 
 Ao final, remove a tabela `faturamento` e o schema de origem.
 
-Comandos manuais equivalentes, após montar um `workspace.json` com o perfil `warehouse`:
+Comandos manuais equivalentes, após montar um `profiles.json` com o perfil `warehouse`:
 
 ```bash
 dowai run faturamento.sql --json

@@ -33,7 +33,7 @@ python3 -I examples/manual-sequence/run_example.py
 ```
 
 O runner copia o exemplo para um diretório temporário, cria um venv sem pacotes
-(os modelos usam só a biblioteca padrão), gera o `workspace.json` e remove a
+(os modelos usam só a biblioteca padrão), gera o `profiles.json` e remove a
 tabela `arq1` e o diretório temporário ao final.
 
 ## Resultado esperado

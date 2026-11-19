@@ -20,7 +20,7 @@ For settings without an administrator ceiling, values merge in this order
 1. Engine defaults
 2. Administrator config
 3. User config
-4. `workspace.json` (a nested `defaults` object is also accepted)
+4. `profiles.json` (a nested `defaults` object is also accepted)
 5. Project `config` object in `dowai_project.json`
 
 Objects merge recursively. Arrays replace rather than merge. `null` means
@@ -33,10 +33,10 @@ and `%PROGRAMDATA%\DOWAI\config.json`. On Linux they follow
 `${XDG_CONFIG_HOME:-~/.config}/dowai/config.json` and `/etc/dowai/config.json`.
 Missing optional files are ignored; an existing unreadable or invalid file is
 an error. Workspace config is found by walking from the project directory to
-the nearest ancestor containing `workspace.json`.
+the nearest ancestor containing `profiles.json`.
 
 The project layer is the `config` object in `dowai_project.json`. Workspace
-defaults are stored in `workspace.json` under `defaults`; direct supported
+defaults are stored in `profiles.json` under `defaults`; direct supported
 configuration sections in that file override matching default fields. User
 and administrator files contain supported sections at the root beside
 `schema_version`.
@@ -56,7 +56,7 @@ with `type`:
       "port": 5432,
       "user": "dowai",
       "database": "analytics",
-      "password_env": "DOWAI_PG_PASSWORD",
+      "password": "{{ env_var('DOWAI_PG_PASSWORD') }}",
       "tls": "required"
     }
   },
@@ -68,7 +68,17 @@ with `type`:
 }
 ```
 
-`password_env` is a variable name, not a password value. Profile objects
+`password` is either a literal password or a complete expression such as
+`{{ env_var('DOWAI_PG_PASSWORD') }}` (single or double quotes). A missing or
+invalid environment variable fails when connecting; optional defaults and
+other template expressions are not supported. Prefer environment variables:
+literal passwords are stored as plaintext. `dowai init` adds `/profiles.json`
+to the workspace `.gitignore`; this does not untrack files already in Git.
+Rename existing `workspace.json` to `profiles.json` and replace each
+`"password_env": "NAME"` with `"password": "{{ env_var('NAME') }}"`;
+the old format is not supported.
+
+Profile objects
 reject unknown fields, require TLS unless explicitly disabled for a loopback
 host, and are not included in effective configuration output. `doctor --check-connections` uses `execution.default_profile`; the check
 performs only a read-only `SELECT 1`. SQL `run` uses the selected profile to
@@ -352,14 +362,14 @@ Unidades e limites aparecem na tabela. Limites mínimos e máximos são inclusiv
 
 #### Destinos de `env.write` (ENT-127)
 
-- `env.write(..., target="NOME")` aceita somente perfis declarados em `workspace.json` (`profiles`) e permitidos pela política (`security.allowed_profiles`). O nome não declarado é recusado com `DOWAI_CONFIG_INVALID` (mensagem: `Unknown connection profile 'NOME'`) **antes de qualquer conexão**.
+- `env.write(..., target="NOME")` aceita somente perfis declarados em `profiles.json` (`profiles`) e permitidos pela política (`security.allowed_profiles`). O nome não declarado é recusado com `DOWAI_CONFIG_INVALID` (mensagem: `Unknown connection profile 'NOME'`) **antes de qualquer conexão**.
 - Tipos suportados: `postgres`, `mysql`, `oracle`, `sqlserver` e `external` (driver Python, ENT-128).
 - Os modos são fixos: `append`, `replace` (com `confirm_replace=True`) e `upsert` (com `keys`). A escolha do método correto, a ausência de duplicidade e as cláusulas de filtro são responsabilidade do usuário; o DOWAI garante perfil, schema, política e transação no destino.
 - `origem` pode ser `None` quando o modelo Python é executado diretamente; o arquivo deve tratar esse caso (ver `examples/sql-run-post`).
 
 #### Perfil `external`: destino com driver Python (ENT-128)
 
-Destinos sem adaptador embutido usam um driver Python escolhido por configuração, sem recompilar o DOWAI. Exemplo em `workspace.json`:
+Destinos sem adaptador embutido usam um driver Python escolhido por configuração, sem recompilar o DOWAI. Exemplo em `profiles.json`:
 
 ```json
 "profiles": {
@@ -427,7 +437,7 @@ Valores de `origins` por campo:
 | `engine_default` | default do catálogo, nenhuma camada definiu o campo |
 | `admin` | definido pelo arquivo do administrador |
 | `user` | definido pelo arquivo do usuário |
-| `workspace` | definido em `workspace.json` |
+| `workspace` | definido em `profiles.json` |
 | `project` | definido em `config` de `dowai_project.json` |
 | `admin_ceiling` | valor reduzido por teto administrativo |
 

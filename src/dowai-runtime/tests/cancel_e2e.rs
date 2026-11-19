@@ -228,16 +228,16 @@ fn write_workspace_profile(root: &Path) {
             "port": std::env::var("DOWAI_TEST_PG_PORT").expect("port").parse::<u16>().expect("port"),
             "user": std::env::var("DOWAI_TEST_PG_USER").expect("user"),
             "database": std::env::var("DOWAI_TEST_PG_DATABASE").expect("database"),
-            "password_env": "DOWAI_TEST_PG_PASSWORD",
+            "password": "{{ env_var('DOWAI_TEST_PG_PASSWORD') }}",
             "tls": if std::env::var("DOWAI_TEST_PG_TLS").as_deref() == Ok("disabled") { "disabled" } else { "required" }
         }},
         "defaults": {"execution": {"default_profile": "warehouse"}}
     });
     fs::write(
-        root.join("workspace.json"),
+        root.join("profiles.json"),
         serde_json::to_vec(&config).expect("enc"),
     )
-    .expect("workspace.json");
+    .expect("profiles.json");
 }
 
 #[test]

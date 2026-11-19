@@ -962,8 +962,15 @@ impl<'a> Executor<'a> {
                 |this, invocation_id| {
                     on_start(invocation_id);
                     if is_python(target) {
+                        let scope = plan(this.root, &[target.to_owned()], ExecutionMode::Manual)?;
+                        let [node] = scope.nodes.as_slice() else {
+                            return Err(DowaiError::Model(
+                                "run() accepts exactly one model target".to_owned(),
+                            ));
+                        };
+                        this.set_target(invocation_id, &node.id);
                         this.execute_node(
-                            target,
+                            &node.path,
                             &depends_on,
                             mode,
                             variables,
@@ -1407,7 +1414,7 @@ impl<'a> Executor<'a> {
     /// `env.connections.get(name)` (ENT-043): a capability handle for a workspace profile.
     /// The profile must pass the same `security.allowed_profiles` and `allowed_hosts` policy
     /// that a SQL run applies. Only the profile name and its type leave the host; host,
-    /// user, database, `password_env` and any secret stay on the host side.
+    /// user, database, password and any secret stay on the host side.
     fn connection_get(&self, target: Option<String>) -> Result<serde_json::Value> {
         let name = target.ok_or_else(|| {
             DowaiError::Config("env.connections.get requires a profile name".to_owned())

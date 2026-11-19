@@ -24,7 +24,7 @@ pub const GLOBAL_DICTIONARY_FILE: &str = "data_dictionary.json";
 /// Caminho do dicionário local, relativo à raiz do projeto.
 pub const LOCAL_DICTIONARY_PATH: &str = "data_docs/dictionary.json";
 
-const WORKSPACE_FILE: &str = "workspace.json";
+const WORKSPACE_FILE: &str = "profiles.json";
 const PROJECT_FILE: &str = "dowai_project.json";
 
 /// Schema público do dicionário (`schema_version` 2), embutido para não depender do checkout.
@@ -88,7 +88,7 @@ pub struct DictionaryPaths {
     pub local: Option<PathBuf>,
 }
 
-/// Localiza o workspace (ancestral com `workspace.json`) e o projeto (ancestral com
+/// Localiza o workspace (ancestral com `profiles.json`) e o projeto (ancestral com
 /// `dowai_project.json`). Os caminhos são devolvidos mesmo quando o arquivo não existe;
 /// use [`load_dictionary`] para ler e validar.
 pub fn dictionary_paths_from(start: &Path) -> DictionaryPaths {

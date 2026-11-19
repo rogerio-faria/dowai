@@ -72,7 +72,7 @@ pub enum TlsMode {
     Disabled,
 }
 
-/// SQL Server connection settings. The password itself is never retained in this value.
+/// SQL Server connection settings; literal passwords are redacted in debug output.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SqlServerProfile {
     pub host: String,
@@ -80,10 +80,20 @@ pub struct SqlServerProfile {
     pub database: String,
     pub user: String,
     pub password_env: String,
+    password: Option<SecretPassword>,
     pub tls_mode: TlsMode,
     pub trust_server_certificate: bool,
     /// Bounds TCP connect and TDS login. Query execution itself has no timeout.
     pub connect_timeout: Duration,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct SecretPassword(String);
+
+impl std::fmt::Debug for SecretPassword {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("<redacted>")
+    }
 }
 
 impl SqlServerProfile {
@@ -100,10 +110,16 @@ impl SqlServerProfile {
             database: database.into(),
             user: user.into(),
             password_env: password_env.into(),
+            password: None,
             tls_mode: TlsMode::Required,
             trust_server_certificate: false,
             connect_timeout: Duration::from_secs(10),
         }
+    }
+
+    pub fn with_password(mut self, password: String) -> Self {
+        self.password = Some(SecretPassword(password));
+        self
     }
 
     pub fn validate(&self) -> Result<(), AdapterError> {
@@ -122,7 +138,7 @@ impl SqlServerProfile {
         if self.port == 0 {
             return Err(AdapterError::InvalidProfile("port"));
         }
-        if !valid_env_var_name(&self.password_env) {
+        if self.password.is_none() && !valid_env_var_name(&self.password_env) {
             return Err(AdapterError::InvalidProfile(
                 "password environment variable",
             ));
@@ -298,7 +314,10 @@ impl SqlServerAdapter {
     /// Connects using the password stored in the profile's environment variable.
     pub async fn connect(profile: &SqlServerProfile) -> Result<Self, AdapterError> {
         profile.validate()?;
-        let password = resolve_password(&profile.password_env)?;
+        let password = match &profile.password {
+            Some(password) => password.0.clone(),
+            None => resolve_password(&profile.password_env)?,
+        };
 
         let mut config = Config::new();
         config.host(&profile.host);
@@ -1296,6 +1315,14 @@ mod tests {
 
     fn profile() -> SqlServerProfile {
         SqlServerProfile::new("localhost", 1433, "dw", "user", "DOWAI_SQLSERVER_PASSWORD")
+    }
+
+    #[test]
+    fn literal_password_is_redacted() {
+        let profile = SqlServerProfile::new("localhost", 1433, "dw", "user", "")
+            .with_password("test-only-value".to_owned());
+        profile.validate().unwrap();
+        assert!(!format!("{profile:?}").contains("test-only-value"));
     }
 
     #[test]

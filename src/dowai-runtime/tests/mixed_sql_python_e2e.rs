@@ -138,14 +138,14 @@ impl Fixture {
                 "port": pg_env("DOWAI_TEST_PG_PORT").parse::<u16>().expect("port"),
                 "user": pg_env("DOWAI_TEST_PG_USER"),
                 "database": pg_env("DOWAI_TEST_PG_DATABASE"),
-                "password_env": "DOWAI_TEST_PG_PASSWORD",
+                "password": "{{ env_var('DOWAI_TEST_PG_PASSWORD') }}",
                 "tls": if std::env::var("DOWAI_TEST_PG_TLS").as_deref() == Ok("disabled") {
                     "disabled" } else { "required" }
             }},
             "defaults": { "execution": { "default_profile": "warehouse" } }
         });
         fs::write(
-            root.join("workspace.json"),
+            root.join("profiles.json"),
             serde_json::to_vec(&workspace).expect("serialize"),
         )
         .expect("write workspace");
@@ -1076,7 +1076,7 @@ fn ent111_python_only_without_profile_keeps_plain_runs_and_refuses_source_reads(
     let fx = Fixture::new("ent111-noprofile");
     let (plain, reader) = (fx.name("plain"), fx.name("reader"));
     // No profile in the workspace: nothing can be resolved for datasets.
-    fs::write(fx.root.join("workspace.json"), b"{\"schema_version\":2}").expect("workspace");
+    fs::write(fx.root.join("profiles.json"), b"{\"schema_version\":2}").expect("workspace");
     let manifest_path = fx.project.join("dowai_project.json");
     let mut manifest: Value =
         serde_json::from_slice(&fs::read(&manifest_path).expect("read manifest"))

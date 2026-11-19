@@ -7,7 +7,7 @@
       "port": 1521,
       "user": "dowai",
       "database": "service",
-      "password_env": "DOWAI_ORACLE_PASSWORD",
+      "password": "{{ env_var('DOWAI_ORACLE_PASSWORD') }}",
       "tls": "oracle_native"
     }
   }

@@ -1,7 +1,7 @@
 //! External write drivers (ENT-128): a Python driver, chosen by configuration, writes to a
 //! destination the runtime has no built-in adapter for. No Rust recompilation is needed.
 //!
-//! Configuration (`workspace.json`, profile `type: "external"`):
+//! Configuration (`profiles.json`, profile `type: "external"`):
 //! - `driver`: relative `.py` path under the project's `drivers/` directory (no `..`).
 //! - `params`: non-secret object passed to the driver. Literal secrets are refused.
 //! - `env`: names of environment variables the driver receives (values are never stored).

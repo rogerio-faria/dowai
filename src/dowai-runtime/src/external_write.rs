@@ -24,8 +24,8 @@ use crate::{
     enforce_external_write_policy, map_execution_error, postgres_profile, resolve_profile,
 };
 use dowai_core::{CancellationToken, DowaiError, Result, WorkspaceProfile};
-use dowai_mysql::{MysqlAdapter, MysqlError, MysqlProfile};
-use dowai_postgres::{quote_identifier, AdapterError, PostgresAdapter, SqlAdapter, TlsMode};
+use dowai_mysql::{MysqlAdapter, MysqlError};
+use dowai_postgres::{quote_identifier, AdapterError, PostgresAdapter, SqlAdapter};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -653,23 +653,7 @@ impl Backend {
             )));
         }
         if profile.profile_type == "mysql" {
-            let database = &configuration["effective"]["database"];
-            let mut adapter_profile = MysqlProfile::new(
-                profile.host,
-                profile.port,
-                profile.user,
-                profile.database,
-                profile.password_env,
-            );
-            if profile.tls == dowai_core::ProfileTlsMode::Disabled {
-                adapter_profile.set_tls_mode(TlsMode::Disabled);
-            }
-            if let Some(seconds) = database["connect_timeout_seconds"].as_u64() {
-                adapter_profile.set_connect_timeout(std::time::Duration::from_secs(seconds));
-            }
-            if let Some(seconds) = database["query_timeout_seconds"].as_u64() {
-                adapter_profile.set_query_timeout(Some(std::time::Duration::from_secs(seconds)));
-            }
+            let adapter_profile = crate::mysql_profile(profile, configuration)?;
             return MysqlAdapter::connect(&adapter_profile)
                 .map(Self::Mysql)
                 .map_err(map_mysql);
@@ -856,7 +840,7 @@ mod tests {
                     "port": variable("PORT").parse::<u16>().expect("invalid port"),
                     "user": variable("USER"),
                     "database": if is_oracle { variable("SERVICE") } else { variable("DATABASE") },
-                    "password_env": if is_oracle { "DOWAI_ORACLE_PASSWORD" } else { "DOWAI_SQLSERVER_PASSWORD" },
+                    "password": if is_oracle { "{{ env_var('DOWAI_ORACLE_PASSWORD') }}" } else { "{{ env_var('DOWAI_SQLSERVER_PASSWORD') }}" },
                     "tls": if is_oracle { "oracle_native" } else { "required" }
                 })).unwrap();
         DatabaseProfile::from_workspace(

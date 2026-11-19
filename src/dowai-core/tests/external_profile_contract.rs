@@ -23,7 +23,7 @@ fn workspace_with(profile: Value) -> (PathBuf, PathBuf) {
         "profiles": { "external_dw": profile },
     });
     fs::write(
-        root.join("workspace.json"),
+        root.join("profiles.json"),
         serde_json::to_vec(&document).expect("serialize"),
     )
     .expect("write workspace");

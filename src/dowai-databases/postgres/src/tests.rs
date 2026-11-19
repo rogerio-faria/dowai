@@ -23,6 +23,15 @@ fn profile_debug_contains_the_environment_reference_not_a_password() {
 }
 
 #[test]
+fn literal_password_is_used_and_redacted() {
+    let profile = PgProfile::new("localhost", 5432, "user", "db", "")
+        .with_password("test-only-value".to_owned());
+    profile.validate().unwrap();
+    assert_eq!(profile.resolve_password().unwrap(), "test-only-value");
+    assert!(!format!("{profile:?}").contains("test-only-value"));
+}
+
+#[test]
 fn profile_rejects_empty_or_whitespace_required_fields() {
     let cases = [
         PgProfile::new("", 5432, "user", "db", "PASSWORD"),

@@ -135,14 +135,14 @@ impl Fixture {
                 "port": pg_env("DOWAI_TEST_PG_PORT").parse::<u16>().expect("port"),
                 "user": pg_env("DOWAI_TEST_PG_USER"),
                 "database": pg_env("DOWAI_TEST_PG_DATABASE"),
-                "password_env": "DOWAI_TEST_PG_PASSWORD",
+                "password": "{{ env_var('DOWAI_TEST_PG_PASSWORD') }}",
                 "tls": if std::env::var("DOWAI_TEST_PG_TLS").as_deref() == Ok("disabled") {
                     "disabled" } else { "required" }
             }},
             "defaults": { "execution": { "default_profile": "warehouse" } }
         });
         fs::write(
-            root.join("workspace.json"),
+            root.join("profiles.json"),
             serde_json::to_vec(&workspace).expect("serialize"),
         )
         .expect("write workspace");

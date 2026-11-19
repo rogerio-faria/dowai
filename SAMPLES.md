@@ -6,8 +6,8 @@ dados entre bancos.
 
 ## 1. Configurar perfis e fontes
 
-Em `workspace.json`, cadastre as conexões. As credenciais ficam em variáveis
-de ambiente indicadas por `password_env`:
+Em `profiles.json`, cadastre as conexões. Prefira variáveis de ambiente em
+`password`; também é possível informar a senha literal:
 
 ```json
 {
@@ -19,7 +19,7 @@ de ambiente indicadas por `password_env`:
       "port": 5432,
       "user": "dowai",
       "database": "analytics",
-      "password_env": "DOWAI_PG_PASSWORD",
+      "password": "{{ env_var('DOWAI_PG_PASSWORD') }}",
       "tls": "required"
     },
     "mysql_mart": {
@@ -28,7 +28,7 @@ de ambiente indicadas por `password_env`:
       "port": 3306,
       "user": "dowai",
       "database": "mart",
-      "password_env": "DOWAI_MYSQL_PASSWORD",
+      "password": "{{ env_var('DOWAI_MYSQL_PASSWORD') }}",
       "tls": "required"
     },
     "oracle_erp": {
@@ -37,7 +37,7 @@ de ambiente indicadas por `password_env`:
       "port": 1521,
       "user": "dowai",
       "database": "SERVICE_NAME",
-      "password_env": "DOWAI_ORACLE_PASSWORD",
+      "password": "{{ env_var('DOWAI_ORACLE_PASSWORD') }}",
       "tls": "oracle_native"
     },
     "sqlserver_mart": {
@@ -46,7 +46,7 @@ de ambiente indicadas por `password_env`:
       "port": 1433,
       "user": "dowai",
       "database": "mart",
-      "password_env": "DOWAI_SQLSERVER_PASSWORD",
+      "password": "{{ env_var('DOWAI_SQLSERVER_PASSWORD') }}",
       "tls": "required"
     }
   },
@@ -57,6 +57,9 @@ de ambiente indicadas por `password_env`:
   }
 }
 ```
+
+Uma senha literal usa `"password": "sua-senha"`; mantenha o arquivo fora do
+Git. `workspace.json` e `password_env` não são mais carregados.
 
 Declare tabelas de origem em `dowai_project.json`. O `profile` é opcional:
 Python pode selecioná-lo na chamada a `env.source()`. Para MySQL, `schema`

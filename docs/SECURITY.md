@@ -64,7 +64,7 @@ Estado atual:
 
 Estado atual:
 
-- Credenciais são referenciadas por variável de ambiente (`password_env` e similares). O valor não é gravado em arquivo de configuração.
+- Perfis aceitam `password` literal ou `{{ env_var('NOME') }}`. Prefira variáveis de ambiente: o valor literal fica em texto no `profiles.json`. O `init` adiciona o arquivo ao `.gitignore`, mas isso não remove arquivos já rastreados pelo Git.
 - Migração de configuração legada recusa literais de segredo (`password`, `secret`, `token`, `api_key`, `apikey`) e exige referência `*_env` ou gerenciador de segredos (`src/dowai-core/src/config.rs`).
 - O design do IPC impede que o segredo passe por argv, ambiente ou log do worker (ADR 0003, D05). A implementação de `connection_open` e o teste de não vazamento estão pendentes (ENT-043).
 - Pendente: mascaramento sistemático em `config show` (ENT-013), redação em logs JSONL (ENT-065) e teste de vazamento em erros e planos JSON.

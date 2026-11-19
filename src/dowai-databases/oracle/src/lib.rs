@@ -46,10 +46,20 @@ pub struct ConnectionProfile {
     pub port: u16,
     pub service: String,
     pub password_env: String,
+    password: Option<SecretPassword>,
     pub tls_mode: TlsMode,
     pub connect_timeout_secs: Option<u32>,
     /// Bounds each database round trip, not the overall duration of a query.
     pub call_timeout_secs: Option<u32>,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct SecretPassword(String);
+
+impl std::fmt::Debug for SecretPassword {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("<redacted>")
+    }
 }
 
 impl ConnectionProfile {
@@ -66,10 +76,16 @@ impl ConnectionProfile {
             port,
             service: service.into(),
             password_env: password_env.into(),
+            password: None,
             tls_mode: TlsMode::default(),
             connect_timeout_secs: None,
             call_timeout_secs: None,
         }
+    }
+
+    pub fn with_password(mut self, password: String) -> Self {
+        self.password = Some(SecretPassword(password));
+        self
     }
 
     pub fn with_tls_mode(mut self, tls_mode: TlsMode) -> Self {
@@ -112,7 +128,7 @@ impl ConnectionProfile {
                 "port must be between 1 and 65535".to_owned(),
             ));
         }
-        if self.password_env.trim().is_empty() {
+        if self.password.is_none() && self.password_env.trim().is_empty() {
             return Err(AdapterError::InvalidProfile(
                 "password environment variable name must not be empty".to_owned(),
             ));
@@ -156,9 +172,11 @@ impl ConnectionProfile {
 
     /// Fetches the password for an immediate connection attempt.
     ///
-    /// The profile stores only the environment variable name, never its value.
     pub fn password_from_env(&self) -> Result<String, AdapterError> {
         self.validate()?;
+        if let Some(password) = &self.password {
+            return Ok(password.0.clone());
+        }
         env::var(&self.password_env).map_err(|_| {
             AdapterError::MissingPasswordEnvironmentVariable(self.password_env.clone())
         })
@@ -931,6 +949,14 @@ fn validate_match_keys(columns: &[String], match_keys: &[&str]) -> Result<(), Ad
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn literal_password_is_used_and_redacted() {
+        let profile = ConnectionProfile::new("user", "localhost", 1521, "service", "")
+            .with_password("test-only-value".to_owned());
+        assert_eq!(profile.password_from_env().unwrap(), "test-only-value");
+        assert!(!format!("{profile:?}").contains("test-only-value"));
+    }
 
     #[test]
     fn profile_validation_requires_each_connection_setting() {

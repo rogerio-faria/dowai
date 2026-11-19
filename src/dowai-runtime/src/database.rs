@@ -64,13 +64,18 @@ impl DatabaseProfile {
             }
             "oracle" => {
                 let database = profile.database.clone();
+                let env_name = profile.password_env_name()?.map(str::to_owned);
+                let literal = env_name.is_none().then(|| profile.password.clone());
                 let mut adapter_profile = OracleProfile::new(
                     profile.user,
                     profile.host,
                     profile.port,
                     database.clone(),
-                    profile.password_env,
+                    env_name.unwrap_or_default(),
                 );
+                if let Some(password) = literal {
+                    adapter_profile = adapter_profile.with_password(password);
+                }
                 adapter_profile = adapter_profile.with_tls_mode(match profile.tls {
                     ProfileTlsMode::Required => OracleTlsMode::Required,
                     ProfileTlsMode::Disabled => OracleTlsMode::Disabled,
@@ -101,13 +106,18 @@ impl DatabaseProfile {
             }
             "sqlserver" => {
                 let database = profile.database.clone();
+                let env_name = profile.password_env_name()?.map(str::to_owned);
+                let literal = env_name.is_none().then(|| profile.password.clone());
                 let mut adapter_profile = SqlServerProfile::new(
                     profile.host,
                     profile.port,
                     database.clone(),
                     profile.user,
-                    profile.password_env,
+                    env_name.unwrap_or_default(),
                 );
+                if let Some(password) = literal {
+                    adapter_profile = adapter_profile.with_password(password);
+                }
                 adapter_profile.tls_mode = match profile.tls {
                     ProfileTlsMode::Required => SqlServerTlsMode::Required,
                     ProfileTlsMode::Disabled => SqlServerTlsMode::Disabled,
@@ -1096,7 +1106,7 @@ mod tests {
             "port": 1234,
             "user": "user",
             "database": "service",
-            "password_env": "DOWAI_TEST_PASSWORD",
+            "password": "{{ env_var('DOWAI_TEST_PASSWORD') }}",
             "tls": "required"
         }))
         .unwrap()
@@ -1177,13 +1187,23 @@ mod tests {
             "port": std::env::var("DOWAI_TEST_SQLSERVER_PORT").expect("SQL Server port is required").parse::<u16>().expect("invalid SQL Server port"),
             "user": std::env::var("DOWAI_TEST_SQLSERVER_USER").expect("SQL Server user is required"),
             "database": std::env::var("DOWAI_TEST_SQLSERVER_DATABASE").expect("SQL Server database is required"),
-            "password_env": "DOWAI_SQLSERVER_PASSWORD",
+            "password": "{{ env_var('DOWAI_SQLSERVER_PASSWORD') }}",
             "tls": "required"
         })).unwrap();
         let configuration = json!({"effective": {"database": {
             "connect_timeout_seconds": 30,
             "query_timeout_seconds": 30
         }}});
+        let mut literal_workspace = workspace.clone();
+        literal_workspace.password =
+            std::env::var("DOWAI_SQLSERVER_PASSWORD").expect("SQL Server password is required");
+        let literal_profile =
+            DatabaseProfile::from_workspace(literal_workspace, &configuration).unwrap();
+        let mut literal_adapter =
+            DatabaseAdapter::connect(&literal_profile).unwrap_or_else(|error| {
+                panic!("SQL Server literal-password connection failed: {:?}", error)
+            });
+        assert!(literal_adapter.test_connection().is_ok());
         let profile = DatabaseProfile::from_workspace(workspace, &configuration).unwrap();
         let mut adapter = DatabaseAdapter::connect(&profile)
             .unwrap_or_else(|error| panic!("SQL Server connection failed: {:?}", error));
@@ -1350,7 +1370,7 @@ mod tests {
             "port": std::env::var("DOWAI_TEST_ORACLE_PORT").expect("Oracle port is required").parse::<u16>().expect("invalid Oracle port"),
             "user": std::env::var("DOWAI_TEST_ORACLE_USER").expect("Oracle user is required"),
             "database": std::env::var("DOWAI_TEST_ORACLE_SERVICE").expect("Oracle service is required"),
-            "password_env": "DOWAI_ORACLE_PASSWORD",
+            "password": "{{ env_var('DOWAI_ORACLE_PASSWORD') }}",
             "tls": "oracle_native"
         })).unwrap();
         let configuration = json!({"effective": {"database": {

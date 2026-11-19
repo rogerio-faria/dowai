@@ -11,7 +11,7 @@ Uso (a partir da raiz do repositório), com as variáveis de conexão exportadas
 
 O exemplo é copiado para um diretório temporário. Um venv `.venv` é provisionado a partir de
 `requirements.lock` com `uv pip sync --require-hashes` (o runtime não instala pacotes). O
-`workspace.json` é gerado com os perfis `warehouse` (origem) e `financeiro` (destino).
+`profiles.json` é gerado com os perfis `warehouse` (origem) e `financeiro` (destino).
 
 O modelo `comissao.py` lê `faturamento` com `env.ref(...).to_pandas()`, calcula a comissão de 5% e
 grava com `env.write(df, target="financeiro", table="comissoes", mode="append")`. O runner cria a
@@ -84,7 +84,7 @@ def write_workspace(work, settings):
             "port": settings["port"],
             "user": settings["user"],
             "database": database,
-            "password_env": "DOWAI_EXAMPLE_PG_PASSWORD",
+            "password": "{{ env_var('DOWAI_EXAMPLE_PG_PASSWORD') }}",
             "tls": settings["tls"],
         }
 
@@ -96,7 +96,7 @@ def write_workspace(work, settings):
         },
         "defaults": {"execution": {"default_profile": "warehouse"}},
     }
-    with open(os.path.join(work, "workspace.json"), "w", encoding="utf-8") as handle:
+    with open(os.path.join(work, "profiles.json"), "w", encoding="utf-8") as handle:
         json.dump(workspace, handle)
 
 

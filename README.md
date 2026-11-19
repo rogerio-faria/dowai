@@ -18,7 +18,7 @@ A project looks like this:
 ```text
 sales/
 ├── dowai_project.json        # project, sources, Python interpreter, policies
-├── workspace.json            # PostgreSQL profiles (passwords come from environment variables)
+├── profiles.json             # database profiles; ignored by Git
 ├── models/
 │   ├── stg_orders.sql
 │   ├── customer_totals.sql
@@ -28,7 +28,7 @@ sales/
 └── .venv/                    # Python environment used by the models
 ```
 
-`workspace.json` declares the connection. The password is read from the variable named in `password_env`, never from the file:
+`profiles.json` declares the connection. `password` accepts a literal or, preferably, an environment variable reference:
 
 ```json
 {
@@ -40,13 +40,23 @@ sales/
       "port": 5432,
       "user": "dowai",
       "database": "analytics",
-      "password_env": "DOWAI_PG_PASSWORD",
+      "password": "{{ env_var('DOWAI_PG_PASSWORD') }}",
       "tls": "required"
     }
   },
   "defaults": { "execution": { "default_profile": "warehouse" } }
 }
 ```
+
+For a literal, use `"password": "your-password"` locally. Do not commit this file;
+the generated workspace `.gitignore` excludes it. Existing tracked files must be
+removed from Git's index separately. Rename old `workspace.json` files to
+`profiles.json` and change `password_env` to a `password` expression; the old
+format is not loaded.
+
+Models may be placed in any subdirectory of `models/` and selected by path or
+unique name. Names without extensions must be unique project-wide, including
+between SQL and Python; duplicate errors list all conflicting paths.
 
 `dowai_project.json` declares the source tables, the Python interpreter and the write policy:
 

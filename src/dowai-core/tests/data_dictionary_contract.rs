@@ -190,7 +190,7 @@ fn paths_are_discovered_from_workspace_and_project() {
     let workspace = root.join("ws");
     let project = workspace.join("projects/fat");
     fs::create_dir_all(&project).expect("project");
-    fs::write(workspace.join("workspace.json"), "{}").expect("workspace");
+    fs::write(workspace.join("profiles.json"), "{}").expect("workspace");
     fs::write(project.join("dowai_project.json"), "{}").expect("project file");
 
     let none = dictionary_paths_from(&project);

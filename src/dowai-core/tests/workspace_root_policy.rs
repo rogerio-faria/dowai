@@ -34,7 +34,7 @@ fn init_creates_workspace_under_user_writable_directory() {
     let root = create_project(&workspace, "demo").expect("init without root");
 
     assert!(root.join("dowai_project.json").is_file());
-    assert!(workspace.join("workspace.json").is_file());
+    assert!(workspace.join("profiles.json").is_file());
 }
 
 #[test]

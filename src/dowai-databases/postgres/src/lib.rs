@@ -32,9 +32,19 @@ pub struct PgProfile {
     user: String,
     database: String,
     password_env_var: String,
+    password: Option<SecretPassword>,
     tls_mode: TlsMode,
     connect_timeout: Duration,
     query_timeout: Option<Duration>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct SecretPassword(String);
+
+impl std::fmt::Debug for SecretPassword {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("<redacted>")
+    }
 }
 
 /// Bounds of `database.connect_timeout_seconds` (catalog: 1..=600 s).
@@ -56,10 +66,16 @@ impl PgProfile {
             user: user.into(),
             database: database.into(),
             password_env_var: password_env_var.into(),
+            password: None,
             tls_mode: TlsMode::Required,
             connect_timeout: Duration::from_secs(10),
             query_timeout: None,
         }
+    }
+
+    pub fn with_password(mut self, password: String) -> Self {
+        self.password = Some(SecretPassword(password));
+        self
     }
 
     pub fn tls_mode(&self) -> TlsMode {
@@ -105,7 +121,7 @@ impl PgProfile {
         if self.port == 0 {
             return Err(AdapterError::InvalidProfile("port"));
         }
-        if !valid_env_var_name(&self.password_env_var) {
+        if self.password.is_none() && !valid_env_var_name(&self.password_env_var) {
             return Err(AdapterError::InvalidProfile(
                 "password environment variable",
             ));
@@ -125,7 +141,12 @@ impl PgProfile {
     }
 
     fn resolve_password(&self) -> Result<String, AdapterError> {
-        std::env::var(&self.password_env_var).map_err(|_| AdapterError::MissingPassword)
+        match &self.password {
+            Some(password) => Ok(password.0.clone()),
+            None => {
+                std::env::var(&self.password_env_var).map_err(|_| AdapterError::MissingPassword)
+            }
+        }
     }
 }
 

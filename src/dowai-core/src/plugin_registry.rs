@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 pub const PLUGIN_LIST_SCHEMA_VERSION: u32 = 1;
 
 const PROJECT_FILE: &str = "dowai_project.json";
-const WORKSPACE_FILE: &str = "workspace.json";
+const WORKSPACE_FILE: &str = "profiles.json";
 const PLUGINS_DIR: &str = "plugins";
 
 /// Escopo pedido pelo usuário (`--scope project|global|all`).
@@ -100,7 +100,7 @@ pub struct PluginRoots {
 }
 
 /// Localiza o projeto (ancestral com `dowai_project.json`) e o workspace (ancestral com
-/// `workspace.json`). Ausentes ficam `None` e o escopo correspondente fica vazio.
+/// `profiles.json`). Ausentes ficam `None` e o escopo correspondente fica vazio.
 pub fn plugin_roots_from(start: &Path) -> PluginRoots {
     PluginRoots {
         project: start

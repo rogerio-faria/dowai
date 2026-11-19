@@ -8,7 +8,7 @@ Uso (a partir da raiz do repositório), com as variáveis de conexão exportadas
     #            DOWAI_EXAMPLE_PG_PASSWORD (nome da variável lida pelo dowai; vazia se ausente)
     python3 -I examples/sql-basic/run_example.py
 
-O exemplo é copiado para um diretório temporário, junto de um `workspace.json` gerado a partir
+O exemplo é copiado para um diretório temporário, junto de um `profiles.json` gerado a partir
 das variáveis acima; nenhuma credencial é gravada no repositório. As tabelas de origem são criadas
 no schema `dowai_example_sql_basic_landing` e os modelos `stg_clientes` e `faturamento` são criados
 no schema padrão do usuário do perfil. Tudo que o exemplo cria é removido ao fim.
@@ -67,13 +67,13 @@ def write_workspace(work, settings):
                 "port": settings["port"],
                 "user": settings["user"],
                 "database": settings["database"],
-                "password_env": "DOWAI_EXAMPLE_PG_PASSWORD",
+                "password": "{{ env_var('DOWAI_EXAMPLE_PG_PASSWORD') }}",
                 "tls": settings["tls"],
             }
         },
         "defaults": {"execution": {"default_profile": "warehouse"}},
     }
-    with open(os.path.join(work, "workspace.json"), "w", encoding="utf-8") as handle:
+    with open(os.path.join(work, "profiles.json"), "w", encoding="utf-8") as handle:
         json.dump(workspace, handle)
 
 
@@ -151,7 +151,7 @@ def main():
     settings = connection_settings()
     if settings is None:
         return 2
-    # O dowai exige que a variável indicada por password_env exista (vazia em autenticação confiável).
+    # O dowai exige que a variável indicada em password exista (vazia em autenticação confiável).
     os.environ.setdefault("DOWAI_EXAMPLE_PG_PASSWORD", "")
     work = tempfile.mkdtemp(prefix="dowai-example-sql-basic-")
     try:

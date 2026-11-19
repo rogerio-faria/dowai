@@ -1,7 +1,10 @@
 /target/
+profiles.json
 **/.dowai_venv/
 **/__pycache__/
 *.py[cod]
 
 # Requisitos mestres: mantidos localmente, fora do repositório
 /plano_mestre.md
+/set-db-passwords.ps1
+/db-sqlserver-oracle.info

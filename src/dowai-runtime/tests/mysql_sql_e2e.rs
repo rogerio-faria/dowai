@@ -102,7 +102,7 @@ impl Workspace {
                 "port": env("DOWAI_TEST_MYSQL_PORT").parse::<u16>().expect("valid MySQL port"),
                 "user": env("DOWAI_TEST_MYSQL_USER"),
                 "database": env("DOWAI_TEST_MYSQL_DATABASE"),
-                "password_env": "DOWAI_TEST_MYSQL_PASSWORD",
+                "password": "{{ env_var('DOWAI_TEST_MYSQL_PASSWORD') }}",
                 "tls": if std::env::var("DOWAI_TEST_MYSQL_TLS").as_deref() == Ok("required") {
                     "required"
                 } else {
@@ -119,7 +119,7 @@ impl Workspace {
                     "port": env("DOWAI_TEST_PG_PORT").parse::<u16>().expect("valid PostgreSQL port"),
                     "user": env("DOWAI_TEST_PG_USER"),
                     "database": env("DOWAI_TEST_PG_DATABASE"),
-                    "password_env": "DOWAI_TEST_PG_PASSWORD",
+                    "password": "{{ env_var('DOWAI_TEST_PG_PASSWORD') }}",
                     "tls": if std::env::var("DOWAI_TEST_PG_TLS").as_deref() == Ok("disabled") {
                         "disabled"
                     } else {
@@ -134,7 +134,7 @@ impl Workspace {
             "defaults": { "execution": { "default_profile": "warehouse" } }
         });
         fs::write(
-            self.root.join("workspace.json"),
+            self.root.join("profiles.json"),
             serde_json::to_vec(&workspace).expect("serialize workspace"),
         )
         .expect("write workspace config");
