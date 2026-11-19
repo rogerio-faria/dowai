@@ -7,7 +7,10 @@ use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static NEXT_SANDBOX: AtomicU64 = AtomicU64::new(0);
 
 struct Sandbox(PathBuf);
 
@@ -17,9 +20,16 @@ impl Sandbox {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let root =
-            std::env::temp_dir().join(format!("dowai-resolve-cli-{}-{nonce}", std::process::id()));
-        fs::create_dir_all(&root).expect("create sandbox");
+        Self::at(nonce)
+    }
+
+    fn at(nonce: u128) -> Self {
+        let id = NEXT_SANDBOX.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "dowai-resolve-cli-{}-{nonce}-{id}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).expect("create sandbox");
         Self(root)
     }
 
@@ -52,7 +62,8 @@ impl Sandbox {
         );
         assert!(
             init.status.success(),
-            "init failed: {}",
+            "init failed: {} {}",
+            String::from_utf8_lossy(&init.stdout),
             String::from_utf8_lossy(&init.stderr)
         );
         let payload: Value = serde_json::from_slice(&init.stdout).expect("init JSON");
@@ -64,6 +75,19 @@ impl Drop for Sandbox {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+#[test]
+fn sandboxes_created_at_the_same_time_are_independent() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let first = Sandbox::at(nonce);
+    let second = Sandbox::at(nonce);
+    assert_ne!(first.0, second.0);
+    drop(first);
+    assert!(second.0.is_dir());
 }
 
 /// Writes `<root>/plugins/<id>/plugin.json` and a module whose import would create `sentinel`.
