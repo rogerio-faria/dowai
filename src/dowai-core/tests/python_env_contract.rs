@@ -1,6 +1,7 @@
 //! Contrato de validação de divergência entre `dowai_project.json` e `pyproject.toml` (ENT-046).
 
 use dowai_core::validate_project_with_configuration;
+use serde_json::json;
 use std::fs;
 use std::path::PathBuf;
 
@@ -17,17 +18,22 @@ impl Sandbox {
                 .as_nanos()
         ));
         fs::create_dir_all(path.join("models")).unwrap();
+        let interpreter = if cfg!(windows) {
+            path.join(".venv").join("Scripts").join("python.exe")
+        } else {
+            path.join(".venv").join("bin").join("python")
+        };
         fs::write(
             path.join("dowai_project.json"),
-            r#"{
-  "schema_version": 2,
-  "name": "demo",
-  "python": {
-    "interpreter": "/usr/bin/python3",
-    "dependencies": ["Pandas>=2", "polars"]
-  }
-}
-"#,
+            json!({
+                "schema_version": 2,
+                "name": "demo",
+                "python": {
+                    "interpreter": interpreter,
+                    "dependencies": ["Pandas>=2", "polars"]
+                }
+            })
+            .to_string(),
         )
         .unwrap();
         Self(path)

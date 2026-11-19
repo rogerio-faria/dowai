@@ -78,9 +78,13 @@ impl Sandbox {
     }
 
     fn audit_events(&self) -> Vec<Value> {
-        fs::read_to_string(self.0.join("state/dowai/audit.jsonl"))
-            .or_else(|_| fs::read_to_string(self.0.join("state/audit.jsonl")))
-            .unwrap_or_default()
+        let path = if cfg!(windows) {
+            self.0.join("local/DOWAI/state/audit.jsonl")
+        } else {
+            self.0.join("state/dowai/audit.jsonl")
+        };
+        fs::read_to_string(path)
+            .expect("read audit")
             .lines()
             .map(|line| serde_json::from_str(line).expect("audit line"))
             .collect()

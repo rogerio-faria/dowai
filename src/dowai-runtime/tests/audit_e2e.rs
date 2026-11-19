@@ -36,6 +36,22 @@ impl Harness {
         let lock = ENVIRONMENT_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let python = if cfg!(windows) {
+            let output = Command::new("python")
+                .args([
+                    "-c",
+                    "import sys; sys.stdout.buffer.write(sys.executable.encode('utf-8'))",
+                ])
+                .output()
+                .expect("locate Python");
+            assert!(output.status.success(), "locate Python failed");
+            String::from_utf8(output.stdout)
+                .expect("Python path is UTF-8")
+                .trim()
+                .to_owned()
+        } else {
+            "python3".to_owned()
+        };
         let root = std::env::temp_dir().join(format!("dowai-audit-e2e-{}", Uuid::new_v4()));
         fs::create_dir_all(root.join("config")).expect("create config dir");
         let mut restore = Vec::new();
@@ -56,7 +72,7 @@ impl Harness {
         std::env::set_var("DOWAI_AUDIT_TEST_PASSWORD", SENTINEL_PASSWORD);
         let project = create_project(&root, "audit-fixture").expect("create project");
         let environment = project.join(".venv");
-        let created = Command::new("python3")
+        let created = Command::new(python)
             .args(["-m", "venv", "--without-pip"])
             .arg(&environment)
             .output()
@@ -66,8 +82,13 @@ impl Harness {
         let mut manifest: Value =
             serde_json::from_slice(&fs::read(&manifest_path).expect("read manifest"))
                 .expect("manifest JSON");
+        let interpreter = if cfg!(windows) {
+            environment.join("Scripts").join("python.exe")
+        } else {
+            environment.join("bin").join("python")
+        };
         manifest["python"] = json!({
-            "interpreter": environment.join("bin").join("python"),
+            "interpreter": interpreter,
             "timeout_seconds": 30
         });
         manifest["config"]["security"]["allow_external_writes"] = json!(true);

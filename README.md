@@ -284,6 +284,50 @@ cargo test --workspace
 
 On Linux without `pkg-config`, set first: `OPENSSL_DIR=/usr OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu OPENSSL_INCLUDE_DIR=/usr/include`.
 
+## Releases and installation
+
+Download an installer and `SHA256SUMS` from [GitHub Releases](https://github.com/rogerio-faria/dowai/releases).
+Verify its SHA-256 hash against the corresponding entry before installing. On Linux or
+macOS, run `sha256sum -c SHA256SUMS --ignore-missing` (or compare the output of
+`shasum -a 256 ./dowai-VERSION-macos-universal.pkg` on macOS); on Windows,
+compare `Get-FileHash .\installer.exe -Algorithm SHA256` with
+the entry in `SHA256SUMS`.
+
+- **Windows x64:** run the `.exe` installer as administrator. It installs to
+  `C:\Program Files\DOWAI` and adds that directory to the system PATH if needed.
+  Uninstall through Windows Apps; a pre-existing PATH entry is retained.
+  Open a new terminal to pick up PATH changes.
+- **Linux x64:** install the `.deb` with `sudo apt install ./dowai-VERSION-linux-x64.deb`
+  or the `.rpm` with `sudo dnf install ./dowai-VERSION-linux-x64.rpm`. Both install
+  `/usr/bin/dowai` and declare native library dependencies. Alternatively, run
+  `sudo sh ./dowai-VERSION-linux-x64.sh` to install `/usr/local/bin/dowai`; remove
+  that file to uninstall it. The self-extracting installer checks for missing
+  shared libraries but does not install them.
+- **macOS Intel/Apple Silicon:** run the universal `.pkg` installer, or use
+  `sudo installer -pkg ./dowai-VERSION-macos-universal.pkg -target /`. It installs
+  `/usr/local/bin/dowai`; remove that file to uninstall.
+
+The Linux binary is built on Ubuntu 22.04 and requires compatible system libraries,
+including glibc 2.35 or newer and OpenSSL 3. The macOS and Windows binaries use
+system libraries. The workflow checks native dependencies on each platform. These
+installers are unsigned, so operating-system security warnings may appear. They
+install only DOWAI, not Rust, Python, database servers, or Oracle Client; Python
+models and Oracle connections still require their separately configured runtimes.
+
+To publish a release, update and commit the CLI version in
+`src/dowai-cli/Cargo.toml` and `Cargo.lock`, then run **Actions → Release → Run
+workflow** on the desired ref with that exact version (without a `v` prefix or
+build metadata). The workflow runs the workspace tests on Linux and macOS and
+selected CLI, audit and contract tests on Windows (some other tests assume Unix paths), builds on
+native runners, validates installers, collects five assets and generates SHA-256 checksums.
+Only after all jobs succeed does it push `vVERSION` and create a non-draft GitHub
+Release with automatically generated notes. Stable versions are marked latest;
+versions with a prerelease suffix are marked prerelease and are not latest. An
+existing tag causes publication to fail; if release creation fails after the tag
+was pushed, resolve the tag manually before retrying. Opt-in live database tests
+are not run by this workflow. GitHub plans to retire the Ubuntu 22.04 runner on
+April 17, 2027; the Linux build baseline will need updating before then.
+
 ## Documentation
 
 - [Database samples](SAMPLES.md)
