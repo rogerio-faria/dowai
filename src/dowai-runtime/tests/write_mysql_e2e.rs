@@ -492,11 +492,12 @@ fn transfer_is_not_atomic_across_databases() {
 
 #[test]
 #[ignore = "opt-in E2E; requires disposable MySQL and PostgreSQL databases"]
-/// Perfil MySQL não vale como perfil de execução SQL: recusado com erro de configuração.
-fn mysql_profile_is_not_an_execution_profile() {
-    let fx = Fixture::new("exec", true, &[], &[]);
+/// SQL models can target MySQL using the same profile selector as PostgreSQL.
+fn mysql_profile_executes_sql_models() {
+    let target = format!("dowai_sql_exec_{}", nonce());
+    let fx = Fixture::new("exec", true, &[&target], &[]);
     fx.write_model("q.sql", "select 1 as id");
-    let outcome = run_postgres(
+    let result = run_postgres(
         &fx.project,
         RunRequest {
             targets: vec!["q.sql".to_owned()],
@@ -507,10 +508,15 @@ fn mysql_profile_is_not_an_execution_profile() {
             confirm_destructive: false,
             full_refresh: false,
         },
-    );
-    let error = outcome.expect_err("MySQL cannot run SQL models");
-    assert!(
-        error.to_string().contains("requires a PostgreSQL profile"),
-        "{error}"
-    );
+    )
+    .expect("MySQL profile runs SQL models");
+    assert_eq!(result.status, "SUCCEEDED");
+    let mut adapter = MysqlAdapter::connect(&mysql_profile()).expect("connect MySQL");
+    let rows = adapter
+        .query_rows(
+            &format!("SELECT id FROM {}", my_ident(&target).expect("identifier")),
+            &[],
+        )
+        .expect("read SQL model result");
+    assert_eq!(rows, vec![vec![DatasetCell::Int(1)]]);
 }

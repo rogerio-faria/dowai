@@ -3,6 +3,9 @@
 //! resolved at run time with the existing planner and recorded in a flat
 //! invocation history linked by `parent_invocation_id`.
 
+use crate::database::{
+    parse_quoted_relation, DatabaseAdapter, DatabaseError, DatabaseProfile, NativePage,
+};
 use crate::dataset_query::{self, FilterRequest};
 use crate::external_write::WriteRequest;
 use crate::python_runtime::{
@@ -11,9 +14,9 @@ use crate::python_runtime::{
 };
 use crate::resources;
 use crate::{
-    build_relations, enforce_profile_policy, prepare_postgres_plan, render_checked,
-    resolve_execution_mode, resolve_python_model_path, template_options, InvocationRecord,
-    SqlExecution,
+    build_relations, build_relations_for_database, enforce_profile_policy, prepare_postgres_plan,
+    render_checked, resolve_execution_mode, resolve_python_model_path, template_options,
+    InvocationRecord, SqlExecution,
 };
 use dowai_core::state::NodeStatus;
 use dowai_core::{
@@ -21,7 +24,7 @@ use dowai_core::{
     validate_project_with_configuration, CancellationToken, DowaiError, ExecutionMode, PlanNode,
     Result, SessionStore,
 };
-use dowai_mysql::{quote_identifier as mysql_quote, MysqlAdapter, MysqlProfile};
+use dowai_mysql::{quote_identifier as mysql_quote, MysqlAdapter};
 use dowai_postgres::{DatasetCell, PgProfile, PostgresAdapter};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -54,12 +57,36 @@ fn dataset_error(code: &'static str, message: &str) -> DowaiError {
     }
 }
 
+fn native_dataset_error(error: DatabaseError) -> DowaiError {
+    if matches!(error, DatabaseError::Cancelled) {
+        DowaiError::cancelled()
+    } else {
+        dataset_error(DATASET_UNAVAILABLE, &error.into_dowai().message())
+    }
+}
+
 /// What a worker asks to read: a model (`env.ref`) or a project-declared source
 /// (`env.source`, ENT-042).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DatasetRef {
     Model(String),
-    Source { source: String, table: String },
+    Source {
+        source: String,
+        table: String,
+        profile: Option<String>,
+    },
+}
+
+pub(crate) type SourceDefinitions = BTreeMap<(String, String), (String, String, Option<String>)>;
+
+struct ResolvedSource {
+    profile: String,
+    table: String,
+    schema: String,
+    relation: String,
+    is_postgres: bool,
+    is_native: bool,
+    is_model: bool,
 }
 
 /// Read-only dataset access (`env.ref`, `env.source`) for a mixed run. Model relations are
@@ -74,7 +101,10 @@ pub(crate) struct DatasetSource {
     /// Quoted relations written by SQL models of the plan.
     sql_relations: BTreeSet<String>,
     /// Tables declared by the project, `(source, table)` to their quoted relation.
-    sources: BTreeMap<(String, String), String>,
+    sources: SourceDefinitions,
+    project_dir: PathBuf,
+    configuration: Value,
+    default_profile: Option<String>,
     adapter: Option<PostgresAdapter>,
     columns: BTreeMap<String, Vec<(String, String)>>,
     /// Requests served (any operation), bounded by `MAX_DATASET_REQUESTS`.
@@ -84,73 +114,265 @@ pub(crate) struct DatasetSource {
     warnings: Vec<String>,
     /// `mysql` profiles of declared sources (ENT-116), resolved by name. An `Err` is reported on
     /// the first read of a source that uses it.
-    mysql_profiles: BTreeMap<String, std::result::Result<MysqlProfile, &'static str>>,
-    /// Declared sources read from a MySQL profile: `(source, table)` to `(profile, table)`.
-    mysql_sources: BTreeMap<(String, String), (String, String)>,
+    database_profiles: BTreeMap<String, std::result::Result<DatabaseProfile, String>>,
     mysql_adapters: BTreeMap<String, MysqlAdapter>,
-}
-
-/// MySQL side of the declared sources of a run (ENT-116).
-#[derive(Clone, Default)]
-pub(crate) struct MysqlSources {
-    pub profiles: BTreeMap<String, std::result::Result<MysqlProfile, &'static str>>,
-    pub sources: BTreeMap<(String, String), (String, String)>,
+    postgres_adapters: BTreeMap<String, PostgresAdapter>,
+    native_adapters: BTreeMap<String, DatabaseAdapter>,
+    cancel: CancellationToken,
 }
 
 impl DatasetSource {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         profile: std::result::Result<PgProfile, &'static str>,
         relations: BTreeMap<String, String>,
         sql_relations: BTreeSet<String>,
-        sources: BTreeMap<(String, String), String>,
+        sources: SourceDefinitions,
+        project_dir: &Path,
+        configuration: &Value,
+        default_profile: Option<String>,
+        cancel: CancellationToken,
     ) -> Self {
         Self {
             profile,
             relations,
             sql_relations,
             sources,
+            project_dir: project_dir.to_path_buf(),
+            configuration: configuration.clone(),
+            default_profile,
             adapter: None,
             columns: BTreeMap::new(),
             requests: 0,
             rows_served: 0,
             warnings: Vec::new(),
-            mysql_profiles: BTreeMap::new(),
-            mysql_sources: BTreeMap::new(),
+            database_profiles: BTreeMap::new(),
             mysql_adapters: BTreeMap::new(),
+            postgres_adapters: BTreeMap::new(),
+            native_adapters: BTreeMap::new(),
+            cancel,
         }
     }
 
-    /// Adds the declared sources that read from MySQL profiles (ENT-116).
-    pub(crate) fn with_mysql(mut self, mysql: MysqlSources) -> Self {
-        self.mysql_profiles = mysql.profiles;
-        self.mysql_sources = mysql.sources;
-        self
+    fn database_profile(&mut self, profile: &str) -> Result<DatabaseProfile> {
+        if !self.database_profiles.contains_key(profile) {
+            let resolved =
+                crate::resolve_profile(&self.project_dir, &self.configuration, Some(profile))
+                    .and_then(|(_, workspace_profile)| {
+                        DatabaseProfile::from_workspace(workspace_profile, &self.configuration)
+                    })
+                    .map_err(|error| error.message());
+            self.database_profiles.insert(profile.to_owned(), resolved);
+        }
+        self.database_profiles
+            .get(profile)
+            .ok_or_else(|| {
+                dataset_error(
+                    DATASET_UNAVAILABLE,
+                    "Dataset source profile is not available",
+                )
+            })?
+            .clone()
+            .map_err(|reason| dataset_error(DATASET_UNAVAILABLE, &reason))
     }
 
-    /// The MySQL `(profile, table)` of a declared source, when the source reads from MySQL.
-    fn mysql_source(&self, target: &DatasetRef) -> Option<(String, String)> {
-        match target {
-            DatasetRef::Source { source, table } => self
-                .mysql_sources
-                .get(&(source.clone(), table.clone()))
-                .cloned(),
-            DatasetRef::Model(_) => None,
+    fn resolve_source(&mut self, target: &DatasetRef) -> Result<Option<ResolvedSource>> {
+        let DatasetRef::Source {
+            source,
+            table,
+            profile,
+        } = target
+        else {
+            return Ok(None);
+        };
+        let (schema, table_name, declared_profile) = self
+            .sources
+            .get(&(source.clone(), table.clone()))
+            .cloned()
+            .ok_or_else(|| {
+                dataset_error(
+                    DATASET_SOURCE_UNDECLARED,
+                    "Source table is not declared in the project",
+                )
+            })?;
+        let profile_name = profile
+            .as_deref()
+            .or(declared_profile.as_deref())
+            .or(self.default_profile.as_deref())
+            .ok_or_else(|| {
+                dataset_error(
+                    DATASET_UNAVAILABLE,
+                    "No database profile is selected for this source",
+                )
+            })?
+            .to_owned();
+        let database = self.database_profile(&profile_name)?;
+        if !database.is_postgres() && !database.is_mysql() && !database.is_native() {
+            return Err(dataset_error(
+                DATASET_UNAVAILABLE,
+                "Python source reads are not yet supported for this database profile",
+            ));
         }
+        if database.is_mysql() && schema != database.database_name() {
+            return Err(dataset_error(
+                DATASET_UNAVAILABLE,
+                "A MySQL source schema must match the selected profile database",
+            ));
+        }
+        let relation = database
+            .relation(&schema, &table_name)
+            .map_err(|_| dataset_error(DATASET_UNAVAILABLE, "Source relation is invalid"))?;
+        Ok(Some(ResolvedSource {
+            profile: profile_name,
+            table: table_name,
+            schema,
+            relation,
+            is_postgres: database.is_postgres(),
+            is_native: database.is_native(),
+            is_model: false,
+        }))
+    }
+
+    fn native_model_source(&mut self, relation: &str) -> Result<Option<ResolvedSource>> {
+        let Some(profile_name) = self.default_profile.clone() else {
+            return Ok(None);
+        };
+        let database = self.database_profile(&profile_name)?;
+        let (opening, closing, sql) = match database {
+            DatabaseProfile::Oracle { .. } => (
+                '"',
+                '"',
+                "SELECT SYS_CONTEXT('USERENV','CURRENT_SCHEMA') AS \"DOWAI_SCHEMA\" FROM DUAL",
+            ),
+            DatabaseProfile::SqlServer { .. } => {
+                ('[', ']', "SELECT SCHEMA_NAME() AS [DOWAI_SCHEMA]")
+            }
+            _ => return Ok(None),
+        };
+        let parts = parse_quoted_relation(relation, opening, closing)
+            .map_err(|_| dataset_error(DATASET_UNAVAILABLE, "Dataset relation is invalid"))?;
+        let (schema, table) = match parts.as_slice() {
+            [schema, table] => (schema.clone(), table.clone()),
+            [table] => {
+                let cancel = self.cancel.clone();
+                let rows = self
+                    .native_adapter(&profile_name)?
+                    .native_query(sql, &[], &|| cancel.is_cancelled())
+                    .map_err(native_dataset_error)?;
+                let schema = rows
+                    .first()
+                    .and_then(|row| row["DOWAI_SCHEMA"].as_str())
+                    .ok_or_else(|| {
+                        dataset_error(DATASET_UNAVAILABLE, "Dataset schema is unavailable")
+                    })?;
+                (schema.to_owned(), table.clone())
+            }
+            _ => {
+                return Err(dataset_error(
+                    DATASET_UNAVAILABLE,
+                    "Dataset relation is invalid",
+                ))
+            }
+        };
+        Ok(Some(ResolvedSource {
+            profile: profile_name,
+            table,
+            schema,
+            relation: relation.to_owned(),
+            is_postgres: false,
+            is_native: true,
+            is_model: true,
+        }))
+    }
+
+    fn native_adapter(&mut self, profile: &str) -> Result<&mut DatabaseAdapter> {
+        if !self.native_adapters.contains_key(profile) {
+            let resolved = self.database_profile(profile)?;
+            let adapter = DatabaseAdapter::connect(&resolved).map_err(native_dataset_error)?;
+            self.native_adapters.insert(profile.to_owned(), adapter);
+        }
+        self.native_adapters
+            .get_mut(profile)
+            .ok_or_else(|| dataset_error(DATASET_UNAVAILABLE, "Dataset source connection failed"))
+    }
+
+    fn native_columns(&mut self, source: &ResolvedSource) -> Result<Vec<(String, String)>> {
+        let key = format!("native:{}:{}", source.profile, source.relation);
+        if let Some(columns) = self.columns.get(&key) {
+            return Ok(columns.clone());
+        }
+        let cancel = self.cancel.clone();
+        let columns = self
+            .native_adapter(&source.profile)?
+            .native_columns(&source.schema, &source.table, &|| cancel.is_cancelled())
+            .map_err(native_dataset_error)?;
+        if columns.is_empty() {
+            return Err(dataset_error(
+                DATASET_UNAVAILABLE,
+                "Dataset could not be described",
+            ));
+        }
+        self.columns.insert(key, columns.clone());
+        Ok(columns)
+    }
+
+    fn native_rows(
+        &mut self,
+        source: &ResolvedSource,
+        select: Option<&[String]>,
+        filters: &[FilterRequest],
+        offset: u64,
+        limit: u32,
+    ) -> Result<DatasetAnswer> {
+        if !filters.is_empty() {
+            return Err(dataset_error(
+                dataset_query::DATASET_FILTER_UNSUPPORTED,
+                "Filters are not supported for Oracle or SQL Server sources",
+            ));
+        }
+        let columns = self.native_columns(source)?;
+        let plan = dataset_query::plan(&columns, select, &[])?;
+        let order_columns: Vec<String> = columns.into_iter().map(|(name, _)| name).collect();
+        let selected: Vec<String> = plan.fetch.into_iter().map(|(name, _)| name).collect();
+        let cancel = self.cancel.clone();
+        let rows = self
+            .native_adapter(&source.profile)?
+            .native_rows(
+                &source.schema,
+                &source.table,
+                NativePage {
+                    columns: &selected,
+                    order_columns: &order_columns,
+                    offset,
+                    limit,
+                    allow_unkeyed: source.is_model,
+                },
+                &|| cancel.is_cancelled(),
+            )
+            .map_err(native_dataset_error)?;
+        self.rows_served += rows.len() as u64;
+        Ok(DatasetAnswer::Rows {
+            columns: selected,
+            rows,
+            residual: plan.residual,
+        })
     }
 
     /// MySQL adapter of a profile, connected on first use and kept for the run.
     fn mysql_adapter(&mut self, profile: &str) -> Result<&mut MysqlAdapter> {
         if !self.mysql_adapters.contains_key(profile) {
-            let resolved = self.mysql_profiles.get(profile).ok_or_else(|| {
-                dataset_error(
+            let resolved = self.database_profile(profile)?;
+            let DatabaseProfile::Mysql {
+                profile: adapter_profile,
+                ..
+            } = resolved
+            else {
+                return Err(dataset_error(
                     DATASET_UNAVAILABLE,
-                    "Dataset source profile is not available",
-                )
-            })?;
-            let adapter_profile = resolved
-                .as_ref()
-                .map_err(|reason| dataset_error(DATASET_UNAVAILABLE, reason))?;
-            let adapter = MysqlAdapter::connect(adapter_profile).map_err(|_| {
+                    "The selected source profile is not MySQL",
+                ));
+            };
+            let adapter = MysqlAdapter::connect(&adapter_profile).map_err(|_| {
                 dataset_error(DATASET_UNAVAILABLE, "Dataset source connection failed")
             })?;
             self.mysql_adapters.insert(profile.to_owned(), adapter);
@@ -175,6 +397,73 @@ impl DatasetSource {
             .collect();
         self.columns.insert(key, columns.clone());
         Ok(columns)
+    }
+
+    fn postgres_adapter(&mut self, profile: &str) -> Result<&mut PostgresAdapter> {
+        if !self.postgres_adapters.contains_key(profile) {
+            let resolved = self.database_profile(profile)?;
+            let DatabaseProfile::Postgres {
+                profile: adapter_profile,
+                ..
+            } = resolved
+            else {
+                return Err(dataset_error(
+                    DATASET_UNAVAILABLE,
+                    "The selected source profile is not PostgreSQL",
+                ));
+            };
+            let adapter = PostgresAdapter::connect(&adapter_profile).map_err(|_| {
+                dataset_error(DATASET_UNAVAILABLE, "Dataset source connection failed")
+            })?;
+            self.postgres_adapters.insert(profile.to_owned(), adapter);
+        }
+        self.postgres_adapters
+            .get_mut(profile)
+            .ok_or_else(|| dataset_error(DATASET_UNAVAILABLE, "Dataset source connection failed"))
+    }
+
+    fn postgres_columns(&mut self, profile: &str, relation: &str) -> Result<Vec<(String, String)>> {
+        let key = format!("postgres:{profile}:{relation}");
+        if let Some(columns) = self.columns.get(&key) {
+            return Ok(columns.clone());
+        }
+        let columns = self
+            .postgres_adapter(profile)?
+            .describe_relation(relation)
+            .map_err(|_| dataset_error(DATASET_UNAVAILABLE, "Dataset could not be described"))?;
+        self.columns.insert(key, columns.clone());
+        Ok(columns)
+    }
+
+    fn postgres_rows(
+        &mut self,
+        profile: &str,
+        relation: &str,
+        select: Option<&[String]>,
+        filters: &[FilterRequest],
+        offset: u64,
+        limit: u32,
+    ) -> Result<DatasetAnswer> {
+        let all_columns = self.postgres_columns(profile, relation)?;
+        let plan = dataset_query::plan(&all_columns, select, filters)?;
+        for warning in plan.warnings {
+            if !self.warnings.contains(&warning) {
+                self.warnings.push(warning);
+            }
+        }
+        let rows = self
+            .postgres_adapter(profile)?
+            .read_rows_filtered(relation, &plan.fetch, &plan.pushed, offset, limit)
+            .map_err(|_| dataset_error(DATASET_UNAVAILABLE, "Dataset rows could not be read"))?;
+        self.rows_served += rows.len() as u64;
+        Ok(DatasetAnswer::Rows {
+            columns: plan.fetch.into_iter().map(|(name, _)| name).collect(),
+            rows: rows
+                .into_iter()
+                .map(|row| row.into_iter().map(cell_to_json).collect())
+                .collect(),
+            residual: plan.residual,
+        })
     }
 
     /// One window of a MySQL source, in primary-key order. Filters are not pushed down or
@@ -254,20 +543,11 @@ impl DatasetSource {
     /// that the model declares as a dependency; a source must be declared by the project.
     /// Returns the quoted relation.
     fn authorize(&self, target: &DatasetRef, depends_on: &[String]) -> Result<String> {
-        let dataset = match target {
-            DatasetRef::Source { source, table } => {
-                return self
-                    .sources
-                    .get(&(source.clone(), table.clone()))
-                    .cloned()
-                    .ok_or_else(|| {
-                        dataset_error(
-                            DATASET_SOURCE_UNDECLARED,
-                            "Source table is not declared in the project",
-                        )
-                    });
-            }
-            DatasetRef::Model(dataset) => dataset,
+        let DatasetRef::Model(dataset) = target else {
+            return Err(dataset_error(
+                DATASET_SOURCE_UNDECLARED,
+                "Source table is not declared in the project",
+            ));
         };
         let relation =
             self.relations.get(dataset).cloned().ok_or_else(|| {
@@ -328,8 +608,14 @@ impl DatasetSource {
     }
 
     fn schema(&mut self, target: &DatasetRef, depends_on: &[String]) -> Result<DatasetAnswer> {
-        if let Some((profile, table)) = self.mysql_source(target) {
-            let columns = self.mysql_columns(&profile, &table)?;
+        if let Some(source) = self.resolve_source(target)? {
+            let columns = if source.is_postgres {
+                self.postgres_columns(&source.profile, &source.relation)?
+            } else if source.is_native {
+                self.native_columns(&source)?
+            } else {
+                self.mysql_columns(&source.profile, &source.table)?
+            };
             return Ok(DatasetAnswer::Columns(
                 columns
                     .into_iter()
@@ -338,6 +624,15 @@ impl DatasetSource {
             ));
         }
         let relation = self.authorize(target, depends_on)?;
+        if let Some(source) = self.native_model_source(&relation)? {
+            let columns = self.native_columns(&source)?;
+            return Ok(DatasetAnswer::Columns(
+                columns
+                    .into_iter()
+                    .map(|(name, data_type)| DatasetColumn { name, data_type })
+                    .collect(),
+            ));
+        }
         let columns = self.columns(&relation)?;
         Ok(DatasetAnswer::Columns(
             columns
@@ -377,10 +672,33 @@ impl DatasetSource {
                 "Dataset row limit reached for this run",
             ));
         }
-        if let Some((profile, table)) = self.mysql_source(target) {
-            return self.mysql_rows(&profile, &table, select, filters, offset, limit);
+        if let Some(source) = self.resolve_source(target)? {
+            return if source.is_postgres {
+                self.postgres_rows(
+                    &source.profile,
+                    &source.relation,
+                    select,
+                    filters,
+                    offset,
+                    limit,
+                )
+            } else if source.is_native {
+                self.native_rows(&source, select, filters, offset, limit)
+            } else {
+                self.mysql_rows(
+                    &source.profile,
+                    &source.table,
+                    select,
+                    filters,
+                    offset,
+                    limit,
+                )
+            };
         }
         let relation = self.authorize(target, depends_on)?;
+        if let Some(source) = self.native_model_source(&relation)? {
+            return self.native_rows(&source, select, filters, offset, limit);
+        }
         let all_columns = self.columns(&relation)?;
         let plan = dataset_query::plan(&all_columns, select, filters)?;
         for warning in plan.warnings {
@@ -431,7 +749,7 @@ fn cell_to_json(cell: DatasetCell) -> Value {
 pub(crate) struct Executor<'a> {
     pub root: &'a Path,
     pub models_dir: &'a Path,
-    pub interpreter: &'a Path,
+    pub interpreter: Option<&'a Path>,
     pub timeout: Duration,
     pub max_call_depth: usize,
     pub max_invocations: usize,
@@ -451,7 +769,7 @@ pub(crate) struct Executor<'a> {
     session_id: Option<String>,
     /// Open `env.write` session (ENT-048). At most one; it belongs to the model that opened it.
     writer: Option<crate::external_write::WriteSession>,
-    /// PostgreSQL side of the run, for SQL models run by nested `env.run` (ENT-114). Set by the
+    /// SQL side of the run, for SQL models run by nested `env.run` (ENT-114). Set by the
     /// run that owns the executor.
     pub(crate) sql: Option<SqlExecution>,
 }
@@ -463,7 +781,7 @@ pub(crate) struct Executor<'a> {
 pub(crate) struct ChildTemplate<'a> {
     root: &'a Path,
     models_dir: &'a Path,
-    interpreter: &'a Path,
+    interpreter: Option<&'a Path>,
     timeout: Duration,
     max_call_depth: usize,
     max_invocations: usize,
@@ -522,7 +840,7 @@ impl<'a> Executor<'a> {
     pub(crate) fn new(
         root: &'a Path,
         models_dir: &'a Path,
-        worker: WorkerSettings<'a>,
+        worker: Option<WorkerSettings<'a>>,
         configuration: &'a Value,
         store: &'a SessionStore,
         cancel: CancellationToken,
@@ -534,11 +852,24 @@ impl<'a> Executor<'a> {
                 .and_then(|value| usize::try_from(value).ok())
                 .ok_or_else(|| DowaiError::Config(format!("Effective execution.{name} is invalid")))
         };
+        let timeout = match &worker {
+            Some(worker) => worker.timeout,
+            None => Duration::from_secs(
+                configuration["effective"]["database"]["query_timeout_seconds"]
+                    .as_u64()
+                    .filter(|seconds| *seconds > 0)
+                    .ok_or_else(|| {
+                        DowaiError::Config(
+                            "Effective database.query_timeout_seconds is invalid".to_owned(),
+                        )
+                    })?,
+            ),
+        };
         Ok(Self {
             root,
             models_dir,
-            interpreter: worker.interpreter,
-            timeout: worker.timeout,
+            interpreter: worker.map(|worker| worker.interpreter),
+            timeout,
             max_call_depth: limit("max_call_depth")?,
             max_invocations: limit("max_invocations_per_run")?,
             configuration,
@@ -604,38 +935,58 @@ impl<'a> Executor<'a> {
         .1
     }
 
-    /// `{{ run("x.py") }}` (ENT-126): runs the Python file after its SQL model was materialized.
-    /// The file receives the model as `origem`; its call is journaled as an imperative call of
-    /// the SQL node, which is the parent. A failure fails the call, never the materialization.
+    /// Runs a SQL or Python target after materialization, preserving the SQL connection.
+    /// Python targets receive the parent model as `origem`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn run_post(
         &mut self,
         target: &str,
+        parent_path: &str,
         origin: &str,
         mode: ExecutionMode,
         variables: Variables,
         parent_invocation_id: &str,
         on_start: &mut dyn FnMut(&str),
     ) -> Result<Variables> {
+        let pushed_parent = self.stack.last().map(String::as_str) != Some(parent_path);
+        if pushed_parent {
+            self.stack.push(parent_path.to_owned());
+        }
         let depends_on = [origin.to_owned()];
-        self.record(
-            "imperative",
-            parent_invocation_id,
-            target,
-            mode,
-            |this, invocation_id| {
-                on_start(invocation_id);
-                this.execute_node(
-                    target,
-                    &depends_on,
-                    mode,
-                    variables,
-                    invocation_id,
-                    None,
-                    Some(origin),
-                )
-            },
-        )
-        .1
+        let result = self
+            .record(
+                "imperative",
+                parent_invocation_id,
+                target,
+                mode,
+                |this, invocation_id| {
+                    on_start(invocation_id);
+                    if is_python(target) {
+                        this.execute_node(
+                            target,
+                            &depends_on,
+                            mode,
+                            variables,
+                            invocation_id,
+                            None,
+                            Some(origin),
+                        )
+                    } else {
+                        this.run_child(
+                            target,
+                            mode,
+                            variables,
+                            invocation_id,
+                            Instant::now() + this.timeout,
+                        )
+                    }
+                },
+            )
+            .1;
+        if pushed_parent {
+            self.stack.pop();
+        }
+        result
     }
 
     /// Count one invocation attempt; fail once the per-run budget is exceeded.
@@ -743,7 +1094,12 @@ impl<'a> Executor<'a> {
         if let Some(cap) = parent_deadline {
             deadline = deadline.min(cap);
         }
-        let (root, interpreter) = (self.root, self.interpreter);
+        let interpreter = self.interpreter.ok_or_else(|| {
+            DowaiError::Config(
+                "Configure python.interpreter with the project's virtual environment".to_owned(),
+            )
+        })?;
+        let root = self.root;
         // ENT-038: limites do worker resolvidos antes de iniciá-lo; `require` recusa aqui,
         // sem executar código do usuário.
         let limits = resources::worker_limits(self.configuration)?;
@@ -846,9 +1202,12 @@ impl<'a> Executor<'a> {
                     request,
                     depth,
                     WorkerSettings {
-                        interpreter: self.interpreter,
+                        interpreter: self.interpreter.ok_or_else(|| DowaiError::Config(
+                            "Configure python.interpreter with the project's virtual environment".to_owned(),
+                        ))?,
                         timeout: self.timeout,
                     },
+                    self.cancel.clone(),
                 )?);
                 Ok(json!({ "state": "open" }))
             }
@@ -1168,7 +1527,10 @@ impl<'a> Executor<'a> {
         // The run-time plan of the target: in automatic mode its predecessors (Python and SQL
         // alike) run first. It never changes the static DAG of the caller (ENT-114).
         let scope = plan(self.root, &targets, mode)?;
-        let relations = build_relations(self.root, &scope)?;
+        let relations = match self.sql.as_ref().and_then(|sql| sql.profile.as_ref().ok()) {
+            Some(profile) => build_relations_for_database(self.root, &scope, profile)?,
+            None => build_relations(self.root, &scope)?,
+        };
         let mut predecessors = Vec::new();
         if mode == ExecutionMode::Automatic {
             predecessors = scope
@@ -1235,7 +1597,7 @@ impl<'a> Executor<'a> {
         self.execute_sql(node, relations, mode, &variables, invocation_id)
     }
 
-    /// Renders and materializes one SQL model with the run's PostgreSQL side. The variables it
+    /// Renders and materializes one SQL model with the run's SQL side. The variables it
     /// defines are returned to the caller, which merges them like any Python model's variables.
     fn execute_sql(
         &mut self,
@@ -1246,31 +1608,62 @@ impl<'a> Executor<'a> {
         invocation_id: &str,
     ) -> Result<Variables> {
         self.cancel.check()?;
-        let sql = self.sql.as_mut().ok_or_else(|| {
-            DowaiError::Execution("SQL execution is not configured for this run".to_owned())
-        })?;
-        let (prepared, next_variables) = render_checked(
-            self.root,
-            node,
-            variables,
-            &sql.template_options,
-            relations,
-            self.store,
-        )?;
-        sql.materialize(node, mode, None, None, &prepared)?;
-        // ENT-126: `run()` targets execute only after the materialization succeeded.
-        let mut variables = next_variables;
-        for target in &prepared.post_run_targets {
-            variables = self.run_post(
-                target,
-                &prepared.relation,
-                mode,
-                variables,
-                invocation_id,
-                &mut |_| {},
-            )?;
+        if self.stack.iter().any(|entry| entry == &node.path) {
+            return Err(DowaiError::Cycle(format!(
+                "Imperative call cycle detected: {}",
+                self.chain_with(&node.path)
+            )));
         }
-        Ok(variables)
+        if self.stack.len() > self.max_call_depth {
+            return Err(DowaiError::Execution(format!(
+                "Maximum call depth execution.max_call_depth={} exceeded: {}",
+                self.max_call_depth,
+                self.chain_with(&node.path)
+            )));
+        }
+        self.stack.push(node.path.clone());
+        let result = (|| {
+            let sql = self.sql.as_mut().ok_or_else(|| {
+                DowaiError::Execution("SQL execution is not configured for this run".to_owned())
+            })?;
+            let (prepared, next_variables) = render_checked(
+                self.root,
+                node,
+                variables,
+                &sql.template_options,
+                relations,
+                self.store,
+            )?;
+            sql.materialize(node, mode, None, None, &prepared)?;
+            if let Some(datasets) = self.datasets.as_mut() {
+                let relation = relations.get(&node.id.replace('\\', "/")).ok_or_else(|| {
+                    DowaiError::Execution("SQL model relation is unavailable".to_owned())
+                })?;
+                datasets.sql_relations.insert(relation.clone());
+                datasets.relations.extend(
+                    relations
+                        .iter()
+                        .filter(|(_, value)| *value == relation)
+                        .map(|(key, value)| (key.clone(), value.clone())),
+                );
+            }
+            // ENT-126: `run()` targets execute only after the materialization succeeded.
+            let mut variables = next_variables;
+            for target in &prepared.post_run_targets {
+                variables = self.run_post(
+                    target,
+                    &node.path,
+                    &prepared.relation,
+                    mode,
+                    variables,
+                    invocation_id,
+                    &mut |_| {},
+                )?;
+            }
+            Ok(variables)
+        })();
+        self.stack.pop();
+        result
     }
 }
 

@@ -12,6 +12,7 @@ pub enum ProfileTlsMode {
     #[default]
     Required,
     Disabled,
+    OracleNative,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -19,7 +20,7 @@ pub enum ProfileTlsMode {
 pub struct WorkspaceProfile {
     #[serde(rename = "type")]
     pub profile_type: String,
-    // SQL profiles (`postgres`, `mysql`) require these; an `external` profile leaves them empty.
+    // Network database profiles require these; driver-based profiles may leave them empty.
     #[serde(default)]
     pub host: String,
     #[serde(default)]
@@ -32,7 +33,7 @@ pub struct WorkspaceProfile {
     pub password_env: String,
     #[serde(default)]
     pub tls: ProfileTlsMode,
-    /// `external` profiles (ENT-128): driver file under `drivers/` (relative, `.py`).
+    /// External Python driver path or a system driver/provider name, depending on `type`.
     #[serde(default)]
     pub driver: Option<String>,
     /// Non-secret parameters passed to the driver. Literal secrets are refused.
@@ -78,8 +79,14 @@ fn parse_workspace_profile(
     let profile: WorkspaceProfile = serde_json::from_value(value.clone()).map_err(|error| {
         config_error(path, &format!("Invalid profile '{profile_name}': {error}"))
     })?;
+    if profile.tls == ProfileTlsMode::OracleNative && profile.profile_type != "oracle" {
+        return Err(config_error(
+            path,
+            &format!("Profile '{profile_name}' can use oracle_native encryption only with Oracle"),
+        ));
+    }
     match profile.profile_type.as_str() {
-        "postgres" | "mysql" => {}
+        "postgres" | "mysql" | "oracle" | "sqlserver" => {}
         "external" => {
             validate_external_profile(path, profile_name, &profile)?;
             return Ok(profile);

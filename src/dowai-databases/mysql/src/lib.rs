@@ -15,10 +15,11 @@
 //!   ou desfazer a transação.
 //! - Transações abrangem somente um banco. Não há atomicidade entre bancos (plano §10.2).
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dowai_postgres::{
-    Batch, Capabilities, ColumnInfo, DatasetCell, MergeCounters, RowCount, StreamLimits, TlsMode,
+    Batch, Capabilities, ColumnInfo, DatasetCell, Materialization, MergeCounters, RowCount,
+    StreamLimits, TlsMode,
 };
 use mysql::prelude::Queryable;
 pub use mysql::Value;
@@ -55,6 +56,7 @@ pub enum MysqlError {
     InvalidProfile(&'static str),
     InvalidIdentifier,
     InsecureTlsDisabled,
+    DestructiveApprovalRequired,
     MissingPassword,
     TlsConfigurationFailed,
     ConnectionFailed,
@@ -67,6 +69,7 @@ pub enum MysqlError {
     InflightLimitExceeded,
     InvalidWriteSpec(&'static str),
     DuplicateMergeKey,
+    SchemaMismatch,
     /// Capacidade que o MySQL não oferece com a mesma garantia (ex.: DDL em transação).
     Unsupported(&'static str),
 }
@@ -85,6 +88,9 @@ impl std::fmt::Display for MysqlError {
             Self::InvalidIdentifier => formatter.write_str("invalid MySQL identifier"),
             Self::InsecureTlsDisabled => {
                 formatter.write_str("TLS may only be disabled for a local MySQL host")
+            }
+            Self::DestructiveApprovalRequired => {
+                formatter.write_str("replacing an existing relation requires explicit approval")
             }
             Self::MissingPassword => {
                 formatter.write_str("required password environment variable is missing")
@@ -105,6 +111,9 @@ impl std::fmt::Display for MysqlError {
             }
             Self::DuplicateMergeKey => {
                 formatter.write_str("MySQL merge staging has duplicate keys")
+            }
+            Self::SchemaMismatch => {
+                formatter.write_str("MySQL full refresh schema differs from the existing relation")
             }
             Self::Unsupported(reason) => {
                 write!(formatter, "unsupported by MySQL adapter: {reason}")
@@ -275,6 +284,12 @@ pub struct MysqlAdapter {
     staging: Vec<String>,
 }
 
+#[derive(Clone, Copy)]
+enum RelationKind {
+    Table,
+    View,
+}
+
 impl MysqlAdapter {
     pub fn connect(profile: &MysqlProfile) -> Result<Self, MysqlError> {
         profile.validate()?;
@@ -325,6 +340,123 @@ impl MysqlAdapter {
             .query_drop("SELECT 1")
             .map_err(classify)
             .map(|()| MYSQL_CAPABILITIES)
+    }
+
+    /// Builds a table or view from one SQL statement. MySQL DDL is not transactional, so an
+    /// existing relation is swapped with a staged relation using one `RENAME TABLE` statement.
+    pub fn materialize(
+        &mut self,
+        relation: &str,
+        materialization: Materialization,
+        query: &str,
+        allow_replace: bool,
+    ) -> Result<(), MysqlError> {
+        self.materialize_with_mode(relation, materialization, query, allow_replace, false)
+    }
+
+    pub fn full_refresh(
+        &mut self,
+        relation: &str,
+        materialization: Materialization,
+        query: &str,
+    ) -> Result<(), MysqlError> {
+        self.materialize_with_mode(relation, materialization, query, true, true)
+    }
+
+    fn materialize_with_mode(
+        &mut self,
+        relation: &str,
+        materialization: Materialization,
+        query: &str,
+        allow_replace: bool,
+        check_schema: bool,
+    ) -> Result<(), MysqlError> {
+        let relation_q = quote_identifier(relation)?;
+        if query.trim().is_empty() {
+            return Err(MysqlError::QueryFailed);
+        }
+        let existing = self.relation_kind(relation)?;
+        if existing.is_some() && !allow_replace {
+            return Err(MysqlError::DestructiveApprovalRequired);
+        }
+
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| MysqlError::QueryFailed)?
+            .as_nanos()
+            % 1_000_000_000;
+        let stage_name = format!("dw_stg_{}_{}", std::process::id(), suffix);
+        let old_name = format!("dw_old_{}_{}", std::process::id(), suffix);
+        let stage_q = quote_identifier(&stage_name)?;
+        let old_q = quote_identifier(&old_name)?;
+        let create = match materialization {
+            Materialization::Table => format!("CREATE TABLE {stage_q} AS {query}"),
+            Materialization::View => format!("CREATE VIEW {stage_q} AS {query}"),
+        };
+        self.conn.query_drop(create).map_err(classify)?;
+
+        if check_schema && existing.is_some() {
+            let current = self.introspect_table(relation)?;
+            let candidate = self.introspect_table(&stage_name)?;
+            if current != candidate {
+                let _ = self
+                    .conn
+                    .query_drop(format!("DROP TABLE IF EXISTS {stage_q}"));
+                let _ = self
+                    .conn
+                    .query_drop(format!("DROP VIEW IF EXISTS {stage_q}"));
+                return Err(MysqlError::SchemaMismatch);
+            }
+        }
+
+        let renamed = match existing {
+            Some(_) => self.conn.query_drop(format!(
+                "RENAME TABLE {relation_q} TO {old_q}, {stage_q} TO {relation_q}"
+            )),
+            None => self
+                .conn
+                .query_drop(format!("RENAME TABLE {stage_q} TO {relation_q}")),
+        };
+        if let Err(error) = renamed {
+            let _ = self
+                .conn
+                .query_drop(format!("DROP TABLE IF EXISTS {stage_q}"));
+            let _ = self
+                .conn
+                .query_drop(format!("DROP VIEW IF EXISTS {stage_q}"));
+            return Err(classify(error));
+        }
+
+        if let Some(kind) = existing {
+            let drop = match kind {
+                RelationKind::Table => "DROP TABLE",
+                RelationKind::View => "DROP VIEW",
+            };
+            self.conn
+                .query_drop(format!("{drop} {old_q}"))
+                .map_err(classify)?;
+        }
+        Ok(())
+    }
+
+    fn relation_kind(&mut self, relation: &str) -> Result<Option<RelationKind>, MysqlError> {
+        quote_identifier(relation)?;
+        let kind: Option<String> = self
+            .conn
+            .exec_first(
+                "SELECT CAST(table_type AS CHAR) FROM information_schema.tables \
+                 WHERE table_schema = DATABASE() AND table_name = ?",
+                (relation,),
+            )
+            .map_err(classify)?;
+        match kind.as_deref() {
+            None => Ok(None),
+            Some("BASE TABLE") => Ok(Some(RelationKind::Table)),
+            Some("VIEW") => Ok(Some(RelationKind::View)),
+            Some(_) => Err(MysqlError::Unsupported(
+                "only tables and views can be materialized",
+            )),
+        }
     }
 
     /// Colunas da chave primária de `table`, na ordem da chave (vazio se não houver).

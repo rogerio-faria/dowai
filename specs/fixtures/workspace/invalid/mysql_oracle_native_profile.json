@@ -1,0 +1,14 @@
+{
+  "schema_version": 2,
+  "profiles": {
+    "mysql": {
+      "type": "mysql",
+      "host": "db.example.test",
+      "port": 3306,
+      "user": "dowai",
+      "database": "service",
+      "password_env": "DOWAI_MYSQL_PASSWORD",
+      "tls": "oracle_native"
+    }
+  }
+}

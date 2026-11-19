@@ -6,13 +6,16 @@ This sequence follows the milestone gates in [plano_mestre.md](../plano_mestre.m
    resolution and static planning are implemented and tested locally; remaining
    work includes broader schemas, CI/platform coverage, the full config
    catalog, and integration of persistent sessions with execution.
-2. **M2 — SQL execution:** SQL-only PostgreSQL `table`/`view` execution,
-   `ref()` resolution, declared `source()` relations, and per-model
-   transactional replacement are implemented locally; session-backed runtime
-   verification for refs, sources, variables, and replacement approval passes
-   against PostgreSQL 17.4 with loopback TLS disabled. Remote TLS, production
-   credentials, MySQL, and cross-database E2E remain outstanding. The PostgreSQL
-   adapter provides TLS-by-default connections and bound parameters.
+2. **M2 — SQL execution:** PostgreSQL, MySQL, Oracle and SQL Server `table`/`view` execution,
+   `ref()` resolution, declared `source()` relations, and per-model replacement
+   are implemented locally. SQL source reads use the selected execution
+   profile; a different declared profile is rejected rather than staged or
+   converted. Nested SQL runs reuse the selected SQL profile. Session-backed
+   PostgreSQL runtime verification passes; opt-in MySQL SQL E2E verification
+   remains dependent on database test settings. Oracle and SQL Server were tested
+   against live encrypted connections; their documented timeout, DDL and
+   full-refresh limitations remain. The PostgreSQL adapter provides
+   TLS-by-default connections and bound parameters.
 3. **M3 — Python runtime:** the first Python-only, session-backed execution
    path is implemented with versioned JSON IPC, project-local venv selection,
    a configurable timeout, process-tree termination, variable APIs, and

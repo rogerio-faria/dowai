@@ -42,7 +42,8 @@ and administrator files contain supported sections at the root beside
 `schema_version`.
 
 Workspace files may also contain a `profiles` object for connection metadata.
-The implemented adapter currently accepts PostgreSQL profiles in this form:
+PostgreSQL, MySQL, Oracle and SQL Server profiles use the same fields; select the database adapter
+with `type`:
 
 ```json
 {
@@ -69,27 +70,50 @@ The implemented adapter currently accepts PostgreSQL profiles in this form:
 
 `password_env` is a variable name, not a password value. Profile objects
 reject unknown fields, require TLS unless explicitly disabled for a loopback
-host, and are not included in effective configuration output. `doctor
---check-connections` uses `execution.default_profile`; the check performs only
-a read-only `SELECT 1`. The SQL `run` path uses that profile to execute
-PostgreSQL table/view models. Effective `security.allow_external_writes` must
-be enabled before a run may write to PostgreSQL. Replacing an existing table
-or view is separately subject to `security.require_approval_for_destructive`;
-when approval is required, pass `--yes` to confirm replacement. Administrator
-ceilings cannot be weakened by project or user settings.
+host, and are not included in effective configuration output. `doctor --check-connections` uses `execution.default_profile`; the check
+performs only a read-only `SELECT 1`. SQL `run` uses the selected profile to
+execute table/view models in PostgreSQL, MySQL, Oracle or SQL Server. Effective
+`security.allow_external_writes` must be enabled before a run may write to a
+database. Replacing an existing table or view is separately subject to
+`security.require_approval_for_destructive`; when approval is required, pass
+`--yes` to confirm replacement. Administrator ceilings cannot be weakened by
+project or user settings.
 
-MySQL profiles (ENT-034) use the same fields with `"type": "mysql"` (typically
-port 3306) and `password_env` holding a variable name. A `mysql` profile is
-supported only as an `env.write` destination (`append`, `replace`, `upsert`),
-under the same `security.allowed_profiles`, `allowed_hosts` and
-`allow_external_writes` policy as PostgreSQL; TLS is required unless disabled
-for a loopback host. Using it as the SQL execution profile (`--profile`,
-`execution.default_profile`, `doctor --check-connections`) is refused with a
-configuration error. MySQL has no transactional DDL (the adapter refuses DDL
-inside a transaction instead of letting it commit implicitly) and no
-`ON CONFLICT`; upsert uses `ON DUPLICATE KEY UPDATE`. A PostgreSQL to MySQL
-transfer is two independent transactions: there is no atomicity across
-databases.
+Oracle profiles may select `tls: "oracle_native"` for required native AES encryption and
+SHA-2 integrity, using the `TNS_ADMIN` configuration described in the README. This setting
+is reserved for Oracle. Oracle and SQL Server profiles also support SQL execution,
+`env.source()` and `env.write()`. Oracle's client timeout limits each database round trip,
+not the total query duration; cancellation requested by the runtime can be delayed by
+the server. An interrupted SQL Server connection is discarded, and the outcome of an
+interrupted commit or DDL can be uncertain.
+
+MySQL profiles typically use port 3306. All four adapter types are accepted for
+`--profile`, `execution.default_profile`, `doctor --check-connections`,
+`env.source()` and `env.write()`, under the same `security.allowed_profiles`,
+`allowed_hosts`, TLS, and `allow_external_writes` policies. `env.write()`
+supports `append`, `replace`, and `upsert`; MySQL upsert uses
+`ON DUPLICATE KEY UPDATE` (and may be activated by any unique index on the
+destination). Oracle and SQL Server paginated source reads require a primary key,
+return non-null values as text, and do not support filters. SQL model datasets without
+a primary key use `ROWID` on Oracle and binary-converted columns on SQL Server;
+unsupported conversions or views without a primary key are rejected.
+
+SQL models use one selected profile and connection for both source reads and
+materialization. A SQL `source()` declaration that names a different profile
+is rejected when the model references it; DOWAI does not stage or convert SQL
+source data between databases. Nested `{{ run("other.sql") }}` calls continue
+using that same profile. A SQL model may call Python with `{{ run("task.py") }}`;
+that Python model can explicitly choose its own source and destination with
+`env.source()` and `env.write()`.
+
+MySQL DDL is not transactional. Existing table/view replacement is performed
+through a staging relation and one `RENAME TABLE` statement; full refresh
+requires the destination schema to match. A MySQL-to-PostgreSQL or
+PostgreSQL-to-MySQL `env.write()` transfer uses independent transactions, so
+there is no atomicity across databases.
+Oracle DDL commits implicitly and table replacement is not atomic. `full_refresh`
+is not implemented for Oracle or SQL Server. Transfers involving them likewise
+are not atomic across databases.
 
 Projects can declare external PostgreSQL relations for static `source()`
 macros in `dowai_project.json`. The source and table names are template lookup
@@ -111,20 +135,23 @@ names; schema and relation names are quoted as PostgreSQL identifiers:
 }
 ```
 
-`{{ source('warehouse', 'orders') }}` resolves to
-`"landing zone"."order facts"` on the selected PostgreSQL connection. Sources
-are external inputs, not executable plan nodes. By default a source uses the
-PostgreSQL connection selected for model execution. A source may declare an
-optional `"profile"` naming a `mysql` profile (ENT-116, D-121): then `schema`
-must equal that profile's database, `tables` maps to MySQL tables, and
-`env.source(name, table)` reads them (`schema()`, `iter_rows`, `select`). Such a
-table needs a primary key (batches are read in key order), and `filter` on it
-returns `DOWAI_DATASET_FILTER_UNSUPPORTED`. A MySQL source does not take part in
-`env.ref`, SQL models, or the PostgreSQL profile policy beyond the named profile
-and `allowed_profiles`/`allowed_hosts`. Undeclared sources, dynamic arguments,
-and unsupported adapters fail explicitly. Profile layering and live database
-verification are not implemented. Full refresh is implemented only for PostgreSQL
-(staging and swap, `--yes` required).
+`{{ source('warehouse', 'orders') }}` resolves using the selected SQL profile's
+identifier quoting and database rules. Sources are external inputs, not
+executable plan nodes. SQL models must use the same profile for the source and
+execution; if a source declaration names a different profile, the model fails
+when it references that source. For MySQL, `schema` must equal the selected
+profile database and `tables` maps to tables in that database.
+
+Python `env.source(name, table, profile=None)` reads declared sources from
+either adapter (`schema()`, `iter_rows`, `select`). The optional `profile`
+overrides the profile on the source declaration; if omitted, the declared
+profile is used, falling back to the default execution profile. Profile and
+host authorization policies still apply. MySQL tables need a primary key for
+ordered batches, and `filter` on them returns
+`DOWAI_DATASET_FILTER_UNSUPPORTED`. `env.ref()` remains limited to PostgreSQL
+model datasets. Undeclared sources, dynamic arguments, and unsupported
+adapters fail explicitly. Full refresh is supported for both adapters; MySQL
+requires the destination schema to match.
 
 Python-only model execution is configured separately from database profiles:
 
@@ -326,7 +353,7 @@ Unidades e limites aparecem na tabela. Limites mínimos e máximos são inclusiv
 #### Destinos de `env.write` (ENT-127)
 
 - `env.write(..., target="NOME")` aceita somente perfis declarados em `workspace.json` (`profiles`) e permitidos pela política (`security.allowed_profiles`). O nome não declarado é recusado com `DOWAI_CONFIG_INVALID` (mensagem: `Unknown connection profile 'NOME'`) **antes de qualquer conexão**.
-- Tipos suportados: `postgres`, `mysql` e `external` (driver Python, ENT-128).
+- Tipos suportados: `postgres`, `mysql`, `oracle`, `sqlserver` e `external` (driver Python, ENT-128).
 - Os modos são fixos: `append`, `replace` (com `confirm_replace=True`) e `upsert` (com `keys`). A escolha do método correto, a ausência de duplicidade e as cláusulas de filtro são responsabilidade do usuário; o DOWAI garante perfil, schema, política e transação no destino.
 - `origem` pode ser `None` quando o modelo Python é executado diretamente; o arquivo deve tratar esse caso (ver `examples/sql-run-post`).
 

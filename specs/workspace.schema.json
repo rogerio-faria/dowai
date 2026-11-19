@@ -11,7 +11,7 @@
     "profiles": {
       "type": "object",
       "propertyNames": { "pattern": "^[^/\\\\\\u0000-\\u001f]+$" },
-      "additionalProperties": { "$ref": "#/$defs/postgres_profile" }
+      "additionalProperties": { "$ref": "#/$defs/database_profile" }
     },
     "defaults": {
       "type": "object",
@@ -19,12 +19,12 @@
     }
   },
   "$defs": {
-    "postgres_profile": {
+    "database_profile": {
       "type": "object",
       "additionalProperties": false,
       "required": ["type", "host", "port", "user", "database", "password_env"],
       "properties": {
-        "type": { "const": "postgres" },
+        "type": { "enum": ["postgres", "mysql", "oracle", "sqlserver"] },
         "host": { "type": "string", "minLength": 1 },
         "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
         "user": { "type": "string", "minLength": 1 },
@@ -33,8 +33,14 @@
           "type": "string",
           "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
         },
-        "tls": { "enum": ["required", "disabled"], "default": "required" }
-      }
+        "tls": { "enum": ["required", "disabled", "oracle_native"], "default": "required" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "type": { "const": "oracle" } } },
+          "else": { "properties": { "tls": { "enum": ["required", "disabled"] } } }
+        }
+      ]
     }
   }
 }

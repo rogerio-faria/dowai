@@ -222,7 +222,16 @@ fn ent116_mysql_source_reads_schema_ordered_batches_and_projection() {
     mysql_exec(&format!(
         "INSERT INTO {table} VALUES (3, 'c'), (1, 'a'), (2, 'b')"
     ));
-    let fx = Fixture::new("read", &table, json!({}));
+    let fx = Fixture::new(
+        "read",
+        &table,
+        json!({
+            "override": {
+                "schema": env_var("DOWAI_TEST_MYSQL_DATABASE"),
+                "tables": { "items": table }
+            }
+        }),
+    );
     fx.write_model(
         "reader.py",
         "def model(env):\n\
@@ -233,6 +242,8 @@ fn ent116_mysql_source_reads_schema_ordered_batches_and_projection() {
          \x20   env.setVar('n', len(rows))\n\
          \x20   env.setVar('id_sum', sum(r['id'] for r in rows))\n\
          \x20   env.setVar('labels', ','.join(r['label'] for r in rows))\n\
+         \x20   selected = env.source('override', 'items', profile='mart')\n\
+         \x20   env.setVar('selected_sum', sum(r['id'] for r in selected.iter_rows(batch_size=10)))\n\
          \x20   picked = list(src.select('label').iter_rows(batch_size=10))\n\
          \x20   env.setVar('picked_keys', ','.join(sorted(picked[0].keys())))\n\
          \x20   try:\n\
@@ -249,6 +260,7 @@ fn ent116_mysql_source_reads_schema_ordered_batches_and_projection() {
     assert_eq!(variables["cols"], json!("id,label"));
     assert_eq!(variables["n"], json!(3));
     assert_eq!(variables["id_sum"], json!(6));
+    assert_eq!(variables["selected_sum"], json!(6));
     assert_eq!(variables["labels"], json!("a,b,c"));
     assert_eq!(variables["picked_keys"], json!("label"));
     assert_eq!(

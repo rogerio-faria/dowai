@@ -320,6 +320,71 @@ fn workspace_profiles_use_environment_references_and_default_to_tls() {
 }
 
 #[test]
+fn native_database_profiles_validate_environment_secrets() {
+    let tree = TestConfigTree::new();
+    let project = tree.path().join("workspace").join("projects").join("sales");
+    fs::create_dir_all(&project).expect("create project");
+    tree.write_json(
+        "workspace/workspace.json",
+        &json!({
+            "schema_version": 2,
+            "profiles": {
+                "oracle": {
+                    "type": "oracle",
+                    "host": "oracle.example.test",
+                    "port": 1521,
+                    "user": "dowai",
+                    "database": "analytics",
+                    "password_env": "DOWAI_ORACLE_PASSWORD",
+                    "tls": "oracle_native"
+                },
+                "sqlserver": {
+                    "type": "sqlserver",
+                    "host": "sqlserver.example.test",
+                    "port": 1433,
+                    "user": "dowai",
+                    "database": "analytics",
+                    "password_env": "DOWAI_SQLSERVER_PASSWORD"
+                }
+            }
+        }),
+    );
+
+    for name in ["oracle", "sqlserver"] {
+        load_workspace_profile(&project, name).expect("valid database profile");
+    }
+    assert_eq!(
+        load_workspace_profile(&project, "oracle").unwrap().tls,
+        ProfileTlsMode::OracleNative
+    );
+}
+
+#[test]
+fn oracle_native_encryption_is_rejected_for_other_profiles() {
+    let tree = TestConfigTree::new();
+    let project = tree.path().join("workspace").join("projects").join("sales");
+    fs::create_dir_all(&project).expect("create project");
+    tree.write_json(
+        "workspace/workspace.json",
+        &json!({
+            "schema_version": 2,
+            "profiles": {
+                "mysql": {
+                    "type": "mysql",
+                    "host": "db.example.test",
+                    "port": 3306,
+                    "user": "dowai",
+                    "database": "analytics",
+                    "password_env": "DOWAI_MYSQL_PASSWORD",
+                    "tls": "oracle_native"
+                }
+            }
+        }),
+    );
+    assert!(load_workspace_profile(&project, "mysql").is_err());
+}
+
+#[test]
 fn workspace_profiles_reject_literal_passwords_and_unknown_fields() {
     let tree = TestConfigTree::new();
     let project = tree.path().join("workspace").join("projects").join("sales");

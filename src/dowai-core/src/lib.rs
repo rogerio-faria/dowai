@@ -69,6 +69,7 @@ pub use sessions::{
     VersionedSnapshot,
 };
 pub use templates::{
-    declares_post_run, render_sql_model, render_template, source_relation_key, Materialization,
-    RenderedSqlModel, TemplateOptions, TemplateRender,
+    declares_post_run, render_sql_model, render_template, source_relation_key,
+    static_sql_references, Materialization, RenderedSqlModel, StaticSqlReference, TemplateOptions,
+    TemplateRender,
 };

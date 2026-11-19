@@ -1,4 +1,5 @@
 use auditor::Auditor;
+use database::{DatabaseAdapter, DatabaseError, DatabaseProfile};
 use dowai_core::{
     admin_config_path, current_time_ms, default_run_store_path, load_project,
     load_workspace_profile, plan, read_planned_model, resolve_effective_configuration, sha256_hex,
@@ -8,10 +9,7 @@ use dowai_core::{
     VariableOrigin, VersionedSnapshot, WorkspaceProfile,
 };
 use dowai_mysql::MysqlProfile;
-use dowai_postgres::{
-    quote_identifier, AdapterError, Materialization as PostgresMaterialization, PgProfile,
-    PostgresAdapter, TlsMode,
-};
+use dowai_postgres::{quote_identifier, AdapterError, PgProfile, TlsMode};
 pub use plugin_exec::{execute_plugin, PluginExecution, PluginPolicy, DEFAULT_MAX_OUTPUT_BYTES};
 use retry::{run_with_retry, wait_unless_cancelled, RetryPolicy};
 use serde::Serialize;
@@ -24,6 +22,7 @@ use uuid::Uuid;
 
 mod auditor;
 pub mod benchmark;
+mod database;
 mod dataset_query;
 mod executor;
 mod external_driver;
@@ -543,10 +542,12 @@ fn model_hash(root: &Path, node: &PlanNode) -> Option<String> {
 /// Runs one Python node, emitting `node.started` / `node.finished` around it.
 /// Audits and runs one `run()` target of a SQL model (ENT-126), as `run_python_node` does for a
 /// plan node: a started and a finished audit event, with the failure when it failed.
+#[allow(clippy::too_many_arguments)]
 fn run_post_target(
     executor: &mut executor::Executor<'_>,
     audit: &mut Auditor,
     target: &str,
+    parent_path: &str,
     origin: &str,
     mode: ExecutionMode,
     variables: BTreeMap<String, Value>,
@@ -555,6 +556,7 @@ fn run_post_target(
     let mut started_id: Option<String> = None;
     let outcome = executor.run_post(
         target,
+        parent_path,
         origin,
         mode,
         variables,
@@ -908,10 +910,10 @@ fn execute_run(
         let mut executor = executor::Executor::new(
             &root,
             &models_dir,
-            executor::WorkerSettings {
+            Some(executor::WorkerSettings {
                 interpreter,
                 timeout: Duration::from_secs(python.timeout_seconds),
-            },
+            }),
             &configuration,
             &store,
             cancel.clone(),
@@ -924,12 +926,23 @@ fn execute_run(
         )?;
         // ENT-114: `env.run("x.sql")` uses the default profile of the run. A missing profile fails
         // only the SQL call that needs it; the connection opens on that first call.
-        let sql_profile = resolve_profile(&root, &configuration, None)
-            .and_then(|(_, workspace_profile)| postgres_profile(workspace_profile, &configuration))
-            .map_err(|error| error.message());
+        let (sql_profile_name, sql_profile) = match resolve_profile(&root, &configuration, None) {
+            Ok((name, workspace_profile)) => (
+                Some(name),
+                DatabaseProfile::from_workspace(workspace_profile, &configuration)
+                    .map_err(|error| error.message()),
+            ),
+            Err(error) => (None, Err(error.message())),
+        };
+        let sql_sources = declared_sql_sources(
+            &root,
+            sql_profile_name.as_deref(),
+            sql_profile.as_ref().ok(),
+        )?;
         // Children of a concurrent wave (ENT-120c) build their own SQL side from these inputs.
         let child_sql = (
             sql_profile.clone(),
+            sql_sources.clone(),
             template_options(&configuration)?,
             replacement_approval(&configuration, request.confirm_destructive)?,
             request.full_refresh,
@@ -937,7 +950,9 @@ fn execute_run(
             cancel.clone(),
         );
         executor.sql = Some(SqlExecution::new(
+            &root,
             sql_profile,
+            sql_sources,
             None,
             template_options(&configuration)?,
             replacement_approval(&configuration, request.confirm_destructive)?,
@@ -945,6 +960,11 @@ fn execute_run(
             retry_policy,
             cancel.clone(),
         ));
+        let default_workspace_profile = resolve_profile(&root, &configuration, None).ok();
+        let default_profile_name = default_workspace_profile
+            .as_ref()
+            .map(|(name, _)| name.clone());
+        let source_definitions = declared_dataset_sources(&root)?;
         // ENT-111: declared sources are readable in Python-only runs. The profile comes from the
         // configuration only; the connection opens on the first dataset read. A Python-only plan
         // has no SQL relation, so model datasets are refused (see `DatasetSource::authorize`).
@@ -954,18 +974,19 @@ fn execute_run(
         let child_datasets = (
             dataset_profile.clone(),
             build_relations(&root, &execution_plan)?,
-            declared_source_relations(&root)?,
-            declared_mysql_sources(&root, &configuration)?,
+            source_definitions.clone(),
+            default_profile_name.clone(),
         );
-        executor.datasets = Some(
-            executor::DatasetSource::new(
-                dataset_profile,
-                build_relations(&root, &execution_plan)?,
-                BTreeSet::new(),
-                declared_source_relations(&root)?,
-            )
-            .with_mysql(declared_mysql_sources(&root, &configuration)?),
-        );
+        executor.datasets = Some(executor::DatasetSource::new(
+            dataset_profile,
+            build_relations(&root, &execution_plan)?,
+            BTreeSet::new(),
+            source_definitions,
+            &root,
+            &configuration,
+            default_profile_name.clone(),
+            cancel.clone(),
+        ));
         let sequential = if matches!(mode, ExecutionMode::Automatic) {
             // ENT-120c (ADR 0008): automatic Python-only runs go wave by wave, with the waves'
             // concurrency. Manual mode keeps the sequential loop below.
@@ -973,10 +994,12 @@ fn execute_run(
             let concurrency = wave_concurrency(&configuration)?;
             let template = executor.child_template();
             let new_sql = || {
-                let (profile, options, allow_replace, full_refresh, policy, cancel) =
+                let (profile, sources, options, allow_replace, full_refresh, policy, cancel) =
                     child_sql.clone();
                 SqlExecution::new(
+                    &root,
                     profile,
+                    sources,
                     None,
                     options,
                     allow_replace,
@@ -986,9 +1009,17 @@ fn execute_run(
                 )
             };
             let new_datasets = || {
-                let (profile, relations, sources, mysql) = child_datasets.clone();
-                executor::DatasetSource::new(profile, relations, BTreeSet::new(), sources)
-                    .with_mysql(mysql)
+                let (profile, relations, sources, default_profile) = child_datasets.clone();
+                executor::DatasetSource::new(
+                    profile,
+                    relations,
+                    BTreeSet::new(),
+                    sources,
+                    &root,
+                    &configuration,
+                    default_profile,
+                    cancel.clone(),
+                )
             };
             let root_invocation = run_invocation_id.clone();
             let wave_run = run_variable_waves(
@@ -1081,7 +1112,7 @@ fn execute_run(
     }
 
     let (profile_name, profile) = profile.ok_or_else(|| {
-        DowaiError::Config("PostgreSQL profile resolution is required for SQL models".to_owned())
+        DowaiError::Config("A database profile is required for SQL models".to_owned())
     })?;
     trace.audit.profile = Some(profile_name.clone());
     let template_options = template_options(&configuration)?;
@@ -1095,18 +1126,29 @@ fn execute_run(
         // Limitation: SQL relations already materialized are NOT rolled back when a
         // later node fails. Only session variables are all-or-nothing (published
         // after every node succeeded); this is not a distributed transaction.
-        let (project, python) = python_settings(&root)?;
+        let project = load_project(&root)?;
+        let python = if project.python.is_some() {
+            Some(python_settings(&root)?.1)
+        } else if python_nodes > 0 {
+            return Err(DowaiError::Config(
+                "Configure python.interpreter with the project's virtual environment".to_owned(),
+            ));
+        } else {
+            None
+        };
         let models_dir = root.join(&project.models_dir);
-        let relations = build_relations(&root, &execution_plan)?;
+        let sql_profile = DatabaseProfile::from_workspace(profile.clone(), &configuration)?;
+        let sql_sources = declared_sql_sources(&root, Some(&profile_name), Some(&sql_profile))?;
+        let relations = build_relations_for_database(&root, &execution_plan, &sql_profile)?;
         let allow_replace = replacement_approval(&configuration, request.confirm_destructive)?;
         let run_invocation_id = trace.root_invocation_id.clone();
         let mut executor = executor::Executor::new(
             &root,
             &models_dir,
-            executor::WorkerSettings {
+            python.as_ref().map(|python| executor::WorkerSettings {
                 interpreter: &python.interpreter,
                 timeout: Duration::from_secs(python.timeout_seconds),
-            },
+            }),
             &configuration,
             &store,
             cancel.clone(),
@@ -1125,31 +1167,34 @@ fn execute_run(
             .filter_map(|node| relations.get(&node.id.replace('\\', "/")).cloned())
             .collect();
         // Children of the waves (ENT-120c2) read datasets through their own connections.
-        let child_dataset_profile: std::result::Result<PgProfile, &'static str> =
-            Ok(postgres_profile(profile.clone(), &configuration)?);
+        let child_dataset_profile = postgres_profile(profile.clone(), &configuration)
+            .map_err(|_| "A PostgreSQL profile is not available for PostgreSQL model datasets");
+        let source_definitions = declared_dataset_sources(&root)?;
         let child_datasets = (
-            child_dataset_profile,
+            child_dataset_profile.clone(),
             relations.clone(),
             sql_relations.clone(),
-            declared_source_relations(&root)?,
-            declared_mysql_sources(&root, &configuration)?,
+            source_definitions.clone(),
+            profile_name.clone(),
         );
-        executor.datasets = Some(
-            executor::DatasetSource::new(
-                Ok(postgres_profile(profile.clone(), &configuration)?),
-                relations.clone(),
-                sql_relations,
-                declared_source_relations(&root)?,
-            )
-            .with_mysql(declared_mysql_sources(&root, &configuration)?),
-        );
-        let pg_profile = postgres_profile(profile, &configuration)?;
-        let child_pg_profile = pg_profile.clone();
+        executor.datasets = Some(executor::DatasetSource::new(
+            child_dataset_profile,
+            relations.clone(),
+            sql_relations,
+            source_definitions,
+            &root,
+            &configuration,
+            Some(profile_name.clone()),
+            cancel.clone(),
+        ));
+        let child_sql_profile = sql_profile.clone();
+        let child_sql_sources = sql_sources.clone();
         // Connected before the first node, as before ENT-114; nested SQL calls reuse it.
-        let adapter = PostgresAdapter::connect(&pg_profile)
-            .map_err(|error| DowaiError::Connection(error.to_string()))?;
+        let adapter = DatabaseAdapter::connect(&sql_profile).map_err(DatabaseError::into_dowai)?;
         executor.sql = Some(SqlExecution::new(
-            Ok(pg_profile),
+            &root,
+            Ok(sql_profile),
+            sql_sources,
             Some(adapter),
             template_options.clone(),
             allow_replace,
@@ -1165,7 +1210,9 @@ fn execute_run(
             let template = executor.child_template();
             let new_sql = || {
                 SqlExecution::new(
-                    Ok(child_pg_profile.clone()),
+                    &root,
+                    Ok(child_sql_profile.clone()),
+                    child_sql_sources.clone(),
                     None,
                     template_options.clone(),
                     allow_replace,
@@ -1175,9 +1222,18 @@ fn execute_run(
                 )
             };
             let new_datasets = || {
-                let (profile, relations, sql_relations, sources, mysql) = child_datasets.clone();
-                executor::DatasetSource::new(profile, relations, sql_relations, sources)
-                    .with_mysql(mysql)
+                let (profile, relations, sql_relations, sources, default_profile) =
+                    child_datasets.clone();
+                executor::DatasetSource::new(
+                    profile,
+                    relations,
+                    sql_relations,
+                    sources,
+                    &root,
+                    &configuration,
+                    Some(default_profile),
+                    cancel.clone(),
+                )
             };
             let root_invocation = run_invocation_id.clone();
             let wave_run = run_variable_waves(
@@ -1284,6 +1340,7 @@ fn execute_run(
                         &mut executor,
                         &mut trace.audit,
                         target,
+                        &node.path,
                         &prepared.relation,
                         mode,
                         std::mem::take(&mut variables),
@@ -1347,7 +1404,9 @@ fn execute_run(
         // The manual mode keeps the sequential loop below, unchanged.
         let wave_plan = waves::waves(&execution_plan.nodes)?;
         let concurrency = wave_concurrency(&configuration)?;
-        let relations = build_relations(&root, &execution_plan)?;
+        let sql_profile = DatabaseProfile::from_workspace(profile.clone(), &configuration)?;
+        let sql_sources = declared_sql_sources(&root, Some(&profile_name), Some(&sql_profile))?;
+        let relations = build_relations_for_database(&root, &execution_plan, &sql_profile)?;
         let (rendered, final_variables) = render_sql_waves(
             &root,
             &execution_plan.nodes,
@@ -1369,12 +1428,13 @@ fn execute_run(
                 node.id
             )));
         }
-        let pg_profile = postgres_profile(profile, &configuration)?;
-        let mut adapter = PostgresAdapter::connect(&pg_profile)
-            .map_err(|error| DowaiError::Connection(error.to_string()))?;
+        let mut adapter =
+            DatabaseAdapter::connect(&sql_profile).map_err(DatabaseError::into_dowai)?;
         let context = WaveContext {
             root: &root,
-            profile: &pg_profile,
+            profile: &sql_profile,
+            sources: &sql_sources,
+            max_nesting: template_options.max_nesting,
             mode,
             retry_policy,
             allow_replace: replacement_approval(&configuration, request.confirm_destructive)?,
@@ -1392,8 +1452,15 @@ fn execute_run(
         )?;
         (completed, final_variables)
     } else {
-        let prepared =
-            prepare_postgres_plan(&root, &execution_plan, &variables, &template_options)?;
+        let sql_profile = DatabaseProfile::from_workspace(profile.clone(), &configuration)?;
+        let sql_sources = declared_sql_sources(&root, Some(&profile_name), Some(&sql_profile))?;
+        let prepared = prepare_database_plan(
+            &root,
+            &execution_plan,
+            &variables,
+            &template_options,
+            &sql_profile,
+        )?;
         if let Some(node) = prepared
             .nodes
             .iter()
@@ -1405,9 +1472,8 @@ fn execute_run(
             )));
         }
         store.validate_variables(&prepared.variables)?;
-        let pg_profile = postgres_profile(profile, &configuration)?;
-        let mut adapter = PostgresAdapter::connect(&pg_profile)
-            .map_err(|error| DowaiError::Connection(error.to_string()))?;
+        let mut adapter =
+            DatabaseAdapter::connect(&sql_profile).map_err(DatabaseError::into_dowai)?;
         let allow_replace = replacement_approval(&configuration, request.confirm_destructive)?;
         let mut completed_nodes = Vec::with_capacity(prepared.nodes.len());
         for (index, node) in prepared.nodes.iter().enumerate() {
@@ -1415,15 +1481,14 @@ fn execute_run(
                 trace.skip(&execution_plan.nodes[index..], mode);
                 return Err(error);
             }
-            let materialization = match node.materialization {
-                Materialization::Table => PostgresMaterialization::Table,
-                Materialization::View => PostgresMaterialization::View,
-            };
             // `prepared.nodes` mirrors `execution_plan.nodes` one to one.
             let plan_node = &execution_plan.nodes[index];
             if let Err(error) = materialize_with_retry(
                 &mut adapter,
-                &pg_profile,
+                &sql_profile,
+                &root,
+                &sql_sources,
+                template_options.max_nesting,
                 plan_node,
                 model_hash(&root, plan_node),
                 mode,
@@ -1432,7 +1497,7 @@ fn execute_run(
                 cancel,
                 SqlWrite {
                     relation: &node.relation,
-                    materialization,
+                    materialization: node.materialization,
                     sql: &node.sql,
                     allow_replace,
                     full_refresh: request.full_refresh,
@@ -1599,7 +1664,9 @@ fn render_sql_waves(
 /// Inputs shared by the SQL nodes of an automatic run.
 struct WaveContext<'a> {
     root: &'a Path,
-    profile: &'a PgProfile,
+    profile: &'a DatabaseProfile,
+    sources: &'a database::SqlSources,
+    max_nesting: usize,
     mode: ExecutionMode,
     retry_policy: RetryPolicy,
     allow_replace: bool,
@@ -1626,7 +1693,7 @@ fn run_sql_waves(
     plan_nodes: &[PlanNode],
     wave_plan: &[Vec<usize>],
     rendered: Vec<RenderedWave>,
-    adapter: &mut PostgresAdapter,
+    adapter: &mut DatabaseAdapter,
     context: &WaveContext<'_>,
 ) -> Result<Vec<RunNodeResult>> {
     let mut completed: Vec<(usize, RunNodeResult)> = Vec::with_capacity(plan_nodes.len());
@@ -1932,7 +1999,7 @@ fn run_wave_in_order(
     trace: &Trace,
     plan_nodes: &[PlanNode],
     nodes: &[(usize, PreparedNode)],
-    adapter: &mut PostgresAdapter,
+    adapter: &mut DatabaseAdapter,
     context: &WaveContext<'_>,
 ) -> Vec<Option<WaveNodeRun>> {
     let mut runs: Vec<Option<WaveNodeRun>> = nodes.iter().map(|_| None).collect();
@@ -1976,12 +2043,12 @@ fn run_wave_concurrently(
             let (index, prepared) = &nodes[slot];
             let plan_node = &plan_nodes[*index];
             let mut node_trace = trace.fork();
-            let outcome = match PostgresAdapter::connect(context.profile) {
+            let outcome = match DatabaseAdapter::connect(context.profile) {
                 Ok(mut adapter) => {
                     run_wave_node(&mut node_trace, &mut adapter, plan_node, prepared, context)
                 }
                 Err(error) => {
-                    let error = DowaiError::Connection(error.to_string());
+                    let error = error.into_dowai();
                     record_unstarted_failure(&mut node_trace, plan_node, context, &error);
                     Err(error)
                 }
@@ -2001,18 +2068,17 @@ fn run_wave_concurrently(
 /// Materializes one rendered node under the retry policy, recording into `node_trace`.
 fn run_wave_node(
     node_trace: &mut Trace,
-    adapter: &mut PostgresAdapter,
+    adapter: &mut DatabaseAdapter,
     plan_node: &PlanNode,
     prepared: &PreparedNode,
     context: &WaveContext<'_>,
 ) -> Result<()> {
-    let materialization = match prepared.materialization {
-        Materialization::Table => PostgresMaterialization::Table,
-        Materialization::View => PostgresMaterialization::View,
-    };
     materialize_with_retry(
         adapter,
         context.profile,
+        context.root,
+        context.sources,
+        context.max_nesting,
         plan_node,
         model_hash(context.root, plan_node),
         context.mode,
@@ -2021,7 +2087,7 @@ fn run_wave_node(
         context.cancel,
         SqlWrite {
             relation: &prepared.relation,
-            materialization,
+            materialization: prepared.materialization,
             sql: &prepared.sql,
             allow_replace: context.allow_replace,
             full_refresh: context.full_refresh,
@@ -2245,55 +2311,27 @@ pub fn check_postgres_connection(
     })?;
     let configuration = effective_configuration(&root)?;
     let (profile_name, profile) = resolve_profile(&root, &configuration, requested_profile)?;
-    let mut adapter = PostgresAdapter::connect(&postgres_profile(profile, &configuration)?)
-        .map_err(|error| DowaiError::Connection(error.to_string()))?;
+    let adapter_profile = DatabaseProfile::from_workspace(profile, &configuration)?;
+    let mut adapter =
+        DatabaseAdapter::connect(&adapter_profile).map_err(DatabaseError::into_dowai)?;
     adapter
         .test_connection()
-        .map_err(|error| DowaiError::Connection(error.to_string()))?;
+        .map_err(DatabaseError::into_dowai)?;
     Ok(profile_name)
 }
 
-/// Quoted relations of the tables declared by the project's sources (ENT-042), keyed by
-/// `(source, table)`. Only these pairs are reachable through `env.source`.
-/// Declared sources that read from a MySQL profile (ENT-116, D-121). Each profile is resolved
-/// and checked by the same policy as the run's profile. A failure is kept and reported on the
-/// first read of a source that uses that profile, so an unrelated run is not blocked.
-fn declared_mysql_sources(
-    project_dir: &Path,
-    configuration: &Value,
-) -> Result<executor::MysqlSources> {
-    let mut mysql = executor::MysqlSources::default();
+/// Source/table declarations are reachable in Python only through `env.source`.
+fn declared_dataset_sources(project_dir: &Path) -> Result<executor::SourceDefinitions> {
+    let mut sources = executor::SourceDefinitions::new();
     for (source_name, source) in load_project(project_dir)?.sources {
-        let Some(profile_name) = source.profile.clone() else {
-            continue;
-        };
-        for (table_name, relation_name) in &source.tables {
-            mysql.sources.insert(
-                (source_name.clone(), table_name.clone()),
-                (profile_name.clone(), relation_name.clone()),
+        for (table_name, relation_name) in source.tables {
+            sources.insert(
+                (source_name.clone(), table_name),
+                (source.schema.clone(), relation_name, source.profile.clone()),
             );
         }
-        if mysql.profiles.contains_key(&profile_name) {
-            continue;
-        }
-        let resolved = resolve_profile(project_dir, configuration, Some(&profile_name))
-            .and_then(|(_, profile)| {
-                if profile.profile_type != "mysql" {
-                    return Err(DowaiError::Config(
-                        "Source profile is not a MySQL profile".to_owned(),
-                    ));
-                }
-                if profile.database != source.schema {
-                    return Err(DowaiError::Config(
-                        "MySQL source schema must match the profile database".to_owned(),
-                    ));
-                }
-                mysql_profile(profile, configuration)
-            })
-            .map_err(|_| "No usable MySQL profile is available for this source");
-        mysql.profiles.insert(profile_name, resolved);
     }
-    Ok(mysql)
+    Ok(sources)
 }
 
 /// Builds the MySQL adapter profile with the effective `database` timeouts (ENT-116). The
@@ -2319,31 +2357,62 @@ fn mysql_profile(profile: WorkspaceProfile, configuration: &Value) -> Result<Mys
     Ok(adapter_profile)
 }
 
-fn declared_source_relations(project_dir: &Path) -> Result<BTreeMap<(String, String), String>> {
-    let mut relations = BTreeMap::new();
+fn declared_sql_sources(
+    project_dir: &Path,
+    target_profile_name: Option<&str>,
+    target_profile: Option<&DatabaseProfile>,
+) -> Result<database::SqlSources> {
+    let mut sources = database::SqlSources::new();
     for (source_name, source) in load_project(project_dir)?.sources {
-        // Sources with their own profile are read by `declared_mysql_sources` (ENT-116).
-        if source.profile.is_some() {
-            continue;
-        }
-        let schema = quote_identifier(&source.schema)
-            .map_err(|error| DowaiError::Model(error.to_string()))?;
-        for (table_name, relation_name) in source.tables {
-            let table = quote_identifier(&relation_name)
-                .map_err(|error| DowaiError::Model(error.to_string()))?;
-            relations.insert(
-                (source_name.clone(), table_name),
-                format!("{schema}.{table}"),
-            );
+        for table_name in source.tables.into_keys() {
+            let resolved = match (
+                source.profile.as_deref(),
+                target_profile_name,
+                target_profile,
+            ) {
+                (Some(source_profile), Some(target_name), _) if source_profile != target_name => {
+                    Err("SQL sources must use the SQL execution profile")
+                }
+                (_, Some(_), Some(profile))
+                    if profile.is_mysql() && source.schema != profile.database_name() =>
+                {
+                    Err("A MySQL SQL source schema must match the execution profile database")
+                }
+                (_, Some(_), Some(_)) => Ok(()),
+                _ => Err("A SQL profile is required for declared SQL sources"),
+            };
+            sources.insert((source_name.clone(), table_name), resolved);
         }
     }
-    Ok(relations)
+    Ok(sources)
 }
 
 fn build_relations(
     project_dir: &Path,
     execution_plan: &ExecutionPlan,
 ) -> Result<BTreeMap<String, String>> {
+    build_relations_with_database(project_dir, execution_plan, None)
+}
+
+fn build_relations_for_database(
+    project_dir: &Path,
+    execution_plan: &ExecutionPlan,
+    database: &DatabaseProfile,
+) -> Result<BTreeMap<String, String>> {
+    build_relations_with_database(project_dir, execution_plan, Some(database))
+}
+
+fn build_relations_with_database(
+    project_dir: &Path,
+    execution_plan: &ExecutionPlan,
+    database: Option<&DatabaseProfile>,
+) -> Result<BTreeMap<String, String>> {
+    let quote = |identifier: &str| match database {
+        Some(database) => database
+            .quote_identifier(identifier)
+            .map_err(DatabaseError::into_dowai),
+        None => quote_identifier(identifier).map_err(|error| DowaiError::Model(error.to_string())),
+    };
     let mut relation_ids = BTreeSet::new();
     for node in &execution_plan.nodes {
         relation_ids.insert(node.id.clone());
@@ -2362,21 +2431,19 @@ fn build_relations(
     let mut written_relations = BTreeSet::new();
     let mut relations = BTreeMap::new();
     for (source_name, source) in load_project(project_dir)?.sources {
-        let schema = quote_identifier(&source.schema)
-            .map_err(|error| DowaiError::Model(error.to_string()))?;
         for (table_name, relation_name) in source.tables {
-            let table = quote_identifier(&relation_name)
-                .map_err(|error| DowaiError::Model(error.to_string()))?;
-            relations.insert(
-                source_relation_key(&source_name, &table_name),
-                format!("{schema}.{table}"),
-            );
+            let relation = match database {
+                Some(database) => database
+                    .relation(&source.schema, &relation_name)
+                    .map_err(DatabaseError::into_dowai)?,
+                None => format!("{}.{}", quote(&source.schema)?, quote(&relation_name)?),
+            };
+            relations.insert(source_relation_key(&source_name, &table_name), relation);
         }
     }
     for id in &relation_ids {
         let stem = model_stem(id)?;
-        let quoted =
-            quote_identifier(&stem).map_err(|error| DowaiError::Model(error.to_string()))?;
+        let quoted = quote(&stem)?;
         if execution_plan.nodes.iter().any(|node| &node.id == id)
             && !written_relations.insert(stem.clone())
         {
@@ -2468,6 +2535,39 @@ pub fn prepare_postgres_plan(
     template_options: &TemplateOptions,
 ) -> Result<PreparedPlan> {
     let relations = build_relations(project_dir, execution_plan)?;
+    prepare_plan_with_relations(
+        project_dir,
+        execution_plan,
+        variables,
+        template_options,
+        &relations,
+    )
+}
+
+fn prepare_database_plan(
+    project_dir: &Path,
+    execution_plan: &ExecutionPlan,
+    variables: &BTreeMap<String, Value>,
+    template_options: &TemplateOptions,
+    database: &DatabaseProfile,
+) -> Result<PreparedPlan> {
+    let relations = build_relations_for_database(project_dir, execution_plan, database)?;
+    prepare_plan_with_relations(
+        project_dir,
+        execution_plan,
+        variables,
+        template_options,
+        &relations,
+    )
+}
+
+fn prepare_plan_with_relations(
+    project_dir: &Path,
+    execution_plan: &ExecutionPlan,
+    variables: &BTreeMap<String, Value>,
+    template_options: &TemplateOptions,
+    relations: &BTreeMap<String, String>,
+) -> Result<PreparedPlan> {
     let mut current_variables = variables.clone();
     let mut prepared_nodes = Vec::with_capacity(execution_plan.nodes.len());
     for node in &execution_plan.nodes {
@@ -2479,7 +2579,7 @@ pub fn prepare_postgres_plan(
             node,
             &current_variables,
             template_options,
-            &relations,
+            relations,
         )?;
         current_variables = next_variables;
         prepared_nodes.push(prepared);
@@ -2677,10 +2777,9 @@ fn enforce_allowlist(
 /// (`connect_timeout_seconds`, `query_timeout_seconds`). The password is never copied: only the
 /// name of the environment variable that holds it.
 fn postgres_profile(profile: WorkspaceProfile, configuration: &Value) -> Result<PgProfile> {
-    // `mysql` profiles are valid workspace profiles but only `env.write` destinations (ENT-034).
     if profile.profile_type != "postgres" {
         return Err(DowaiError::Config(format!(
-            "This operation requires a PostgreSQL profile; a '{}' profile is only supported as an env.write destination",
+            "This operation requires a PostgreSQL profile; got '{}'",
             profile.profile_type
         )));
     }
@@ -2733,15 +2832,17 @@ fn map_execution_error(error: AdapterError) -> DowaiError {
     }
 }
 
-/// PostgreSQL side of a run (ENT-114). The connection, profile and SQL options are shared by the
+/// SQL side of a run (ENT-114). The connection, profile and SQL options are shared by the
 /// SQL nodes of the plan and by nested `env.run("x.sql")` calls, so both reach the database
 /// through the same materialization path (retry, staging, full refresh).
 pub(crate) struct SqlExecution {
+    root: PathBuf,
     /// The run's profile, or the reason it is unavailable. The reason fails only the SQL work
     /// that needs a database, so a Python-only run without a profile keeps working.
-    profile: std::result::Result<PgProfile, String>,
+    profile: std::result::Result<DatabaseProfile, String>,
+    sources: database::SqlSources,
     /// Connection kept between calls; opened by the first SQL work when not given.
-    adapter: Option<PostgresAdapter>,
+    adapter: Option<DatabaseAdapter>,
     template_options: TemplateOptions,
     allow_replace: bool,
     full_refresh: bool,
@@ -2750,9 +2851,12 @@ pub(crate) struct SqlExecution {
 }
 
 impl SqlExecution {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        profile: std::result::Result<PgProfile, String>,
-        adapter: Option<PostgresAdapter>,
+        root: &Path,
+        profile: std::result::Result<DatabaseProfile, String>,
+        sources: database::SqlSources,
+        adapter: Option<DatabaseAdapter>,
         template_options: TemplateOptions,
         allow_replace: bool,
         full_refresh: bool,
@@ -2760,7 +2864,9 @@ impl SqlExecution {
         cancel: CancellationToken,
     ) -> Self {
         Self {
+            root: root.to_path_buf(),
             profile,
+            sources,
             adapter,
             template_options,
             allow_replace,
@@ -2786,16 +2892,14 @@ impl SqlExecution {
             .map_err(|reason| DowaiError::Config(reason.clone()))?;
         let mut adapter = match self.adapter.take() {
             Some(adapter) => adapter,
-            None => PostgresAdapter::connect(profile)
-                .map_err(|error| DowaiError::Connection(error.to_string()))?,
-        };
-        let materialization = match prepared.materialization {
-            Materialization::Table => PostgresMaterialization::Table,
-            Materialization::View => PostgresMaterialization::View,
+            None => DatabaseAdapter::connect(profile).map_err(DatabaseError::into_dowai)?,
         };
         let outcome = materialize_with_retry(
             &mut adapter,
             profile,
+            &self.root,
+            &self.sources,
+            self.template_options.max_nesting,
             node,
             hash,
             mode,
@@ -2804,7 +2908,7 @@ impl SqlExecution {
             &self.cancel,
             SqlWrite {
                 relation: &prepared.relation,
-                materialization,
+                materialization: prepared.materialization,
                 sql: &prepared.sql,
                 allow_replace: self.allow_replace,
                 full_refresh: self.full_refresh,
@@ -2818,7 +2922,7 @@ impl SqlExecution {
 /// One SQL materialization of a node, already rendered.
 struct SqlWrite<'a> {
     relation: &'a str,
-    materialization: PostgresMaterialization,
+    materialization: Materialization,
     sql: &'a str,
     allow_replace: bool,
     /// ENT-033: staging and swap instead of replacement in place.
@@ -2831,8 +2935,11 @@ struct SqlWrite<'a> {
 /// the next attempt. Only transient failures are repeated.
 #[allow(clippy::too_many_arguments)]
 fn materialize_with_retry(
-    adapter: &mut PostgresAdapter,
-    profile: &PgProfile,
+    adapter: &mut DatabaseAdapter,
+    profile: &DatabaseProfile,
+    root: &Path,
+    sources: &database::SqlSources,
+    max_nesting: usize,
     node: &PlanNode,
     hash: Option<String>,
     mode: ExecutionMode,
@@ -2841,9 +2948,10 @@ fn materialize_with_retry(
     cancel: &CancellationToken,
     write: SqlWrite<'_>,
 ) -> Result<()> {
+    validate_sql_sources(root, node, sources, max_nesting)?;
     let outcome = run_with_retry(
         policy,
-        |error: &AdapterError| error.is_transient(),
+        |error: &DatabaseError| error.is_transient(),
         |_attempt| {
             let invocation_id = Uuid::new_v4().to_string();
             let started = Instant::now();
@@ -2853,27 +2961,19 @@ fn materialize_with_retry(
                     .node_started(&invocation_id, &node.id, hash.clone());
             }
             let connected = if adapter.is_closed() {
-                PostgresAdapter::connect(profile).map(|fresh| *adapter = fresh)
+                DatabaseAdapter::connect(profile).map(|fresh| *adapter = fresh)
             } else {
                 Ok(())
             };
             let result = connected.and_then(|()| {
-                if write.full_refresh {
-                    adapter.full_refresh_cancellable(
-                        write.relation,
-                        write.materialization,
-                        write.sql,
-                        &|| cancel.is_cancelled(),
-                    )
-                } else {
-                    adapter.materialize_cancellable(
-                        write.relation,
-                        write.materialization,
-                        write.sql,
-                        write.allow_replace,
-                        &|| cancel.is_cancelled(),
-                    )
-                }
+                adapter.materialize(
+                    write.relation,
+                    write.materialization,
+                    write.sql,
+                    write.allow_replace,
+                    write.full_refresh,
+                    &|| cancel.is_cancelled(),
+                )
             });
             match &result {
                 Ok(()) => {
@@ -2886,7 +2986,7 @@ fn materialize_with_retry(
                     }
                 }
                 Err(error) => {
-                    let mapped = map_execution_error(*error);
+                    let mapped = (*error).into_dowai();
                     if let Some(trace) = trace.as_mut() {
                         trace
                             .audit
@@ -2907,13 +3007,37 @@ fn materialize_with_retry(
         |delay| wait_unless_cancelled(delay, cancel),
         || Uuid::new_v4().as_u128() as u64,
     );
-    outcome.map_err(|error| {
-        if cancel.is_cancelled() {
+    match outcome {
+        Err(error) => Err(if cancel.is_cancelled() {
             DowaiError::cancelled()
         } else {
-            map_execution_error(error)
-        }
-    })
+            error.into_dowai()
+        }),
+        Ok(()) => Ok(()),
+    }
+}
+
+fn validate_sql_sources(
+    root: &Path,
+    node: &PlanNode,
+    sources: &database::SqlSources,
+    max_nesting: usize,
+) -> Result<()> {
+    let source = verify_planned_model(root, node)?;
+    let references = dowai_core::static_sql_references(&source, max_nesting)?;
+    for reference in references {
+        let dowai_core::StaticSqlReference::Source { source, table } = reference else {
+            continue;
+        };
+        let key = (source.clone(), table.clone());
+        let source = sources.get(&key).ok_or_else(|| {
+            DowaiError::Config(format!("Source '{source}.{table}' is not configured"))
+        })?;
+        source
+            .as_ref()
+            .map_err(|reason| DowaiError::Config((*reason).to_owned()))?;
+    }
+    Ok(())
 }
 
 const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -2958,7 +3082,8 @@ fn default_session_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        prepare_postgres_plan, run_postgres, run_postgres_detailed_with_cancel, RunRequest,
+        prepare_postgres_plan, run_postgres, run_postgres_detailed_with_cancel,
+        validate_sql_sources, RunRequest,
     };
     use dowai_core::{
         create_project, plan, CancellationToken, ExecutionMode, Materialization, ProfileTlsMode,
@@ -3055,6 +3180,57 @@ mod tests {
         assert_eq!(prepared.nodes[1].relation, "daily");
         assert_eq!(prepared.nodes[1].materialization, Materialization::View);
         assert_eq!(prepared.nodes[1].sql.trim(), "select * from \"source\"");
+    }
+
+    #[test]
+    fn sql_profile_mismatch_is_rejected_only_when_the_source_is_referenced() {
+        let fixture = Fixture::new();
+        let manifest_path = fixture.path().join("dowai_project.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).expect("read project config"))
+                .expect("project config is JSON");
+        manifest["sources"] = json!({
+            "warehouse": {
+                "profile": "other_profile",
+                "schema": "public",
+                "tables": { "orders": "orders" }
+            }
+        });
+        fs::write(
+            manifest_path,
+            serde_json::to_vec(&manifest).expect("serialize project config"),
+        )
+        .expect("write project config");
+
+        let sources = BTreeMap::from([(
+            ("warehouse".to_owned(), "orders".to_owned()),
+            Err("SQL sources must use the SQL execution profile"),
+        )]);
+        fixture.write_model(
+            "daily.sql",
+            "select * from {{ source('warehouse', 'orders') }}",
+        );
+        let execution_plan = plan(
+            fixture.path(),
+            &["daily.sql".to_owned()],
+            ExecutionMode::Automatic,
+        )
+        .expect("plan SQL source model");
+        let error = validate_sql_sources(fixture.path(), &execution_plan.nodes[0], &sources, 32)
+            .expect_err("referenced cross-profile source must fail");
+        assert!(error
+            .to_string()
+            .contains("SQL sources must use the SQL execution profile"));
+
+        fixture.write_model("daily.sql", "select 1 as id");
+        let execution_plan = plan(
+            fixture.path(),
+            &["daily.sql".to_owned()],
+            ExecutionMode::Automatic,
+        )
+        .expect("plan SQL model without the source");
+        validate_sql_sources(fixture.path(), &execution_plan.nodes[0], &sources, 32)
+            .expect("unused cross-profile source does not block the SQL model");
     }
 
     #[test]

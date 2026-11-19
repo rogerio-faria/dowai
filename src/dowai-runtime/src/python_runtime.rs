@@ -293,6 +293,7 @@ def main():
                     "kind": "dataset",
                     "source": origin[0],
                     "table": origin[1],
+                    "profile": origin[2],
                     "operation": operation,
                 }
             message.update(fields)
@@ -344,13 +345,15 @@ def main():
                 raise ValueError("name must be a non-empty string")
             return Dataset(self, name)
 
-        def source(self, name, table):
-            """`env.source(name, table)`: a table declared by the project (ENT-042)."""
+        def source(self, name, table, profile=None):
+            """Read a declared source, optionally selecting its workspace profile."""
             if not isinstance(name, str) or not name.strip():
                 raise ValueError("name must be a non-empty string")
             if not isinstance(table, str) or not table.strip():
                 raise ValueError("table must be a non-empty string")
-            return Dataset(self, "%s.%s" % (name, table), origin=(name, table))
+            if profile is not None and (not isinstance(profile, str) or not profile.strip()):
+                raise ValueError("profile must be a non-empty string or None")
+            return Dataset(self, "%s.%s" % (name, table), origin=(name, table, profile))
 
         @property
         def connections(self):
@@ -1082,6 +1085,8 @@ struct WorkerMessage {
     #[serde(default)]
     table: Option<String>,
     #[serde(default)]
+    profile: Option<String>,
+    #[serde(default)]
     operation: Option<String>,
     #[serde(default)]
     offset: Option<u64>,
@@ -1280,13 +1285,16 @@ pub(crate) fn execute_model(
     if request.len() > MAX_IPC_BYTES {
         return Err(protocol_error());
     }
-    request.push(b'\n');
+    let mut bootstrap = serde_json::to_vec(WORKER).map_err(|_| protocol_error())?;
+    bootstrap.push(b'\n');
+    bootstrap.append(&mut request);
+    bootstrap.push(b'\n');
 
     invocation.cancel.check()?;
     let mut command = Command::new(invocation.interpreter);
     command
         .arg("-c")
-        .arg(WORKER)
+        .arg("import json,sys;exec(json.loads(sys.stdin.buffer.readline()))")
         .arg(invocation.model_path)
         .current_dir(invocation.project_root)
         .stdin(Stdio::piped())
@@ -1352,7 +1360,7 @@ pub(crate) fn execute_model(
             }
         }
     });
-    let _ = write_sender.send(request);
+    let _ = write_sender.send(bootstrap);
 
     let mut supervision = Supervision {
         deadline: invocation.deadline,
@@ -1564,9 +1572,18 @@ impl Supervision {
                 };
                 // Exactly one origin: a plan model (`dataset`) or a declared source
                 // (`source` and `table`). Any other combination is a protocol error.
-                let target = match (message.dataset, message.source, message.table) {
-                    (Some(dataset), None, None) => DatasetRef::Model(dataset),
-                    (None, Some(source), Some(table)) => DatasetRef::Source { source, table },
+                let target = match (
+                    message.dataset,
+                    message.source,
+                    message.table,
+                    message.profile,
+                ) {
+                    (Some(dataset), None, None, None) => DatasetRef::Model(dataset),
+                    (None, Some(source), Some(table), profile) => DatasetRef::Source {
+                        source,
+                        table,
+                        profile,
+                    },
                     _ => return Err(protocol_error()),
                 };
                 let HostReply::Dataset(result) = on_request(HostRequest::Dataset {

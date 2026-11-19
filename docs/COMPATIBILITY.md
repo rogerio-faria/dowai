@@ -23,7 +23,7 @@ dowai compatibility check <project_path> [--json]
 | `source('fonte', 'tabela')` | SUPPORTED | — |
 | `config(materialized='table')` / `config(materialized='view')` | SUPPORTED | — |
 | `def_var` (extensão DOWAI) | SUPPORTED | — |
-| `run("arq.py")` (extensão DOWAI, ENT-124/ENT-126) | SUPPORTED | Aceita somente no fim do arquivo SQL, após todo o SQL, com literal de caminho `.py` relativo a `models/` (sem `..`, sem barra invertida, sem caractere de controle). Executado depois da materialização do modelo, com o modelo como `origem` (ENT-125). Múltiplas chamadas executam em ordem. Falha do Python falha a execução, sem reverter a materialização. Um run que contém `run()` usa o caminho com executor, em ordem sequencial (sem ondas). Journal: chamada `imperative` com o SQL como pai. |
+| `run("arq.py")` / `run("arq.sql")` (extensão DOWAI) | SUPPORTED | Aceita somente no fim do arquivo SQL, com caminho literal relativo a `models/` (sem `..`, barra invertida ou caractere de controle). Executado após a materialização: Python recebe o modelo como `origem`; SQL usa a mesma conexão. Chamadas executam em ordem; falhas não revertem a materialização anterior. Um run com `run()` usa o executor sequencial. |
 | `{% if %}` / `{% elif %}` / `{% else %}` (subconjunto de `var()`) | PARTIAL | `DOWAI_COMPAT_CONDITIONAL_SUBSET` |
 | `config(materialized='incremental')` e demais materializações | UNSUPPORTED | `DOWAI_COMPAT_MATERIALIZATION_UNSUPPORTED` |
 | `config(...)` com chaves diferentes de `materialized` | UNSUPPORTED | `DOWAI_COMPAT_CONFIG_UNSUPPORTED` |

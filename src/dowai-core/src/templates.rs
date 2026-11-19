@@ -44,7 +44,7 @@ pub struct RenderedSqlModel {
     pub sql: String,
     pub variables: BTreeMap<String, Value>,
     pub materialization: Materialization,
-    /// Python files named by `{{ run("arq.py") }}` at the end of the model (ENT-124), in order.
+    /// SQL or Python files named by `{{ run(...) }}` at the end of the model, in order.
     /// They are executed only after the SQL is materialized (ENT-126); rendering runs nothing.
     pub post_run_targets: Vec<String>,
 }
@@ -427,8 +427,8 @@ pub fn declares_post_run(source: &str) -> bool {
     false
 }
 
-/// `run("x.py")` names a Python file inside the project: relative, without `..`, absolute
-/// prefixes, backslashes or empty segments, and with a `.py` extension. Symbolic links and
+/// `run(...)` names a SQL or Python file inside the project: relative, without `..`, absolute
+/// prefixes, backslashes or empty segments. Symbolic links and
 /// existence are checked when the file is executed (ENT-126).
 fn validate_run_target(path: &str) -> Result<()> {
     let invalid = path.is_empty()
@@ -439,10 +439,10 @@ fn validate_run_target(path: &str) -> Result<()> {
         || path
             .split('/')
             .any(|segment| segment.is_empty() || segment == "..")
-        || !path.ends_with(".py");
+        || !(path.ends_with(".py") || path.ends_with(".sql"));
     if invalid {
         return Err(template_error(format!(
-            "run('{path}') must be a relative project path to a .py file without '..'"
+            "run('{path}') must be a relative project path to a .py or .sql file without '..'"
         )));
     }
     Ok(())

@@ -1,6 +1,6 @@
 # DOWAI
 
-**Build data pipelines with SQL and Python in one dependency graph, running against PostgreSQL.**
+**Build data pipelines with SQL and Python across PostgreSQL, MySQL, Oracle and SQL Server.**
 You write the models. DOWAI works out the execution order, writes safely, and records every run.
 
 - **One graph for SQL and Python.** `ref()`, `source()` and `env.depends_on()` define the order.
@@ -12,13 +12,6 @@ You write the models. DOWAI works out the execution order, writes safely, and re
 - **Auditable.** A local journal records each run and invocation with stable `DOWAI_*` error codes. Logs keep metadata and hashes, never variable values or SQL text.
 
 ## Quick start
-
-Requirements: a Rust toolchain to build, a PostgreSQL database, and Python 3 with `venv` for Python models.
-
-```bash
-cargo build --workspace
-export PATH="$PWD/target/debug:$PATH"
-```
 
 A project looks like this:
 
@@ -239,12 +232,38 @@ dowai retry <run_id> --failed-only --yes   # rerun only what failed
 
 Connection and policy details: [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 
+## Database support
+
+| Database | SQL models | Python `env.source` / `env.write` |
+| --- | --- | --- |
+| PostgreSQL | Supported | Supported |
+| MySQL | Supported | Supported |
+| Oracle | Supported with limitations below | Supported with limitations below |
+| SQL Server | Supported with limitations below | Supported with limitations below |
+
+Oracle and SQL Server execution, source reads and writes have been tested against live
+databases. The Oracle connector requires Oracle Client libraries.
+Its `oracle_native` mode requires `TNS_ADMIN` to point
+to a directory containing exactly this `sqlnet.ora`:
+
+```text
+SQLNET.ENCRYPTION_CLIENT = REQUIRED
+SQLNET.ENCRYPTION_TYPES_CLIENT = (AES256, AES192, AES128)
+SQLNET.CRYPTO_CHECKSUM_CLIENT = REQUIRED
+SQLNET.CRYPTO_CHECKSUM_TYPES_CLIENT = (SHA512, SHA384, SHA256)
+```
+
+Oracle Client configuration is process-wide. Native encryption cannot be mixed with other
+Oracle transport modes in one process, or enabled after Oracle Client was initialized elsewhere.
+
 ## Status and limitations
 
-- SQL models run on PostgreSQL (tables and views). MySQL works as a write destination and as a Python source, not as the SQL execution profile.
+- SQL models can run on PostgreSQL, MySQL, Oracle or SQL Server (tables and views). A SQL model reads declared sources through the same selected profile and connection it uses for execution; a source declaring another profile is rejected when referenced. Nested SQL keeps that connection. Python can choose an origin with `env.source(name, table, profile=...)` and a destination with `env.write(...)`; transformations between databases are explicit user code, not automatic staging or type conversion. See [SAMPLES.md](SAMPLES.md) for examples.
+- Oracle and SQL Server source tables require a primary key for paginated reads; filters are unsupported. Their non-null dataset values are returned as text, so Python must convert values as needed. `full_refresh` is unavailable on both; Oracle table replacement is not atomic.
+- Oracle cancellation can be delayed by the server, and its per-round-trip timeout is not a hard total execution deadline. An interrupted SQL Server operation discards its connection; the outcome of an interrupted commit or DDL may be uncertain.
 - DOWAI writes into existing tables and does not create them.
 - Re-running a table model fails while a view depends on that table, because the table is dropped and recreated. Drop the dependent view first.
-- The test suite passes on Linux against PostgreSQL 16.15 and MySQL 8.0.46. Windows and hosted CI are not verified yet. See [docs/STATUS.md](docs/STATUS.md) for what is implemented, partial, or pending, and [docs/ROADMAP.md](docs/ROADMAP.md) for the plan.
+- PostgreSQL and MySQL have been tested on Linux; Oracle and SQL Server integration has been tested locally on Windows. Hosted CI has not verified these integrations. See [docs/STATUS.md](docs/STATUS.md) and [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Build and test
 
@@ -257,5 +276,6 @@ On Linux without `pkg-config`, set first: `OPENSSL_DIR=/usr OPENSSL_LIB_DIR=/usr
 
 ## Documentation
 
+- [Database samples](SAMPLES.md)
 - [Configuration](docs/CONFIGURATION.md), [CLI and API](docs/API.md), [compatibility](docs/COMPATIBILITY.md), [operations](docs/OPERATIONS.md), [security](docs/SECURITY.md)
 - [Contributing](CONTRIBUTING.md) and [security policy](SECURITY.md)

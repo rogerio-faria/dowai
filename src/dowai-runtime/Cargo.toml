@@ -6,11 +6,14 @@ license.workspace = true
 
 [dependencies]
 dowai-core = { path = "../dowai-core" }
-dowai-mysql = { path = "../dowai-mysql" }
-dowai-postgres = { path = "../dowai-postgres" }
+dowai-databases-oracle = { path = "../dowai-databases/oracle" }
+dowai-mysql = { path = "../dowai-databases/mysql" }
+dowai-postgres = { path = "../dowai-databases/postgres" }
+dowai-sqlserver = { path = "../dowai-databases/sqlserver" }
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
+tokio = { version = "1", features = ["rt", "net", "time"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

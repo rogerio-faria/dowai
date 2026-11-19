@@ -24,9 +24,9 @@ ENT-078 e ENT-010).
 | `dowai validate [PATH] [--strict] [--json]` | Parcial | Schema, referências, ciclos, declarações de source e sintaxe de template. Verificado: `valid: true` em `examples/automatic-dag`. |
 | `dowai plan <targets>... [--vars JSON] [--project-dir PATH] [--json]` | Parcial | Ordenação automática offline. Verificado: `stg_vendas.sql` antes de `faturamento.sql`. |
 | `dowai plan --manual <targets>... [--vars JSON] [--json]` | Parcial | Ordem informada pelo usuário com dependências. Verificado com `faturamento.sql stg_vendas.sql`. |
-| `dowai run <targets>|all [--profile NAME] [--vars JSON] [--session ID] [--json]` | Parcial | SQL (tabelas/views no PostgreSQL) e Python em venv do projeto. Exige banco configurado; verificado localmente contra PostgreSQL de teste (E-110, D-114). Full refresh e demais adaptadores: ver §1.3. |
+| `dowai run <targets> all [--profile NAME] [--vars JSON] [--session ID] [--json]` | Parcial | SQL (tabelas/views em PostgreSQL, MySQL, Oracle ou SQL Server) e Python em venv do projeto. Modelos SQL exigem perfil configurado. |
 | `dowai run --manual <targets>... [--session ID]` | Parcial | Mesma restrição de `run`. |
-| `dowai run <target> --full-refresh --yes` | Parcial | PostgreSQL: reconstrói as tabelas/views selecionadas em staging no mesmo banco e troca pelo nome numa única transação; sem `--yes` recusa com exit 5 antes de qualquer escrita; colunas (nome e tipo, em ordem) divergentes do destino falham com exit 3 e mantêm a relação anterior. Não altera schema automaticamente. |
+| `dowai run <target> --full-refresh --yes` | Parcial | PostgreSQL: staging e troca transacional; MySQL: staging e `RENAME TABLE`. Sem `--yes` recusa antes de qualquer escrita; divergência de schema falha e mantém a relação anterior. |
 | `dowai session start [--project-dir PATH] [--json]` | Parcial | Verificado: retorna `session_id`, `status: ACTIVE`, TTL. |
 | `dowai session show <session_id> [--json]` | Parcial | Verificado. |
 | `dowai session end <session_id> [--json]` | Parcial | Verificado: `status: ENDED`. |
@@ -61,10 +61,19 @@ Comandos não implementados **não aparecem** no `--help` como funcionais e reto
 
 ### 1.3 Execução real e limitações
 
-- `run` escreve no PostgreSQL apenas com adaptador configurado. Substituir relações
-  existentes exige `--yes`.
-- Adaptadores MySQL e demais origens/destinos: não implementados nesta revisão.
+- `run` executa modelos SQL no PostgreSQL, MySQL, Oracle ou SQL Server selecionado por `--profile` ou
+  `execution.default_profile`. Substituir relações existentes exige aprovação.
+- Em SQL, `source()` deve usar a mesma conexão selecionada para executar o
+  modelo. Uma fonte declarada com outro perfil é recusada quando referenciada;
+  não há cópia nem conversão automática entre bancos. `{{ run("other.sql") }}`
+  preserva a conexão SQL do chamador.
+- Em Python, `env.source(name, table, profile=None)` seleciona a origem por
+  perfil; o argumento opcional substitui o perfil declarado e, se omitido,
+  usa o perfil declarado ou o padrão de execução. `env.write()` escolhe o
+  destino. Transformações entre bancos são responsabilidade do código Python.
 - Cancelamento (Ctrl+C/SIGTERM) retorna `CANCELLED`, exit 130 e `DOWAI_CANCELLED`.
+  No Oracle o servidor pode adiar a interrupção; no SQL Server a conexão interrompida
+  é descartada e o resultado de um commit ou DDL interrompido pode ser incerto.
 
 ### 1.4 Saída JSON e códigos de erro
 
@@ -146,7 +155,7 @@ def model(env, origem=None):         # recebe o modelo SQL que chamou via run() 
 
 - `origem` é um dataset lazy com o mesmo contrato de `env.ref(...)`. Quando não há modelo pai (`dowai run x.py`, ou `env.run("x.py")` sem origem), `origem` é `None`.
 - Passar uma origem a um modelo com assinatura `model(env)` falha com `DOWAI_MODEL_SIGNATURE_INVALID`, em vez de ignorar o pai silenciosamente. Assinaturas com mais de dois parâmetros obrigatórios também são recusadas com esse código, antes de qualquer efeito.
-- Nesta versão, o runtime ainda não passa origem a partir de `{{ run(...) }}` (ENT-126 pendente); o contrato do worker já está pronto.
+- `{{ run("x.py") }}` em SQL passa o modelo SQL chamador como `origem`. Datasets de modelos estão disponíveis para PostgreSQL, Oracle e SQL Server, mas não MySQL. `{{ run("x.sql") }}` executa outro SQL na mesma conexão; uma cadeia somente SQL não exige Python configurado.
 
 Disponível no modelo Python executado pelo runtime:
 
@@ -154,14 +163,15 @@ Disponível no modelo Python executado pelo runtime:
 |---|---|
 | `setVar(name, value)`, `getVar(name, default)`, `unsetVar(name)` | Implementado como sobreposição local, publicada só se a execução inteira tiver sucesso. |
 | `manual()` (contexto) | Implementado. |
-| `run(target, mode=None, raise_on_error=True)` | Implementado para `.py` (subprocesso supervisionado, com limites de profundidade e contagem) e para `.sql` (executa no PostgreSQL do run, com perfil e sessão do run pai; ENT-114). |
+| `run(target, mode=None, raise_on_error=True)` | Implementado para `.py` (subprocesso supervisionado, com limites de profundidade e contagem) e para `.sql` (executa no perfil SQL selecionado pelo run pai). |
 | `plan(target, mode=None)`, `validate()` | Implementado; mesmo JSON do CLI. |
+| `source(name, table, profile=None)` | Implementado para fontes declaradas PostgreSQL, MySQL, Oracle e SQL Server. O perfil opcional substitui o perfil da declaração; se omitido, usa o perfil declarado ou o perfil padrão. A política de perfis/hosts continua aplicada. Oracle e SQL Server exigem chave primária para leitura paginada, retornam valores não nulos como texto e não suportam filtros. |
 | `ref(name).schema()` | Implementado para modelos SQL de uma execução mista SQL+Python (somente leitura, apenas relações declaradas em `depends_on`; limite de 10 000 requisições por execução). |
-| `ref(name).iter_rows(batch_size)` | Implementado em lotes de até 10 000 linhas, em ordem física; recusado para views (`DOWAI_DATASET_UNAVAILABLE`). |
-| `ref(name).select(*cols)`, `.filter(col, op, value)`, `.iter_batches(batch_size)` | Implementados (ENT-041). Projeção e comparações (`=`, `!=`, `<`, `<=`, `>`, `>=`, `is_null`, `is_not_null`) em `bool`, inteiros, `float` e texto rodam no SQL com parâmetros tipados. `=`/`!=` em tipos lidos como texto (ex.: `numeric`, datas, UUID) são aplicados pelo worker sobre a forma textual e geram o aviso `DOWAI_DATASET_FILTER_NOT_PUSHED` em `warnings`. Comparações ordenadas nesses tipos são recusadas com `DOWAI_DATASET_FILTER_UNSUPPORTED`; projeção inválida com `DOWAI_DATASET_INVALID_QUERY`. Objeto lazy não pode ser serializado e expira ao fim do model (`DOWAI_DATASET_EXPIRED`). |
+| `ref(name).iter_rows(batch_size)` | Lotes de até 10 000 linhas. PostgreSQL usa ordem física; Oracle e SQL Server usam chave primária ou, para tabelas de modelos sem chave, `ROWID` ou colunas convertidas para binário, respectivamente. Tipos não conversíveis podem falhar; views sem chave são recusadas. |
+| `ref(name).select(*cols)`, `.filter(col, op, value)`, `.iter_batches(batch_size)` | Projeção e lotes são implementados. Filtros de datasets Oracle e SQL Server são recusados; no PostgreSQL comparações (`=`, `!=`, `<`, `<=`, `>`, `>=`, `is_null`, `is_not_null`) em `bool`, inteiros, `float` e texto rodam no SQL com parâmetros tipados. `=`/`!=` em tipos lidos como texto (ex.: `numeric`, datas, UUID) são aplicados pelo worker sobre a forma textual e geram o aviso `DOWAI_DATASET_FILTER_NOT_PUSHED` em `warnings`. Comparações ordenadas nesses tipos são recusadas com `DOWAI_DATASET_FILTER_UNSUPPORTED`; projeção inválida com `DOWAI_DATASET_INVALID_QUERY`. Objeto lazy não pode ser serializado e expira ao fim do model (`DOWAI_DATASET_EXPIRED`). |
 | `generateCsv(data, path, **options)` | Implementado (ENT-050). Recebe um `Dataset` (lido em lotes) ou um iterável de mapeamentos com as mesmas chaves; grava UTF-8 por streaming em arquivo temporário e renomeia ao final, sem arquivo parcial em caso de falha. Opções: `delimiter` (padrão `,`), `header` (padrão `True`), `null` (padrão vazio) e `timezone` (nome IANA; aplicado somente a `datetime` com fuso, valores de texto passam sem conversão). Destino: caminho relativo ao projeto ou absoluto dentro dele; recusa `..`, links simbólicos em qualquer componente, diretórios reservados (`models`, `.dowai`, `.venv`, `dowai_project.json`) e destinos externos com `DOWAI_POLICY_DENIED` (destinos externos/SFTP ficam para ENT-057). Retorna o número de linhas. |
-| `ref(name).to_arrow(max_rows)`, `.to_pandas(max_rows)`, `.to_polars(max_rows)` | Implementados (ENT-047). Materializam o dataset (lido em lotes) com mapeamento explícito de tipos PostgreSQL: `bool`, `int2/4/8`, `float4/8`, texto, `numeric` (decimal exato, escala preservada), `date`, `timestamp` (sem fuso) e `timestamptz` (convertido para UTC). Nulos são preservados. Tipos sem mapeamento (ex.: `json`, `uuid`, `bytea`) são recusados com `DOWAI_DATASET_TYPE_UNSUPPORTED` (use `select`); `max_rows` (padrão `1000000`, limite `10000000`) recusa com `DOWAI_DATASET_TOO_LARGE`; biblioteca ausente no venv do projeto recusa com `DOWAI_DATASET_LIBRARY_UNAVAILABLE`; `NaN`/infinito recusados com `DOWAI_DATASET_VALUE_INVALID`. Exige `pyarrow`, `pandas` ou `polars` em `python.dependencies`. |
-| `write(rows, target, table, mode, keys, confirm_replace)` | Implementado (ENT-048) para perfis `postgres` e, desde ENT-034, `mysql` (`target` é o nome do perfil). Modos `append`, `replace` (exige `confirm_replace=True`) e `upsert` (exige `keys` com índice único exato no destino). Uma transação por sessão de escrita, atômica somente no banco de destino: uma transferência PostgreSQL→MySQL são duas transações independentes, sem atomicidade entre bancos (a escrita no MySQL permanece confirmada se o restante da execução falhar depois). No MySQL o upsert usa `INSERT ... ON DUPLICATE KEY UPDATE` e dispara por qualquer índice único do destino; booleanos viram `0/1`. Exige `security.allow_external_writes`. Destino não declarado em `workspace.json` é recusado com `DOWAI_CONFIG_INVALID` antes de qualquer conexão (ENT-127); quando o modelo propaga a falha de escrita, o código reportado é o do destino (por exemplo `DOWAI_CONFIG_INVALID`), e não o genérico `DOWAI_PYTHON_FAILED`. Destinos `external` usam driver Python por configuração (ENT-128, ver `docs/CONFIGURATION.md`). Duplicidade, `WHERE` e escolha do modo são responsabilidade do usuário. Exemplo: `examples/sql-run-post`. |
+| `ref(name).to_arrow(max_rows)`, `.to_pandas(max_rows)`, `.to_polars(max_rows)` | Implementados (ENT-047) para datasets PostgreSQL. Materializam o dataset (lido em lotes) com mapeamento explícito de tipos PostgreSQL: `bool`, `int2/4/8`, `float4/8`, texto, `numeric` (decimal exato, escala preservada), `date`, `timestamp` (sem fuso) e `timestamptz` (convertido para UTC). Nulos são preservados. Tipos sem mapeamento (ex.: `json`, `uuid`, `bytea`) são recusados com `DOWAI_DATASET_TYPE_UNSUPPORTED` (use `select`); `max_rows` (padrão `1000000`, limite `10000000`) recusa com `DOWAI_DATASET_TOO_LARGE`; biblioteca ausente no venv do projeto recusa com `DOWAI_DATASET_LIBRARY_UNAVAILABLE`; `NaN`/infinito recusados com `DOWAI_DATASET_VALUE_INVALID`. Exige `pyarrow`, `pandas` ou `polars` em `python.dependencies`. |
+| `write(rows, target, table, mode, keys, confirm_replace)` | Implementado para perfis `postgres`, `mysql`, `oracle` e `sqlserver` (`target` é o nome do perfil). Modos `append`, `replace` (exige `confirm_replace=True`) e `upsert` (exige `keys` com índice único exato no destino). Uma transação por sessão de escrita, atômica somente no banco de destino; não há atomicidade entre bancos. No MySQL o upsert usa `INSERT ... ON DUPLICATE KEY UPDATE` e pode ser acionado por qualquer índice único do destino; booleanos viram `0/1`. Exige `security.allow_external_writes`. Destino não declarado em `workspace.json` é recusado com `DOWAI_CONFIG_INVALID` antes de qualquer conexão (ENT-127); quando o modelo propaga a falha de escrita, o código reportado é o do destino (por exemplo `DOWAI_CONFIG_INVALID`), e não o genérico `DOWAI_PYTHON_FAILED`. Destinos `external` usam driver Python por configuração (ENT-128, ver `docs/CONFIGURATION.md`). Duplicidade, `WHERE` e escolha do modo são responsabilidade do usuário. Exemplo: `examples/sql-run-post`. |
 | Dependências instaladas pelo modelo | Não implementado. |
 
 Erros de runtime são `DowaiExecutionError` com `code`, `hint`, `run_id` e `invocation_id`.
@@ -176,9 +186,9 @@ client.plan(["all"])                                              # ordem autom�
 ## 3. Limitações conhecidas
 
 - Não há CI hospedado que execute estes exemplos (ENT-010 em `tarefas-autorizacao/`).
-- Os testes com PostgreSQL exigem `DOWAI_TEST_PG_*` (P-09); execução de `run` contra banco
-  não foi verificada nesta revisão.
-- Windows não foi verificado a partir deste ambiente.
+- Os testes com PostgreSQL exigem `DOWAI_TEST_PG_*` (P-09); execução SQL com MySQL e
+  staging entre bancos ainda precisa de validação E2E nesta revisão.
+- A integração Oracle e SQL Server foi testada localmente no Windows; CI hospedado ainda não a verifica.
 - A superfície de plugins não tem sandbox de SO (ENT-108).
 
 ## 4. Referências

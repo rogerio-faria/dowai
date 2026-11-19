@@ -1,5 +1,5 @@
 //! ENT-124: `{{ run("x.py") }}` is a deferred, static macro. It is accepted only at the end of a
-//! SQL model, as literal project-relative `.py` paths, and rendering never executes it.
+//! SQL model, as literal project-relative `.py` or `.sql` paths, and rendering never executes it.
 
 use dowai_core::{render_sql_model, TemplateOptions};
 use std::collections::BTreeMap;
@@ -16,12 +16,12 @@ fn render(source: &str) -> dowai_core::Result<dowai_core::RenderedSqlModel> {
 #[test]
 fn run_at_the_end_is_collected_in_order_and_removed_from_sql() {
     let rendered =
-        render("select 1 as id\n{{ run(\"transf.py\") }}\n{{ run(\"carga/outro.py\") }}\n")
+        render("select 1 as id\n{{ run(\"transf.py\") }}\n{{ run(\"carga/outro.sql\") }}\n")
             .expect("run at the end should be accepted");
 
     assert_eq!(
         rendered.post_run_targets,
-        vec!["transf.py", "carga/outro.py"]
+        vec!["transf.py", "carga/outro.sql"]
     );
     assert_eq!(rendered.sql.trim(), "select 1 as id");
 }
@@ -60,7 +60,7 @@ fn invalid_run_paths_are_refused() {
         "/abs/fora.py",
         "C:/fora.py",
         "pasta\\fora.py",
-        "transf.sql",
+        "transf.txt",
         "",
         "pasta//x.py",
     ] {
