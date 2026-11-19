@@ -6,7 +6,10 @@ use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static NEXT_SANDBOX: AtomicU64 = AtomicU64::new(0);
 
 struct Sandbox(PathBuf);
 
@@ -16,9 +19,10 @@ impl Sandbox {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
+        let id = NEXT_SANDBOX.fetch_add(1, Ordering::Relaxed);
         let root =
-            std::env::temp_dir().join(format!("dowai-doctor-{}-{nonce}", std::process::id()));
-        fs::create_dir_all(&root).expect("create sandbox");
+            std::env::temp_dir().join(format!("dowai-doctor-{}-{nonce}-{id}", std::process::id()));
+        fs::create_dir(&root).expect("create sandbox");
         Self(root)
     }
 

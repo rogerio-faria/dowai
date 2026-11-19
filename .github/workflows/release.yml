@@ -94,6 +94,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked -p dowai-core --test openlineage_contract --test plan_demo_contract --test python_env_contract
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p dowai-runtime --lib interpreter_directory
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked -p dowai-runtime --test audit_e2e
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo build --release --locked -p dowai-cli --bin dowai

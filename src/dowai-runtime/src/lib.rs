@@ -2175,7 +2175,7 @@ fn python_settings(root: &Path) -> Result<(dowai_core::Project, dowai_core::Proj
         )
     })?;
     python_runtime::validate_python_runtime(&python)?;
-    if !is_project_path(root, &python.interpreter) {
+    if !is_project_path(root, &python.interpreter)? {
         return Err(DowaiError::Path(
             "Python interpreter path must be inside the project directory".to_owned(),
         ));
@@ -2188,19 +2188,16 @@ fn python_settings(root: &Path) -> Result<(dowai_core::Project, dowai_core::Proj
     Ok((project, python))
 }
 
-#[cfg(windows)]
-fn is_project_path(project_root: &Path, candidate: &Path) -> bool {
-    fn remove_windows_prefix(path: &Path) -> PathBuf {
-        let path = path.to_string_lossy();
-        PathBuf::from(path.strip_prefix(r"\\?\").unwrap_or(&path))
-    }
-
-    remove_windows_prefix(candidate).starts_with(remove_windows_prefix(project_root))
-}
-
-#[cfg(not(windows))]
-fn is_project_path(project_root: &Path, candidate: &Path) -> bool {
-    candidate.starts_with(project_root)
+fn is_project_path(project_root: &Path, candidate: &Path) -> Result<bool> {
+    let parent = candidate.parent().ok_or_else(|| {
+        DowaiError::Path("Python interpreter path has no parent directory".to_owned())
+    })?;
+    let parent = parent.canonicalize().map_err(|error| {
+        DowaiError::Path(format!(
+            "Cannot resolve Python interpreter directory: {error}"
+        ))
+    })?;
+    Ok(parent.starts_with(project_root))
 }
 
 fn resolve_python_model_path(
@@ -3089,7 +3086,7 @@ fn default_session_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        prepare_postgres_plan, run_postgres, run_postgres_detailed_with_cancel,
+        is_project_path, prepare_postgres_plan, run_postgres, run_postgres_detailed_with_cancel,
         validate_sql_sources, RunRequest,
     };
     use dowai_core::{
@@ -3116,13 +3113,8 @@ mod tests {
                 std::env::set_var("XDG_STATE_HOME", &state);
                 std::env::set_var("LOCALAPPDATA", &state);
             });
-            let nonce = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("clock is after Unix epoch")
-                .as_nanos();
-            let root = std::env::temp_dir()
-                .join(format!("dowai-runtime-test-{}-{nonce}", std::process::id()));
-            fs::create_dir_all(&root).expect("create fixture");
+            let root = std::env::temp_dir().join(format!("dowai-runtime-test-{}", Uuid::new_v4()));
+            fs::create_dir(&root).expect("create fixture");
             let project = create_project(&root, "fixture").expect("create project");
             Self(project)
         }
@@ -3158,6 +3150,66 @@ mod tests {
                 let _ = fs::remove_dir_all(workspace);
             }
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn interpreter_directory_accepts_windows_case_variations() {
+        let fixture = Fixture::new();
+        let directory = fixture.path().join(".venv").join("Scripts");
+        fs::create_dir_all(&directory).expect("create interpreter directory");
+        let root = fixture.path().canonicalize().expect("canonical project");
+        let candidate =
+            PathBuf::from(directory.to_string_lossy().to_ascii_uppercase()).join("python.exe");
+        assert!(is_project_path(&root, &candidate).expect("resolve interpreter directory"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn interpreter_directory_resolves_junctions_and_rejects_escapes() {
+        let fixture = Fixture::new();
+        let workspace = fixture.path().parent().expect("project parent");
+        fs::create_dir_all(fixture.path().join(".venv").join("Scripts"))
+            .expect("create interpreter directory");
+        let alias = workspace.join("project-alias");
+        let escape = fixture.path().join("outside");
+        for (link, target) in [(&alias, fixture.path()), (&escape, workspace)] {
+            let output = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .expect("create junction");
+            assert!(
+                output.status.success(),
+                "create junction: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let root = fixture.path().canonicalize().expect("canonical project");
+        let candidate = alias.join(".venv").join("Scripts").join("python.exe");
+        assert!(is_project_path(&root, &candidate).expect("resolve project alias"));
+        assert!(!is_project_path(&root, &escape.join("python.exe")).expect("resolve outside path"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interpreter_directory_resolves_project_aliases_and_rejects_escapes() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new();
+        let workspace = fixture.path().parent().expect("project parent");
+        let bin = fixture.path().join(".venv").join("bin");
+        fs::create_dir_all(&bin).expect("create interpreter directory");
+        let alias = workspace.join("project-alias");
+        symlink(fixture.path(), &alias).expect("create project alias");
+        let root = fixture.path().canonicalize().expect("canonical project");
+        let candidate = alias.join(".venv").join("bin").join("python");
+        assert!(is_project_path(&root, &candidate).expect("resolve project alias"));
+
+        let escape = fixture.path().join("outside");
+        symlink(workspace, &escape).expect("create directory escape");
+        assert!(!is_project_path(&root, &escape.join("python")).expect("resolve outside path"));
     }
 
     #[test]

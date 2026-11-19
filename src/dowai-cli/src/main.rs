@@ -1398,7 +1398,10 @@ mod tests {
     use dowai_core::{SessionLimits, SessionStore};
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_PROJECT: AtomicU64 = AtomicU64::new(0);
 
     struct TestProject(PathBuf);
 
@@ -1408,9 +1411,13 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .expect("clock is after Unix epoch")
                 .as_nanos();
-            let root =
-                std::env::temp_dir().join(format!("dowai-cli-test-{}-{nonce}", std::process::id()));
-            fs::create_dir_all(root.join("models")).expect("create models directory");
+            let id = NEXT_PROJECT.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "dowai-cli-test-{}-{nonce}-{id}",
+                std::process::id()
+            ));
+            fs::create_dir(&root).expect("create project directory");
+            fs::create_dir(root.join("models")).expect("create models directory");
             fs::write(
                 root.join("dowai_project.json"),
                 r#"{"schema_version":2,"name":"fixture","models_dir":"models"}"#,

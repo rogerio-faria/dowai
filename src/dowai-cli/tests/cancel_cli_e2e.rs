@@ -8,7 +8,10 @@ use serde_json::{json, Value};
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
 struct Fixture {
     root: PathBuf,
@@ -21,8 +24,12 @@ impl Fixture {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let root =
-            std::env::temp_dir().join(format!("dowai-cancel-cli-{}-{nonce}", std::process::id()));
+        let id = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "dowai-cancel-cli-{}-{nonce}-{id}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).expect("create fixture");
         fs::create_dir_all(root.join("state")).expect("state dir");
         fs::create_dir_all(root.join("config")).expect("config dir");
         let project = create_project(&root, "fixture").expect("project");
