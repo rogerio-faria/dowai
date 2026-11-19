@@ -1,0 +1,218 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "CLI version from src/dowai-cli/Cargo.toml (without v)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate version
+        id: version
+        env:
+          VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Version must be a Cargo version without a v prefix or build metadata." >&2
+            exit 1
+          fi
+          cargo metadata --locked --no-deps --format-version 1 > "$RUNNER_TEMP/metadata.json"
+          python3 -c 'import json, os; d=json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "metadata.json"))); versions=[p["version"] for p in d["packages"] if p["name"] == "dowai-cli"]; assert versions == [os.environ["VERSION"]], f"CLI Cargo.toml version mismatch: {versions}"'
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if [[ "$VERSION" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  linux:
+    needs: validate
+    runs-on: ubuntu-22.04
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install build and packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev dpkg-dev rpm rpm2cpio cpio makeself
+      - name: Test and build
+        run: |
+          cargo test --workspace --locked
+          cargo build --release --locked -p dowai-cli --bin dowai
+          test "$(target/release/dowai --version)" = "dowai $VERSION"
+      - name: Package
+        run: bash packaging/linux.sh "$VERSION"
+      - name: Validate installers
+        run: |
+          set -euo pipefail
+          sudo dpkg -i "dist/dowai-$VERSION-linux-x64.deb"
+          test "$(/usr/bin/dowai --version)" = "dowai $VERSION"
+          sudo dpkg -r dowai
+          mkdir "$RUNNER_TEMP/rpm-check"
+          (cd "$RUNNER_TEMP/rpm-check" && rpm2cpio "$GITHUB_WORKSPACE/dist/dowai-$VERSION-linux-x64.rpm" | cpio -id)
+          test "$("$RUNNER_TEMP/rpm-check/usr/bin/dowai" --version)" = "dowai $VERSION"
+          sudo bash "dist/dowai-$VERSION-linux-x64.sh" --noprogress
+          test "$(/usr/local/bin/dowai --version)" = "dowai $VERSION"
+          sudo rm /usr/local/bin/dowai
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-installers
+          path: dist/*
+          if-no-files-found: error
+
+  windows:
+    needs: validate
+    runs-on: windows-2022
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test and build
+        shell: pwsh
+        run: |
+          cargo test --locked -p dowai-cli --bin dowai
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p dowai-cli --test plugins_run_cli_e2e
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p dowai-core --test openlineage_contract --test plan_demo_contract --test python_env_contract
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p dowai-runtime --test audit_e2e
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --release --locked -p dowai-cli --bin dowai
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ((& .\target\release\dowai.exe --version) -ne "dowai $env:VERSION") { throw "Unexpected binary version" }
+      - name: Check native dependencies
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw "Visual C++ tools not found" }
+          $devcmd = Join-Path $vs 'Common7\Tools\VsDevCmd.bat'
+          $output = & cmd /c "`"$devcmd`" -arch=x64 >nul && dumpbin /dependents target\release\dowai.exe"
+          if ($LASTEXITCODE -ne 0) { throw "dumpbin failed" }
+          $output
+          $dlls = @($output | ForEach-Object { if ($_ -match '^\s+([A-Za-z0-9_.-]+\.dll)\s*$') { $Matches[1] } })
+          if ($dlls.Count -eq 0) { throw "No PE dependencies found" }
+          foreach ($dll in $dlls) {
+            if ($dll -match '^(vcruntime|msvcp|libssl|libcrypto|oci)' -or
+                ($dll -notmatch '^(api-ms-win-|ext-ms-win-)' -and
+                 -not (Test-Path (Join-Path $env:SystemRoot "System32\$dll")))) {
+              throw "Non-system dependency: $dll"
+            }
+          }
+      - name: Install Inno Setup and package
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DVersion=$env:VERSION" packaging\windows.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Validate installer and PATH ownership
+        shell: pwsh
+        run: .\packaging\test-windows.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: dist/*.exe
+          if-no-files-found: error
+
+  macos:
+    needs: validate
+    runs-on: macos-15-intel
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+      - name: Test and build
+        run: |
+          set -euo pipefail
+          cargo test --workspace --locked
+          cargo build --release --locked -p dowai-cli --bin dowai --target x86_64-apple-darwin
+          cargo build --release --locked -p dowai-cli --bin dowai --target aarch64-apple-darwin
+          mkdir -p dist "$RUNNER_TEMP/pkgroot/usr/local/bin"
+          lipo -create target/x86_64-apple-darwin/release/dowai target/aarch64-apple-darwin/release/dowai -output "$RUNNER_TEMP/pkgroot/usr/local/bin/dowai"
+          lipo -verify_arch x86_64 arm64 "$RUNNER_TEMP/pkgroot/usr/local/bin/dowai"
+          test "$("$RUNNER_TEMP/pkgroot/usr/local/bin/dowai" --version)" = "dowai $VERSION"
+      - name: Check native dependencies
+        run: |
+          set -euo pipefail
+          for arch in x86_64 arm64; do
+            otool -arch "$arch" -L "$RUNNER_TEMP/pkgroot/usr/local/bin/dowai" | tee "$RUNNER_TEMP/otool-$arch.txt"
+            awk 'NR > 1 { if ($1 !~ /^\/usr\/lib\// && $1 !~ /^\/System\/Library\//) { print "Non-system dependency: " $1 > "/dev/stderr"; bad=1 } } END { exit bad }' "$RUNNER_TEMP/otool-$arch.txt"
+          done
+      - name: Package and validate
+        run: |
+          set -euo pipefail
+          pkgbuild --root "$RUNNER_TEMP/pkgroot" --identifier org.dowai.cli --version "$VERSION" --install-location / "dist/dowai-$VERSION-macos-universal.pkg"
+          sudo installer -pkg "dist/dowai-$VERSION-macos-universal.pkg" -target /
+          lipo -verify_arch x86_64 arm64 /usr/local/bin/dowai
+          test "$(/usr/local/bin/dowai --version)" = "dowai $VERSION"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-installer
+          path: dist/*.pkg
+          if-no-files-found: error
+
+  publish:
+    needs: [validate, linux, windows, macos]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
+      PRERELEASE: ${{ needs.validate.outputs.prerelease }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Verify assets and generate checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          files=("dowai-$VERSION-windows-x64-setup.exe" "dowai-$VERSION-linux-x64.deb" "dowai-$VERSION-linux-x64.rpm" "dowai-$VERSION-linux-x64.sh" "dowai-$VERSION-macos-universal.pkg")
+          for file in "${files[@]}"; do test -s "$file"; done
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 5
+          sha256sum "${files[@]}" > SHA256SUMS
+          sha256sum -c SHA256SUMS
+      - name: Tag and publish release
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          existing=$(git ls-remote --tags origin "refs/tags/$tag")
+          if [ -n "$existing" ]; then
+            echo "Tag $tag already exists; refusing to publish." >&2
+            exit 1
+          fi
+          git tag "$tag" "$GITHUB_SHA"
+          git push origin "refs/tags/$tag"
+          flags=(--verify-tag --generate-notes --title "$tag")
+          if [ "$PRERELEASE" = true ]; then
+            flags+=(--prerelease --latest=false)
+          else
+            flags+=(--latest)
+          fi
+          gh release create "$tag" dist/* "${flags[@]}"
