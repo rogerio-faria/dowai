@@ -5,7 +5,10 @@ use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static NEXT_STATE: AtomicU64 = AtomicU64::new(0);
 
 const RUN_A: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const RUN_B: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
@@ -19,9 +22,16 @@ impl State {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let root =
-            std::env::temp_dir().join(format!("dowai-runs-cli-{}-{nonce}", std::process::id()));
-        fs::create_dir_all(&root).expect("create state root");
+        Self::at(nonce)
+    }
+
+    fn at(nonce: u128) -> Self {
+        let id = NEXT_STATE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "dowai-runs-cli-{}-{nonce}-{id}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).expect("create state root");
         Self(root)
     }
 
@@ -96,6 +106,21 @@ impl Drop for State {
 
 fn json_stdout(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).expect("stdout must be only JSON")
+}
+
+#[test]
+fn states_created_at_the_same_time_are_independent() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let first = State::at(nonce);
+    let second = State::at(nonce);
+    assert_ne!(first.0, second.0);
+    first.seed();
+    second.seed();
+    drop(first);
+    assert!(second.cli(&["runs", "list", "--json"]).status.success());
 }
 
 #[test]

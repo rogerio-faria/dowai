@@ -317,8 +317,9 @@ models and Oracle connections still require their separately configured runtimes
 To publish a release, update and commit the CLI version in
 `src/dowai-cli/Cargo.toml` and `Cargo.lock`, then run **Actions → Release → Run
 workflow** on the desired ref with that exact version (without a `v` prefix or
-build metadata). The workflow runs the workspace tests on Linux and macOS and
-selected CLI, audit and contract tests on Windows (some other tests assume Unix paths), builds on
+build metadata). The workflow runs the workspace tests serially on Linux and macOS
+to isolate tests that share process state, and runs selected CLI, audit and contract
+tests on Windows (some other tests assume Unix paths). It builds on
 native runners, validates installers, collects five assets and generates SHA-256 checksums.
 Only after all jobs succeed does it push `vVERSION` and create a non-draft GitHub
 Release with automatically generated notes. Stable versions are marked latest;

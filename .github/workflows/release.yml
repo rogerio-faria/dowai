@@ -53,7 +53,7 @@ jobs:
           sudo apt-get install -y pkg-config libssl-dev dpkg-dev rpm rpm2cpio cpio makeself
       - name: Test and build
         run: |
-          cargo test --workspace --locked
+          cargo test --workspace --locked -- --test-threads=1
           cargo build --release --locked -p dowai-cli --bin dowai
           test "$(target/release/dowai --version)" = "dowai $VERSION"
       - name: Package
@@ -90,7 +90,7 @@ jobs:
         run: |
           cargo test --locked -p dowai-cli --bin dowai
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --locked -p dowai-cli --test plugins_run_cli_e2e
+          cargo test --locked -p dowai-cli --test plugins_run_cli_e2e --test runs_cli_e2e
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked -p dowai-core --test openlineage_contract --test plan_demo_contract --test python_env_contract
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -149,7 +149,7 @@ jobs:
       - name: Test and build
         run: |
           set -euo pipefail
-          cargo test --workspace --locked
+          cargo test --workspace --locked -- --test-threads=1
           cargo build --release --locked -p dowai-cli --bin dowai --target x86_64-apple-darwin
           cargo build --release --locked -p dowai-cli --bin dowai --target aarch64-apple-darwin
           mkdir -p dist "$RUNNER_TEMP/pkgroot/usr/local/bin"
