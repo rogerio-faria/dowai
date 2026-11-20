@@ -749,7 +749,7 @@ dependencies = [
 
 [[package]]
 name = "dowai-cli"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "clap",
  "ctrlc",
@@ -761,7 +761,7 @@ dependencies = [
 
 [[package]]
 name = "dowai-core"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "flate2",
  "jsonschema",
@@ -778,7 +778,7 @@ dependencies = [
 
 [[package]]
 name = "dowai-databases-oracle"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "oracle",
  "serde_json",
@@ -788,7 +788,7 @@ dependencies = [
 
 [[package]]
 name = "dowai-mysql"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "dowai-postgres",
  "mysql",
@@ -796,7 +796,7 @@ dependencies = [
 
 [[package]]
 name = "dowai-postgres"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "native-tls",
  "postgres",
@@ -805,7 +805,7 @@ dependencies = [
 
 [[package]]
 name = "dowai-runtime"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "dowai-core",
  "dowai-databases-oracle",
@@ -822,7 +822,7 @@ dependencies = [
 
 [[package]]
 name = "dowai-sqlserver"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "futures-util",
  "serde_json",

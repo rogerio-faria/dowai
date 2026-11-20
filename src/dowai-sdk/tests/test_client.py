@@ -184,7 +184,7 @@ class EngineCompatibilityTests(unittest.TestCase):
     def test_sdk_exposes_its_version(self):
         import dowai
 
-        self.assertEqual(dowai.__version__, "0.1.0")
+        self.assertEqual(dowai.__version__, "0.1.2")
 
 
 if __name__ == "__main__":
