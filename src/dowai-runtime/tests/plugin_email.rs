@@ -97,14 +97,17 @@ struct Smtp {
     child: Child,
     port: u16,
     log: PathBuf,
+    trace: PathBuf,
 }
 
 impl Smtp {
     fn start(log: PathBuf) -> Self {
+        let trace = log.with_extension("trace");
         let mut child = Command::new("python3")
             .args(["-I", FAKE_SMTP])
             .arg(&log)
             .arg("0")
+            .arg(&trace)
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
@@ -119,7 +122,12 @@ impl Smtp {
             .strip_prefix("PORT ")
             .and_then(|value| value.parse().ok())
             .expect("fake SMTP announces its port");
-        Self { child, port, log }
+        Self {
+            child,
+            port,
+            log,
+            trace,
+        }
     }
 
     /// Mensagens aceitas pelo gateway falso (uma linha JSON por mensagem).
@@ -197,7 +205,11 @@ fn sends_deduplicates_by_key_and_never_leaks_credentials() {
     input["context"] = json!({"nome": "Ana", "tipo": "limiar"});
     let first = fixture
         .execute(input.clone(), Some("envio.001"), &policy)
-        .expect("first send succeeds");
+        .unwrap_or_else(|error| {
+            let trace = fs::read_to_string(&smtp.trace)
+                .unwrap_or_else(|error| format!("unavailable: {error}"));
+            panic!("first send failed: {error}; SMTP stages: {trace}");
+        });
     assert_eq!(first["status"], "SUCCEEDED");
     assert!(
         !first.to_string().contains(SECRET_PASSWORD),

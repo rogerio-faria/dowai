@@ -1,6 +1,6 @@
 """Gateway SMTP falso para os testes do plugin `email` (ENT-059). Somente loopback, sem TLS.
 
-Uso: python3 -I fake_smtp.py <log.jsonl> [porta]   (porta 0 = automática)
+Uso: python3 -I fake_smtp.py <log.jsonl> [porta] [trace]   (porta 0 = automática)
 
 Quando pronto, imprime `PORT <n>` em stdout. Cada mensagem aceita vira uma linha JSON no log
 (remetente, destinatários, assunto e tamanho; nunca credenciais).
@@ -28,6 +28,7 @@ class Handler(socketserver.StreamRequestHandler):
 
     def handle(self):
         log = self.server.log_path
+        self.server.trace("CONNECTED")
         self.sender = None
         self.recipients = []
         self.authed = False
@@ -38,6 +39,9 @@ class Handler(socketserver.StreamRequestHandler):
                 return
             line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
             verb = line.split(" ", 1)[0].upper()
+            self.server.trace(verb if verb in {
+                "EHLO", "HELO", "AUTH", "MAIL", "RCPT", "DATA", "RSET", "NOOP", "QUIT"
+            } else "OTHER")
             if verb in ("EHLO", "HELO"):
                 if verb == "EHLO":
                     self.wfile.write(b"250-fake.dowai.test\r\n250 AUTH PLAIN\r\n")
@@ -116,12 +120,19 @@ class Server(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
+    def trace(self, stage):
+        if self.trace_path:
+            with self.lock:
+                with open(self.trace_path, "a", encoding="utf-8") as handle:
+                    handle.write(stage + "\n")
+
 
 def main():
     log_path = sys.argv[1]
     port = int(sys.argv[2]) if len(sys.argv) > 2 else 0
     server = Server(("127.0.0.1", port), Handler)
     server.log_path = log_path
+    server.trace_path = sys.argv[3] if len(sys.argv) > 3 else None
     server.lock = threading.Lock()
     print(f"PORT {server.server_address[1]}", flush=True)
     try:

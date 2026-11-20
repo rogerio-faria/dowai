@@ -164,11 +164,14 @@ def _connect(host, port, tls, timeout_seconds, credentials):
     if not isinstance(timeout_seconds, (int, float)) or not 1 <= timeout_seconds <= 60:
         raise EmailError("DOWAI_EMAIL_INPUT_INVALID", "timeout_seconds fora do intervalo 1 a 60")
     context = ssl.create_default_context()
+    local_hostname = "localhost" if host in LOOPBACK_HOSTS else None
     try:
         if tls == "ssl":
-            server = smtplib.SMTP_SSL(host, port, timeout=timeout_seconds, context=context)
+            server = smtplib.SMTP_SSL(
+                host, port, local_hostname=local_hostname, timeout=timeout_seconds, context=context
+            )
         else:
-            server = smtplib.SMTP(host, port, timeout=timeout_seconds)
+            server = smtplib.SMTP(host, port, local_hostname=local_hostname, timeout=timeout_seconds)
             server.ehlo()
             if tls == "starttls":
                 server.starttls(context=context)

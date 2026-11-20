@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
@@ -25,8 +26,9 @@ CREDS = {"mail_credentials": json.dumps({"username": "robo", "password": "senha-
 class FakeGateway:
     def __init__(self, log):
         self.log = log
+        self.trace = log.with_suffix(".trace")
         self.proc = subprocess.Popen(
-            [sys.executable, "-I", str(FAKE), str(log), "0"],
+            [sys.executable, "-I", str(FAKE), str(log), "0", str(self.trace)],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
@@ -92,6 +94,14 @@ class EmailSenderTests(unittest.TestCase):
         record = self.gateway.records()[before]
         self.assertEqual(record["subject"], "Alerta")
         self.assertEqual(record["to"], ["ops@example.org"])
+
+    def test_loopback_send_does_not_resolve_local_hostname(self):
+        with patch("socket.getfqdn", side_effect=AssertionError("unexpected hostname lookup")):
+            result = self.send()
+        self.assertEqual(result, {"messages": 1, "recipients": 1})
+        trace = self.gateway.trace.read_text(encoding="utf-8")
+        self.assertIn("CONNECTED\nEHLO\nAUTH\n", trace)
+        self.assertNotIn("senha-de-teste", trace)
 
     def test_missing_template_variable_is_refused_without_sending(self):
         before = len(self.gateway.records())
