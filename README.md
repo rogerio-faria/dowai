@@ -291,9 +291,8 @@ On Linux without `pkg-config`, set first: `OPENSSL_DIR=/usr OPENSSL_LIB_DIR=/usr
 ## Releases and installation
 
 Download an installer and `SHA256SUMS` from [GitHub Releases](https://github.com/rogerio-faria/dowai/releases).
-Verify its SHA-256 hash against the corresponding entry before installing. On Linux or
-macOS, run `sha256sum -c SHA256SUMS --ignore-missing` (or compare the output of
-`shasum -a 256 ./dowai-VERSION-macos-universal.pkg` on macOS); on Windows,
+Verify its SHA-256 hash against the corresponding entry before installing. On Linux,
+run `sha256sum -c SHA256SUMS --ignore-missing`; on Windows,
 compare `Get-FileHash .\installer.exe -Algorithm SHA256` with
 the entry in `SHA256SUMS`.
 
@@ -307,12 +306,9 @@ the entry in `SHA256SUMS`.
   `sudo sh ./dowai-VERSION-linux-x64.sh` to install `/usr/local/bin/dowai`; remove
   that file to uninstall it. The self-extracting installer checks for missing
   shared libraries but does not install them.
-- **macOS Intel/Apple Silicon:** run the universal `.pkg` installer, or use
-  `sudo installer -pkg ./dowai-VERSION-macos-universal.pkg -target /`. It installs
-  `/usr/local/bin/dowai`; remove that file to uninstall.
 
 The Linux binary is built on Ubuntu 22.04 and requires compatible system libraries,
-including glibc 2.35 or newer and OpenSSL 3. The macOS and Windows binaries use
+including glibc 2.35 or newer and OpenSSL 3. The Windows binary uses
 system libraries. The workflow checks native dependencies on each platform. These
 installers are unsigned, so operating-system security warnings may appear. They
 install only DOWAI, not Rust, Python, database servers, or Oracle Client; Python
@@ -321,10 +317,10 @@ models and Oracle connections still require their separately configured runtimes
 To publish a release, update and commit the CLI version in
 `src/dowai-cli/Cargo.toml` and `Cargo.lock`, then run **Actions → Release → Run
 workflow** on the desired ref with that exact version (without a `v` prefix or
-build metadata). The workflow runs the workspace tests serially on Linux and macOS
+build metadata). The workflow runs the workspace tests serially on Linux
 to isolate tests that share process state, and runs selected CLI, audit and contract
 tests on Windows (some other tests assume Unix paths). It builds on
-native runners, validates installers, collects five assets and generates SHA-256 checksums.
+native runners, validates installers, collects four assets and generates SHA-256 checksums.
 Only after all jobs succeed does it push `vVERSION` and create a non-draft GitHub
 Release with automatically generated notes. Stable versions are marked latest;
 versions with a prerelease suffix are marked prerelease and are not latest. An

@@ -146,48 +146,8 @@ jobs:
           path: dist/*.exe
           if-no-files-found: error
 
-  macos:
-    needs: validate
-    runs-on: macos-15-intel
-    env:
-      VERSION: ${{ needs.validate.outputs.version }}
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-apple-darwin,aarch64-apple-darwin
-      - name: Test and build
-        run: |
-          set -euo pipefail
-          cargo test --workspace --locked -- --test-threads=1
-          cargo build --release --locked -p dowai-cli --bin dowai --target x86_64-apple-darwin
-          cargo build --release --locked -p dowai-cli --bin dowai --target aarch64-apple-darwin
-          mkdir -p dist "$RUNNER_TEMP/pkgroot/usr/local/bin"
-          lipo -create target/x86_64-apple-darwin/release/dowai target/aarch64-apple-darwin/release/dowai -output "$RUNNER_TEMP/pkgroot/usr/local/bin/dowai"
-          lipo -verify_arch x86_64 arm64 "$RUNNER_TEMP/pkgroot/usr/local/bin/dowai"
-          test "$("$RUNNER_TEMP/pkgroot/usr/local/bin/dowai" --version)" = "dowai $VERSION"
-      - name: Check native dependencies
-        run: |
-          set -euo pipefail
-          for arch in x86_64 arm64; do
-            otool -arch "$arch" -L "$RUNNER_TEMP/pkgroot/usr/local/bin/dowai" | tee "$RUNNER_TEMP/otool-$arch.txt"
-            awk 'NR > 1 { if ($1 !~ /^\/usr\/lib\// && $1 !~ /^\/System\/Library\//) { print "Non-system dependency: " $1 > "/dev/stderr"; bad=1 } } END { exit bad }' "$RUNNER_TEMP/otool-$arch.txt"
-          done
-      - name: Package and validate
-        run: |
-          set -euo pipefail
-          pkgbuild --root "$RUNNER_TEMP/pkgroot" --identifier org.dowai.cli --version "$VERSION" --install-location / "dist/dowai-$VERSION-macos-universal.pkg"
-          sudo installer -pkg "dist/dowai-$VERSION-macos-universal.pkg" -target /
-          lipo -verify_arch x86_64 arm64 /usr/local/bin/dowai
-          test "$(/usr/local/bin/dowai --version)" = "dowai $VERSION"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: macos-installer
-          path: dist/*.pkg
-          if-no-files-found: error
-
   publish:
-    needs: [validate, linux, windows, macos]
+    needs: [validate, linux, windows]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -205,9 +165,9 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          files=("dowai-$VERSION-windows-x64-setup.exe" "dowai-$VERSION-linux-x64.deb" "dowai-$VERSION-linux-x64.rpm" "dowai-$VERSION-linux-x64.sh" "dowai-$VERSION-macos-universal.pkg")
+          files=("dowai-$VERSION-windows-x64-setup.exe" "dowai-$VERSION-linux-x64.deb" "dowai-$VERSION-linux-x64.rpm" "dowai-$VERSION-linux-x64.sh")
           for file in "${files[@]}"; do test -s "$file"; done
-          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 5
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 4
           sha256sum "${files[@]}" > SHA256SUMS
           sha256sum -c SHA256SUMS
       - name: Tag and publish release
