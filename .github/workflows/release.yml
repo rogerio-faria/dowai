@@ -18,7 +18,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Validate version
         id: version
         env:
@@ -31,7 +31,17 @@ jobs:
             exit 1
           fi
           cargo metadata --locked --no-deps --format-version 1 > "$RUNNER_TEMP/metadata.json"
-          python3 -c 'import json, os; d=json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "metadata.json"))); versions=[p["version"] for p in d["packages"] if p["name"] == "dowai-cli"]; assert versions == [os.environ["VERSION"]], f"CLI Cargo.toml version mismatch: {versions}"'
+          python3 -c '
+          import json, os, sys
+          with open(os.path.join(os.environ["RUNNER_TEMP"], "metadata.json")) as f:
+              metadata = json.load(f)
+          versions = [p["version"] for p in metadata["packages"] if p["name"] == "dowai-cli"]
+          if len(versions) != 1:
+              sys.exit(f"Expected one dowai-cli package; found {len(versions)}.")
+          requested = os.environ["VERSION"]
+          if versions[0] != requested:
+              sys.exit(f"Version mismatch: entered {requested}; use {versions[0]} from src/dowai-cli/Cargo.toml.")
+          '
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           if [[ "$VERSION" == *-* ]]; then
             echo "prerelease=true" >> "$GITHUB_OUTPUT"
@@ -45,7 +55,7 @@ jobs:
     env:
       VERSION: ${{ needs.validate.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - name: Install build and packaging dependencies
         run: |
@@ -83,7 +93,7 @@ jobs:
       VERSION: ${{ needs.validate.outputs.version }}
       RUSTFLAGS: -C target-feature=+crt-static
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - name: Test and build
         shell: pwsh
@@ -142,7 +152,7 @@ jobs:
     env:
       VERSION: ${{ needs.validate.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-apple-darwin,aarch64-apple-darwin
@@ -186,7 +196,7 @@ jobs:
       PRERELEASE: ${{ needs.validate.outputs.prerelease }}
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: actions/download-artifact@v4
         with:
           path: dist
