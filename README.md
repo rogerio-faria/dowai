@@ -54,6 +54,10 @@ removed from Git's index separately. Rename old `workspace.json` files to
 `profiles.json` and change `password_env` to a `password` expression; the old
 format is not loaded.
 
+Workspaces cannot be created in protected system directories or through symlinks
+to them. On macOS, the per-user temporary directories under `/var/folders`
+remain usable.
+
 Models may be placed in any subdirectory of `models/` and selected by path or
 unique name. Names without extensions must be unique project-wide, including
 between SQL and Python; duplicate errors list all conflicting paths.

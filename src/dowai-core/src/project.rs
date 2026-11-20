@@ -281,7 +281,22 @@ pub fn validate_workspace_root(workspace: &Path) -> Result<()> {
         ));
     }
     for protected in PROTECTED_WORKSPACE_ROOTS {
-        if resolved.starts_with(protected) {
+        #[cfg(unix)]
+        let protected_path = match fs::canonicalize(protected) {
+            Ok(path) => path,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        #[cfg(not(unix))]
+        let protected_path = PathBuf::from(protected);
+
+        // macOS keeps per-user temporary directories under /var/folders.
+        #[cfg(target_os = "macos")]
+        if *protected == "/var" && resolved.starts_with("/private/var/folders") {
+            continue;
+        }
+
+        if resolved.starts_with(protected_path) {
             return Err(DowaiError::Path(format!(
                 "Workspace outside authorized root: {} is a protected system location",
                 resolved.display()
@@ -289,6 +304,26 @@ pub fn validate_workspace_root(workspace: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod workspace_root_tests {
+    use super::validate_workspace_root;
+    use std::path::Path;
+
+    #[test]
+    fn canonical_system_paths_are_protected() {
+        for path in ["/private/etc", "/private/var"] {
+            let error = validate_workspace_root(Path::new(path)).expect_err("protected location");
+            assert_eq!(error.code(), "DOWAI_POLICY_PATH", "{path}");
+        }
+    }
+
+    #[test]
+    fn macos_user_temporary_directory_remains_allowed() {
+        validate_workspace_root(Path::new("/var/folders")).expect("system temporary directory");
+        validate_workspace_root(&std::env::temp_dir()).expect("user temporary directory");
+    }
 }
 
 pub fn create_project(workspace: &Path, name: &str) -> Result<PathBuf> {
